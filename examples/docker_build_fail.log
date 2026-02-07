@@ -1,0 +1,20 @@
+Step 1/5 : FROM python:3.9-slim
+ ---> 5d023423a233
+Step 2/5 : WORKDIR /app
+ ---> Using cache
+ ---> 9a413233b232
+Step 3/5 : COPY . .
+ ---> a3423423b233
+Step 4/5 : RUN pip install -r requirements.txt
+ ---> Running in b23423423c34
+Collecting flask
+  Downloading flask-2.0.1-py3-none-any.whl (99 kB)
+Collecting requests
+  Downloading requests-2.26.0-py2.py3-none-any.whl (62 kB)
+Step 5/5 : RUN ./build_script.sh
+ ---> Running in c3453453d454
++ ./build_script.sh
+Building project...
+Compiling assets...
+Error: COPY failed: stat /var/lib/docker/tmp/docker-builder5435345/missing_file.txt: no such file or directory
+The command '/bin/sh -c ./build_script.sh' returned a non-zero code: 1

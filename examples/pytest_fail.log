@@ -1,0 +1,20 @@
+============================= test session starts ==============================
+platform linux -- Python 3.9.7, pytest-6.2.5, py-1.10.0, pluggy-1.0.0
+rootdir: /app
+collected 3 items
+
+tests/test_api.py .F.                                                    [100%]
+
+=================================== FAILURES ===================================
+_______________________________ test_login_fail ________________________________
+
+    def test_login_fail():
+        response = client.post("/login", json={"username": "test", "password": "wrong"})
+>       assert response.status_code == 401
+E       AssertionError: assert 200 == 401
+E        +  where 200 = <Response [200]>.status_code
+
+tests/test_api.py:12: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_api.py::test_login_fail - AssertionError: assert 200 == 401
+========================= 1 failed, 2 passed in 0.12s ==========================

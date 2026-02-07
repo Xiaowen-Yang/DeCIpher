@@ -1,0 +1,6 @@
+Step 1/1 : FROM arm64v8/ubuntu
+ ---> 342342342342
+Step 2/1 : RUN echo "Hello"
+ ---> Running in d34234234234
+standard_init_linux.go:228: exec user process caused: exec format error
+The command '/bin/sh -c echo "Hello"' returned a non-zero code: 1
