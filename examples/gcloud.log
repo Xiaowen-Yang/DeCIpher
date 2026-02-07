@@ -1,0 +1,41 @@
+➜  ~ gcloud container clusters create --num-nodes 3 --region europe-north1-a dat490-cluster
+Note: Your Pod address range (`--cluster-ipv4-cidr`) can accommodate at most 1008 node(s).
+API [container.googleapis.com] not enabled on project [project-d7ee798f-9d91-4c6f-82b]. Would you like to enable and
+retry (this will take a few minutes)? (y/N)?  y
+
+Enabling service [container.googleapis.com] on project [project-d7ee798f-9d91-4c6f-82b]...
+Operation "operations/acf.p2-676949458164-b8e810a6-80c0-4cef-9655-746d956643ab" finished successfully.
+Creating cluster dat490-cluster in europe-north1-a...done.
+ERROR: (gcloud.container.clusters.create) Operation [<Operation
+ clusterConditions: [<StatusCondition
+ canonicalCode: CanonicalCodeValueValuesEnum(RESOURCE_EXHAUSTED, 9)
+ code: CodeValueValuesEnum(GCE_QUOTA_EXCEEDED, 3)
+ message: "Instance 'gke-dat490-cluster-default-pool-c1cd08fd-2v6c' creation failed: Quota 'SSD_TOTAL_GB' exceeded.  Limit: 250.0 in region europe-north1.">, <StatusCondition
+ canonicalCode: CanonicalCodeValueValuesEnum(RESOURCE_EXHAUSTED, 9)
+ message: "Insufficient quota to satisfy the request: Not all instances running in IGM after 29.292936849s. Expected 3, running 2, transitioning 1. Current errors: [GCE_QUOTA_EXCEEDED]: Instance 'gke-dat490-cluster-default-pool-c1cd08fd-2v6c' creation failed: Quota 'SSD_TOTAL_GB' exceeded.  Limit: 250.0 in region europe-north1.">]
+ detail: "Insufficient quota to satisfy the request: Not all instances running in IGM after 29.292936849s. Expected 3, running 2, transitioning 1. Current errors: [GCE_QUOTA_EXCEEDED]: Instance 'gke-dat490-cluster-default-pool-c1cd08fd-2v6c' creation failed: Quota 'SSD_TOTAL_GB' exceeded.  Limit: 250.0 in region europe-north1."
+ endTime: '2026-02-07T22:33:45.412847171Z'
+ error: <Status
+ code: 8
+ details: []
+ message: "Instance 'gke-dat490-cluster-default-pool-c1cd08fd-2v6c' creation failed: Quota 'SSD_TOTAL_GB' exceeded.  Limit: 250.0 in region europe-north1.">
+ name: 'operation-1770503242328-9a0e07ad-5d8b-4b0f-8b88-a3336b585d8d'
+ nodepoolConditions: []
+ operationType: OperationTypeValueValuesEnum(CREATE_CLUSTER, 1)
+ progress: <OperationProgress
+ metrics: [<Metric
+ intValue: 8
+ name: 'CLUSTER_CONFIGURING'>, <Metric
+ intValue: 8
+ name: 'CLUSTER_CONFIGURING_TOTAL'>, <Metric
+ intValue: 12
+ name: 'CLUSTER_DEPLOYING'>, <Metric
+ intValue: 12
+ name: 'CLUSTER_DEPLOYING_TOTAL'>]
+ stages: []>
+ selfLink: 'https://container.googleapis.com/v1/projects/676949458164/zones/europe-north1-a/operations/operation-1770503242328-9a0e07ad-5d8b-4b0f-8b88-a3336b585d8d'
+ startTime: '2026-02-07T22:27:22.328878613Z'
+ status: StatusValueValuesEnum(DONE, 3)
+ statusMessage: "Insufficient quota to satisfy the request: Not all instances running in IGM after 29.292936849s. Expected 3, running 2, transitioning 1. Current errors: [GCE_QUOTA_EXCEEDED]: Instance 'gke-dat490-cluster-default-pool-c1cd08fd-2v6c' creation failed: Quota 'SSD_TOTAL_GB' exceeded.  Limit: 250.0 in region europe-north1."
+ targetLink: 'https://container.googleapis.com/v1/projects/676949458164/zones/europe-north1-a/clusters/dat490-cluster'
+ zone: 'europe-north1-a'>] finished with error: Insufficient quota to satisfy the request: Not all instances running in IGM after 29.292936849s. Expected 3, running 2, transitioning 1. Current errors: [GCE_QUOTA_EXCEEDED]: Instance 'gke-dat490-cluster-default-pool-c1cd08fd-2v6c' creation failed: Quota 'SSD_TOTAL_GB' exceeded.  Limit: 250.0 in region europe-north1.

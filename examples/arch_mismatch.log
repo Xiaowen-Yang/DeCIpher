@@ -1,6 +1,53 @@
-Step 1/1 : FROM arm64v8/ubuntu
- ---> 342342342342
-Step 2/1 : RUN echo "Hello"
- ---> Running in d34234234234
-standard_init_linux.go:228: exec user process caused: exec format error
-The command '/bin/sh -c echo "Hello"' returned a non-zero code: 1
+Step 1/10 : FROM --platform=linux/amd64 ubuntu:20.04
+ ---> 1d622ef86b13
+Step 2/10 : WORKDIR /app
+ ---> Using cache
+ ---> 44321235a123
+Step 3/10 : COPY . .
+ ---> Using cache
+ ---> 55432346b234
+Step 4/10 : RUN apt-get update && apt-get install -y curl
+ ---> Running in c6543457c345
+Get:1 http://archive.ubuntu.com/ubuntu focal InRelease [265 kB]
+Get:2 http://security.ubuntu.com/ubuntu focal-security InRelease [114 kB]
+Get:3 http://archive.ubuntu.com/ubuntu focal-updates InRelease [114 kB]
+Get:4 http://archive.ubuntu.com/ubuntu focal-backports InRelease [108 kB]
+Get:5 http://archive.ubuntu.com/ubuntu focal/main amd64 Packages [1275 kB]
+Get:6 http://archive.ubuntu.com/ubuntu focal/universe amd64 Packages [11.3 MB]
+Fetched 13.2 MB in 3s (4400 kB/s)
+Reading package lists... Done
+Building dependency tree       
+Reading state information... Done
+The following additional packages will be installed:
+  libcurl4 libcurl4-openssl-dev
+The following NEW packages will be installed:
+  curl libcurl4
+0 upgraded, 2 newly installed, 0 to remove and 0 not upgraded.
+Need to get 234 kB of archives.
+After this operation, 987 kB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu focal/main amd64 libcurl4 amd64 7.68.0-1ubuntu2.7 [230 kB]
+Get:2 http://archive.ubuntu.com/ubuntu focal/main amd64 curl amd64 7.68.0-1ubuntu2.7 [170 kB]
+Fetched 400 kB in 0s (1200 kB/s)
+Selecting previously unselected package libcurl4:amd64.
+(Reading database ... 23456 files and directories currently installed.)
+Preparing to unpack .../libcurl4_7.68.0-1ubuntu2.7_amd64.deb ...
+Unpacking libcurl4:amd64 (7.68.0-1ubuntu2.7) ...
+Selecting previously unselected package curl.
+Preparing to unpack .../curl_7.68.0-1ubuntu2.7_amd64.deb ...
+Unpacking curl (7.68.0-1ubuntu2.7) ...
+Setting up libcurl4:amd64 (7.68.0-1ubuntu2.7) ...
+Setting up curl (7.68.0-1ubuntu2.7) ...
+Processing triggers for libc-bin (2.31-0ubuntu9.2) ...
+ ---> d7654568d456
+Step 5/10 : RUN ./build_binary.sh
+ ---> Running in e8765679e567
++ ./build_binary.sh
+Building binary for target architecture...
+Analysis: Host architecture: linux/arm64
+Analysis: Target architecture: linux/amd64
+Compiling main.c...
+Linking...
+User requested execution of test suite...
+WARNING: The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64) and no specific platform was requested
+exec /app/test_suite: exec format error
+The command '/bin/sh -c ./build_binary.sh' returned a non-zero code: 126

@@ -4,11 +4,45 @@ import uuid
 import sys
 import os
 
-from .utils import read_log
+from .utils import read_log, load_config, save_config, CONFIG_PATH
 from .log_slicer import slice_log
 from .known_classifier import classify_failure
-from .unknown_triage import triage_unknown
+from .unknown_triage import triage_unknown, llm_healthcheck
 from .renderer import render_html
+
+def _resolve_ai_config(args) -> dict:
+    stored = load_config().get("ai", {})
+    ai_mode = (
+        getattr(args, "ai_mode", None)
+        or os.environ.get("AI_MODE")
+        or stored.get("ai_mode")
+        or "off"
+    )
+    return {
+        "ai_mode": ai_mode,
+        "api_key": getattr(args, "api_key", None) or os.environ.get("AI_API_KEY") or stored.get("api_key"),
+        "api_base": getattr(args, "api_base", None) or os.environ.get("AI_API_BASE") or stored.get("api_base"),
+        "api_model": getattr(args, "api_model", None) or os.environ.get("AI_API_MODEL") or stored.get("api_model"),
+        "api_timeout": getattr(args, "api_timeout", None) or os.environ.get("AI_API_TIMEOUT") or stored.get("api_timeout"),
+    }
+
+def _maybe_persist_ai_config(args, ai_config: dict) -> None:
+    save_requested = getattr(args, "save_config", False)
+    provided = any(
+        getattr(args, field, None) is not None
+        for field in ("api_key", "api_base", "api_model", "api_timeout")
+    )
+    if not (save_requested or provided):
+        return
+    data = load_config()
+    data["ai"] = {
+        "ai_mode": ai_config.get("ai_mode"),
+        "api_key": ai_config.get("api_key"),
+        "api_base": ai_config.get("api_base"),
+        "api_model": ai_config.get("api_model"),
+        "api_timeout": ai_config.get("api_timeout"),
+    }
+    save_config(data)
 
 def analyze(args):
     """Analyze a log file and produce a JSON result."""
@@ -25,14 +59,8 @@ def analyze(args):
     classification = classify_failure(focus_window, args.exit_code)
     
     # 3. Triage (if unknown) or fill generic analysis
-    ai_mode = getattr(args, 'ai_mode', None) or os.environ.get("AI_MODE", "off")
-    ai_config = {
-        "ai_mode": ai_mode,
-        "api_key": getattr(args, 'api_key', None),
-        "api_base": getattr(args, 'api_base', None),
-        "api_model": getattr(args, 'api_model', None),
-        "api_timeout": getattr(args, 'api_timeout', None),
-    }
+    ai_config = _resolve_ai_config(args)
+    ai_mode = ai_config.get("ai_mode", "off")
     
     if classification["path"] == "unknown":
         # Fix: Pass ai_config to triage_unknown
@@ -64,6 +92,7 @@ def analyze(args):
     
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
+    _maybe_persist_ai_config(args, ai_config)
     print(f"Analysis written to {args.out}")
 
 def render(args):
@@ -77,6 +106,18 @@ def render(args):
     
     render_html(result, args.out)
     print(f"Report written to {args.out}")
+
+def test_llm(args):
+    ai_config = _resolve_ai_config(args)
+    ai_config["ai_mode"] = "llm"
+    print("Testing LLM connection...")
+    result = llm_healthcheck(ai_config)
+    if result.get("ok"):
+        print("LLM connection OK.")
+        _maybe_persist_ai_config(args, ai_config)
+        return
+    print(f"LLM connection failed: {result.get('error')}")
+    sys.exit(1)
 
 def interactive():
     """Interactive mode for step-by-step execution."""
@@ -107,10 +148,12 @@ def interactive():
         
         if args.ai_mode == "llm":
              args.api_key = input("API Key: ").strip() or None
-             args.api_base = input("API Base URL (default: https://api.openai.com/v1/chat/completions): ").strip() or None
-             args.api_model = input("API Model (default: gpt-4o-mini): ").strip() or None
-             timeout_val = input("API Timeout (default: 30): ").strip()
+             args.api_base = input("API Base URL: ").strip() or None
+             args.api_model = input("API Model: ").strip() or None
+             timeout_val = input("API Timeout (seconds, optional): ").strip()
              args.api_timeout = float(timeout_val) if timeout_val else None
+             save_choice = input(f"Save AI config to {CONFIG_PATH}? [y/N]: ").strip().lower()
+             args.save_config = save_choice == "y"
     
     if command == "analyze":
         args.out = input("Output JSON path (default: out/result.json): ").strip() or "out/result.json"
@@ -154,6 +197,7 @@ def main():
     analyze_parser.add_argument("--api-base", help="API base URL (overrides AI_API_BASE)")
     analyze_parser.add_argument("--api-model", help="Model name (overrides AI_API_MODEL)")
     analyze_parser.add_argument("--api-timeout", type=float, help="Timeout in seconds (overrides AI_API_TIMEOUT)")
+    analyze_parser.add_argument("--save-config", action="store_true", help="Save AI config to ~/.decipher/config.json")
     
     # Render Command
     render_parser = subparsers.add_parser("render")
@@ -169,9 +213,17 @@ def main():
     run_parser.add_argument("--api-base", help="API base URL (overrides AI_API_BASE)")
     run_parser.add_argument("--api-model", help="Model name (overrides AI_API_MODEL)")
     run_parser.add_argument("--api-timeout", type=float, help="Timeout in seconds (overrides AI_API_TIMEOUT)")
+    run_parser.add_argument("--save-config", action="store_true", help="Save AI config to ~/.decipher/config.json")
     
     # Interactive Command
     subparsers.add_parser("interactive")
+    test_parser = subparsers.add_parser("test-llm")
+    test_parser.add_argument("--ai-mode", choices=["llm"], help="Force AI mode to llm")
+    test_parser.add_argument("--api-key", help="API key (overrides AI_API_KEY)")
+    test_parser.add_argument("--api-base", help="API base URL (overrides AI_API_BASE)")
+    test_parser.add_argument("--api-model", help="Model name (overrides AI_API_MODEL)")
+    test_parser.add_argument("--api-timeout", type=float, help="Timeout in seconds (overrides AI_API_TIMEOUT)")
+    test_parser.add_argument("--save-config", action="store_true", help="Save AI config to ~/.decipher/config.json")
 
     # If no args provided, default to interactive
     if len(sys.argv) == 1:
@@ -197,6 +249,8 @@ def main():
         args.input = json_out
         args.out = html_out
         render(args)
+    elif args.command == "test-llm":
+        test_llm(args)
 
 if __name__ == "__main__":
     try:

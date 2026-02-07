@@ -1,6 +1,26 @@
-Starting application...
-[INFO] App initialized on port 8080
-[INFO] Loading large dataset...
-[INFO] Processing batch 1...
-[INFO] Processing batch 2...
+[INFO] [2023-10-27 14:00:01] Starting Application v2.4.5
+[INFO] [2023-10-27 14:00:02] Loading configuration from /app/config/application.yml
+[INFO] [2023-10-27 14:00:03] Connecting to database at jdbc:postgresql://db:5432/myapp
+[INFO] [2023-10-27 14:00:05] Database connection established
+[INFO] [2023-10-27 14:00:06] Initializing Spring Boot context...
+[INFO] [2023-10-27 14:00:10] Tomcat started on port(s): 8080 (http)
+[INFO] [2023-10-27 14:00:11] Started Application in 9.876 seconds (JVM running for 10.543)
+[INFO] [2023-10-27 14:00:12] Performing scheduled task: DataSync
+[INFO] [2023-10-27 14:00:15] Processing batch 1/1000 - 500 records
+[INFO] [2023-10-27 14:00:18] Processing batch 2/1000 - 500 records
+[INFO] [2023-10-27 14:00:22] Processing batch 3/1000 - 500 records
+[WARN] [2023-10-27 14:00:25] Memory usage at 75%
+[INFO] [2023-10-27 14:00:28] Processing batch 4/1000 - 500 records
+[INFO] [2023-10-27 14:00:32] Processing batch 5/1000 - 500 records
+[WARN] [2023-10-27 14:00:36] Memory usage at 82%
+[INFO] [2023-10-27 14:00:40] Processing batch 6/1000 - 500 records
+[INFO] [2023-10-27 14:00:41] Large payload detected in record ID: 45678, size: 45MB
+[INFO] [2023-10-27 14:00:42] Large payload detected in record ID: 45679, size: 52MB
+[INFO] [2023-10-27 14:00:43] Large payload detected in record ID: 45680, size: 55MB
+[WARN] [2023-10-27 14:00:44] Memory usage at 91%
+[WARN] [2023-10-27 14:00:45] GC overhead limit exceeded warning
+[INFO] [2023-10-27 14:00:46] Attempting to process large batch...
+[INFO] [2023-10-27 14:00:47] Allocating buffer for image processing...
+[WARN] [2023-10-27 14:00:48] Memory usage at 98%
 Killed
+The command '/bin/sh -c java -jar /app/app.jar' returned a non-zero code: 137

@@ -18,6 +18,37 @@ def triage_unknown(
         return _llm_triage(classification, focus_window, evidence, config)
     return _generic_triage(evidence)
 
+def llm_healthcheck(config: Dict[str, Any]) -> Dict[str, Any]:
+    api_key = config.get("api_key") or os.environ.get("AI_API_KEY")
+    api_base = config.get("api_base") or os.environ.get("AI_API_BASE")
+    api_model = config.get("api_model") or os.environ.get("AI_API_MODEL")
+    if not api_key:
+        return {"ok": False, "error": "AI_API_KEY is not set"}
+    if not api_base:
+        return {"ok": False, "error": "AI_API_BASE is not set"}
+    if not api_model:
+        return {"ok": False, "error": "AI_API_MODEL is not set"}
+
+    payload = {
+        "model": api_model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": "Return ONLY JSON: {\"ok\": true}"},
+            {"role": "user", "content": "{\"ping\": true}"},
+        ],
+    }
+
+    try:
+        raw = _send_llm_request(payload, config)
+        parsed = json.loads(raw)
+        content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
+        data = _parse_json_from_text(content)
+        if isinstance(data, dict) and data.get("ok") is True:
+            return {"ok": True}
+        return {"ok": False, "error": "LLM response did not include ok=true"}
+    except Exception as exc:
+        return {"ok": False, "error": f"LLM request failed: {exc}"}
+
 def _mock_triage(evidence: List[Dict], title_prefix: str = "") -> Dict[str, Any]:
     evidence_ids = [e.get("id") for e in evidence if e.get("id")] or ["E1"]
     return {
@@ -66,12 +97,16 @@ def _llm_triage(
     config: Dict[str, Any],
 ) -> Dict[str, Any]:
     api_key = config.get("api_key") or os.environ.get("AI_API_KEY")
-    api_base = config.get("api_base") or os.environ.get("AI_API_BASE") or "https://api.openai.com/v1/chat/completions"
-    api_model = config.get("api_model") or os.environ.get("AI_API_MODEL") or "gpt-4o-mini"
-    timeout = config.get("api_timeout") or os.environ.get("AI_API_TIMEOUT") or 30
+    api_base = config.get("api_base") or os.environ.get("AI_API_BASE")
+    api_model = config.get("api_model") or os.environ.get("AI_API_MODEL")
+    timeout = config.get("api_timeout") or os.environ.get("AI_API_TIMEOUT")
 
     if not api_key:
         return _generic_triage(evidence, reason="AI_MODE=llm but AI_API_KEY not set")
+    if not api_base:
+        return _generic_triage(evidence, reason="AI_MODE=llm but AI_API_BASE not set")
+    if not api_model:
+        return _generic_triage(evidence, reason="AI_MODE=llm but AI_API_MODEL not set")
 
     evidence_text = _format_evidence(evidence)
     prompt = (
@@ -101,17 +136,7 @@ def _llm_triage(
     }
 
     try:
-        request = urllib.request.Request(
-            api_base,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=float(timeout)) as response:
-            raw = response.read().decode("utf-8")
+        raw = _send_llm_request(payload, config)
         parsed = json.loads(raw)
         content = parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
         data = _parse_json_from_text(content)
@@ -130,6 +155,34 @@ def _format_evidence(evidence: List[Dict]) -> List[Dict[str, Any]]:
             }
         )
     return formatted
+
+def _send_llm_request(payload: Dict[str, Any], config: Dict[str, Any]) -> str:
+    api_key = config.get("api_key") or os.environ.get("AI_API_KEY")
+    api_base = config.get("api_base") or os.environ.get("AI_API_BASE")
+    timeout = config.get("api_timeout") or os.environ.get("AI_API_TIMEOUT")
+    if not api_key:
+        raise ValueError("AI_API_KEY is not set")
+    if not api_base:
+        raise ValueError("AI_API_BASE is not set")
+
+    request = urllib.request.Request(
+        api_base,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        timeout_val = float(timeout) if timeout is not None else None
+        with urllib.request.urlopen(request, timeout=timeout_val) as response:
+            return response.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        raise RuntimeError(f"HTTP {e.code} at {api_base}: {error_body}") from e
+    except Exception as e:
+        raise RuntimeError(f"Request failed to {api_base}: {e}") from e
 
 def _parse_json_from_text(text: str) -> Dict[str, Any]:
     try:
