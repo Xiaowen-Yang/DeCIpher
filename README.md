@@ -1,5 +1,5 @@
 # DeCIpher
-CI log explainer with deterministic slicing, conservative known-failure classification, optional LLM triage for unknowns, and a single-file HTML report.
+CI log explainer with deterministic slicing, conservative known-failure classification, optional LLM triage for unknowns, and a single-file HTML report
 
 ## Quick Start
 ```bash
