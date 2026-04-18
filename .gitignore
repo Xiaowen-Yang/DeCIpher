@@ -4,3 +4,5 @@ references/
 tasks/
 decipher-agent-docs
 .claude
+
+.DS_Store
