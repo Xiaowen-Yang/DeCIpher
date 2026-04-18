@@ -10,9 +10,9 @@
   "repair_target_files": ["Dockerfile"],
   "required_tools": ["docker"],
   "docker_verified": true,
-  "verification": ["docker_build", "structural"],
+  "verification": ["docker_build", "healthcheck"],
   "demo_time_seconds": 30,
   "broken_files": ["Dockerfile"],
   "log_file": "logs/runtime-failure.log",
-  "verification_command": "docker build -t decipher-hc-check scenarios/docker-healthcheck-failure/expected -q 2>/dev/null && grep -q 'localhost:3000' scenarios/docker-healthcheck-failure/expected/Dockerfile && docker rmi decipher-hc-check -f >/dev/null 2>&1 && echo PASS || echo FAIL"
+  "verification_command": "bash -lc 'set -euo pipefail; img=decipher-hc-check-$$; ctr=${img}-ctr; cleanup(){ docker rm -f \"$ctr\" >/dev/null 2>&1 || true; docker rmi \"$img\" -f >/dev/null 2>&1 || true; }; trap cleanup EXIT; docker build -t \"$img\" scenarios/docker-healthcheck-failure/expected -q >/dev/null; docker run -d --name \"$ctr\" \"$img\" >/dev/null; for _ in 1 2 3 4 5 6; do status=$(docker inspect --format=\"{{.State.Health.Status}}\" \"$ctr\" 2>/dev/null || true); if [ \"$status\" = \"healthy\" ]; then echo PASS; exit 0; fi; sleep 3; done; echo FAIL'"
 }

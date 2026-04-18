@@ -23,9 +23,7 @@ The fix must change `8080` to `3000` in the HEALTHCHECK CMD line. No other lines
 ## Verification
 
 ```bash
-docker build -t decipher-hc-check scenarios/docker-healthcheck-failure/expected
-grep -q 'localhost:3000' scenarios/docker-healthcheck-failure/expected/Dockerfile && echo PASS
-docker rmi decipher-hc-check
+./scripts/verify.sh scenarios/docker-healthcheck-failure
 ```
 
 Expected output: `PASS`
@@ -36,4 +34,4 @@ Expected output: `PASS`
 - [ ] Confidence >= 0.80
 - [ ] Patch targets only the HEALTHCHECK line
 - [ ] `docker build` on expected succeeds
-- [ ] Grep confirms port 3000 in expected Dockerfile
+- [ ] Expected container reaches `healthy` via Docker healthcheck polling

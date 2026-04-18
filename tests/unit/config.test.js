@@ -37,6 +37,7 @@ test('CONFIG_DEFAULTS has required keys', () => {
   assert.ok('max_iterations' in CONFIG_DEFAULTS);
   assert.ok('auto_approve' in CONFIG_DEFAULTS);
   assert.ok('approval_policy' in CONFIG_DEFAULTS);
+  assert.ok('notification_command' in CONFIG_DEFAULTS);
 });
 
 test('maskSecret hides most of the api key', () => {

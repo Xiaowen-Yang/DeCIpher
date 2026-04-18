@@ -20,6 +20,7 @@ import { startSpinner } from "../../lib/spinner.js";
 import { createWorkspace, writeBack, readWorkspaceFiles, cleanupWorkspace } from "./workspace.js";
 import { runCommand } from "./runner.js";
 import { persistSessionSnapshot } from "../../lib/session-store.js";
+import { runCompletionNotification } from "../../lib/notifications.js";
 
 const MAX_ITERATIONS = 3;
 
@@ -114,6 +115,7 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
       outcome: "FAIL",
       error: err.message,
     });
+    await notify("BUILD_FAIL", "workspace_creation_failed", null);
     return {
       outcome: "FAIL", state: "BUILD_FAIL", writtenBack: [],
       workspace: null, iterations: 0,
@@ -127,6 +129,14 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
   let finalState       = "FAIL";
   let preserveWorkspace = false;
   let completedIterations = startIteration - 1;
+  const notify = async (status, stopReason = null, workspacePath = null) => {
+    return runCompletionNotification(config.notification_command, {
+      status,
+      targetPath: scenarioPath,
+      workspacePath,
+      stopReason,
+    });
+  };
 
   try {
     for (let iteration = startIteration; iteration <= MAX_ITERATIONS; iteration++) {
@@ -193,6 +203,7 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
           resumable: true,
           outcome: "NEEDS_HUMAN_REVIEW",
         });
+        await notify(result.state, "low_confidence", workspace);
         return {
           outcome: "NEEDS_HUMAN_REVIEW", state: result.state, writtenBack: [],
           workspace: preserveWorkspace ? workspace : null,
@@ -223,6 +234,7 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
           resumable: true,
           outcome: "NEEDS_HUMAN_REVIEW",
         });
+        await notify(result.state, "same_patch_repeated", workspace);
         return {
           outcome: "NEEDS_HUMAN_REVIEW", state: result.state, writtenBack: [],
           workspace: preserveWorkspace ? workspace : null,
@@ -246,6 +258,7 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
           resumable: true,
           outcome: "NEEDS_HUMAN_REVIEW",
         });
+        await notify(result.state, "patch_scope_too_large", workspace);
         return {
           outcome: "NEEDS_HUMAN_REVIEW", state: result.state, writtenBack: [],
           workspace: preserveWorkspace ? workspace : null,
@@ -274,6 +287,37 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
     // ── Write back on success ───────────────────────────────
     let writtenBack = [];
     if (finalState === "PASS" && writeback) {
+      const writebackAllowed = options.sessionContext?.confirmWriteback
+        ? await options.sessionContext.confirmWriteback(repairFiles)
+        : true;
+
+      if (!writebackAllowed) {
+        preserveWorkspace = true;
+        const sessionSnapshot = await saveSnapshot({
+          iteration: completedIterations,
+          workspace_path: workspace,
+          last_verification_state: finalState,
+          classification,
+          patch: lastPatch,
+          written_back: [],
+          resumable: true,
+          outcome: "NEEDS_HUMAN_REVIEW",
+          stop_reason: "writeback_declined",
+        });
+        await notify(finalState, "writeback_declined", workspace);
+        return {
+          outcome: "NEEDS_HUMAN_REVIEW",
+          state: finalState,
+          writtenBack: [],
+          workspace,
+          iterations: completedIterations,
+          classification: classification ?? {},
+          patch: lastPatch,
+          sessionSnapshot,
+          transcript: lines.join("\n"),
+        };
+      }
+
       const wbSp = startSpinner("Writing back repaired files");
       writtenBack = await writeBack(workspace, brokenDir, repairFiles);
       wbSp.stop(`Write-back complete: ${writtenBack.join(", ")}`);
@@ -290,6 +334,7 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
       resumable: finalState !== "PASS",
       outcome: finalState === "PASS" ? "PASS" : "FAIL",
     });
+    await notify(finalState, finalState === "PASS" ? null : "loop_complete", finalState === "PASS" ? null : workspace);
 
     return {
       outcome: finalState === "PASS" ? "PASS" : "FAIL",

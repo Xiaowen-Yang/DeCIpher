@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseFixResponse } from '../../agents/fixer/index.js';
+import { parseFixResponse, buildDeterministicFix } from '../../agents/fixer/index.js';
 
 test('parseFixResponse extracts valid patch artifact', () => {
   const raw = JSON.stringify({
@@ -40,4 +40,82 @@ test('parseFixResponse throws when affected_files is empty', () => {
     () => parseFixResponse(raw),
     { message: /No affected files/ }
   );
+});
+
+test('buildDeterministicFix returns COPY path repair for docker path_or_copy_error', () => {
+  const artifact = buildDeterministicFix(
+    {
+      classification: 'path_or_copy_error',
+      confidence: 1,
+      root_causes: [],
+    },
+    {
+      broken_files: [
+        {
+          path: 'Dockerfile',
+          content: 'FROM node:18-alpine\nWORKDIR /app\nCOPY src/ .\nRUN npm install\n',
+        },
+      ],
+    },
+  );
+
+  assert.ok(artifact, 'expected deterministic artifact');
+  assert.deepEqual(artifact.affected_files, ['Dockerfile']);
+  assert.match(artifact.patch, /-COPY src\/ \./);
+  assert.match(artifact.patch, /\+COPY \. \./);
+  assert.equal(artifact.risk, 'low');
+});
+
+test('buildDeterministicFix returns healthcheck port repair when Dockerfile shows 8080 vs 3000 mismatch', () => {
+  const artifact = buildDeterministicFix(
+    {
+      classification: 'healthcheck_startup_failure',
+      confidence: 1,
+      root_causes: [
+        {
+          hypothesis: 'port mismatch',
+          evidence: 'HEALTHCHECK probes localhost:8080 but the app listens on port 3000',
+        },
+      ],
+    },
+    {
+      broken_files: [
+        {
+          path: 'Dockerfile',
+          content: [
+            'FROM node:18-alpine',
+            'EXPOSE 3000',
+            'HEALTHCHECK --interval=5s --timeout=3s --retries=3 \\',
+            '  CMD wget -qO- http://localhost:8080/ || exit 1',
+            'CMD ["node", "server.js"]',
+          ].join('\n'),
+        },
+      ],
+    },
+  );
+
+  assert.ok(artifact, 'expected deterministic artifact');
+  assert.deepEqual(artifact.affected_files, ['Dockerfile']);
+  assert.match(artifact.patch, /localhost:8080/);
+  assert.match(artifact.patch, /localhost:3000/);
+});
+
+test('buildDeterministicFix returns null when no deterministic Docker repair matches', () => {
+  const artifact = buildDeterministicFix(
+    {
+      classification: 'docker_entrypoint_runtime_error',
+      confidence: 1,
+      root_causes: [],
+    },
+    {
+      broken_files: [
+        {
+          path: 'Dockerfile',
+          content: 'FROM node:18-alpine\nCMD ["node", "server.js"]\n',
+        },
+      ],
+    },
+  );
+
+  assert.equal(artifact, null);
 });

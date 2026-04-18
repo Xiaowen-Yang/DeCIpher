@@ -13,5 +13,5 @@
   "demo_time_seconds": 25,
   "broken_files": ["Dockerfile"],
   "log_file": "logs/build-failure.log",
-  "verification_command": "docker build -f scenarios/docker-copy-path-bug/expected/Dockerfile -t decipher-cpb-check . && docker rmi decipher-cpb-check -f >/dev/null 2>&1 && echo PASS || echo FAIL"
+  "verification_command": "docker build -t decipher-cpb-check scenarios/docker-copy-path-bug/expected && docker rmi decipher-cpb-check -f >/dev/null 2>&1 && echo PASS || echo FAIL"
 }

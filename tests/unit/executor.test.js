@@ -4,7 +4,12 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-const { resolveTarget, detectAction } = await import('../../agents/executor/index.js');
+const {
+  resolveTarget,
+  detectAction,
+  askApproval,
+  shouldConfirmWriteback,
+} = await import('../../agents/executor/index.js');
 
 test('resolveTarget detects a scenario directory from natural-language input', async () => {
   const root = await mkdtemp(join(tmpdir(), 'decipher-executor-'));
@@ -45,6 +50,59 @@ test('detectAction prefers triage_only when user asks to diagnose only', () => {
   assert.equal(detectAction('triage this failure log', 'logfile'), 'triage_only');
 });
 
-test('detectAction maps build language to docker_build', () => {
-  assert.equal(detectAction('build this container', 'scenario'), 'docker_build');
+test('detectAction keeps scenario build requests on the fix loop', () => {
+  assert.equal(detectAction('build this container', 'scenario'), 'fix');
+});
+
+test('detectAction maps build language to docker_build for raw Dockerfile targets', () => {
+  assert.equal(detectAction('build this container', 'dockerfile'), 'docker_build');
+});
+
+test('askApproval auto-approves never policy without prompting', async () => {
+  let prompted = false;
+  const approved = await askApproval({
+    question: () => { prompted = true; },
+  }, {
+    approved: false,
+    approvalPolicy: 'never',
+  });
+
+  assert.equal(approved, true);
+  assert.equal(prompted, false);
+});
+
+test('askApproval auto-approves on-failure policy without prompting', async () => {
+  let prompted = false;
+  const approved = await askApproval({
+    question: () => { prompted = true; },
+  }, {
+    approved: false,
+    approvalPolicy: 'on-failure',
+  });
+
+  assert.equal(approved, true);
+  assert.equal(prompted, false);
+});
+
+test('askApproval prompts once for on-request policy', async () => {
+  let prompts = 0;
+  const rl = {
+    question: (_prompt, cb) => {
+      prompts += 1;
+      cb('y');
+    },
+  };
+
+  const state = { approved: false, approvalPolicy: 'on-request' };
+  const approved = await askApproval(rl, state);
+
+  assert.equal(approved, true);
+  assert.equal(state.approved, true);
+  assert.equal(prompts, 1);
+});
+
+test('shouldConfirmWriteback requires confirmation except for never policy', () => {
+  assert.equal(shouldConfirmWriteback({ approvalPolicy: 'on-request' }), true);
+  assert.equal(shouldConfirmWriteback({ approvalPolicy: 'on-failure' }), true);
+  assert.equal(shouldConfirmWriteback({ approvalPolicy: 'never' }), false);
 });

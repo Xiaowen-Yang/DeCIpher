@@ -42,6 +42,67 @@ function getSkillFile(classification) {
   return 'ci-triage';
 }
 
+function buildSingleLinePatch(path, fromLine, toLine, lineNumber) {
+  return [
+    `--- a/${path}`,
+    `+++ b/${path}`,
+    `@@ -${lineNumber} +${lineNumber} @@`,
+    `-${fromLine}`,
+    `+${toLine}`,
+  ].join('\n');
+}
+
+function findDockerfile(context) {
+  return (context.broken_files ?? []).find((file) => file.path === 'Dockerfile') ?? null;
+}
+
+export function buildDeterministicFix(classificationArtifact, context) {
+  const dockerfile = findDockerfile(context);
+  if (!dockerfile) return null;
+
+  const { classification, root_causes = [] } = classificationArtifact;
+  const lines = dockerfile.content.split('\n');
+
+  if (classification === 'path_or_copy_error') {
+    const lineIndex = lines.findIndex((line) => line.trim() === 'COPY src/ .');
+    if (lineIndex !== -1) {
+      return {
+        affected_files: ['Dockerfile'],
+        patch: buildSingleLinePatch('Dockerfile', 'COPY src/ .', 'COPY . .', lineIndex + 1),
+        rationale: 'The Docker build context is the broken/ workspace itself, so COPY must reference the current directory.',
+        risk: 'low',
+        blast_radius: 'Dockerfile COPY source path only',
+        rollback_hint: 'git checkout -- Dockerfile',
+      };
+    }
+  }
+
+  if (classification === 'healthcheck_startup_failure') {
+    const evidenceText = root_causes
+      .map((rootCause) => `${rootCause.hypothesis ?? ''} ${rootCause.evidence ?? ''}`)
+      .join(' ')
+      .toLowerCase();
+    const lineIndex = lines.findIndex((line) => line.includes('http://localhost:8080/'));
+    const appPort = evidenceText.includes('3000') || dockerfile.content.includes('EXPOSE 3000') ? '3000' : null;
+    if (lineIndex !== -1 && appPort) {
+      const fromLine = lines[lineIndex];
+      const toLine = fromLine.replace('http://localhost:8080/', `http://localhost:${appPort}/`);
+      if (fromLine !== toLine) {
+        return {
+          affected_files: ['Dockerfile'],
+          patch: buildSingleLinePatch('Dockerfile', fromLine, toLine, lineIndex + 1),
+          rationale: 'The HEALTHCHECK port must match the port the app actually listens on.',
+          risk: 'low',
+          blast_radius: 'Dockerfile healthcheck command only',
+          rollback_hint: 'git checkout -- Dockerfile',
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
  * Propose a fix for a classified failure.
  * @param {object} classificationArtifact - from triage node
@@ -51,6 +112,11 @@ function getSkillFile(classification) {
  */
 export async function proposeFix(classificationArtifact, context, config) {
   const { classification, confidence, root_causes } = classificationArtifact;
+
+  const deterministicFix = buildDeterministicFix(classificationArtifact, context);
+  if (deterministicFix) {
+    return deterministicFix;
+  }
 
   const skillName = getSkillFile(classification);
   const skillContent = await readFile(

@@ -2,7 +2,7 @@
 
 **Classification:** `healthcheck_startup_failure`
 **Difficulty:** Easy
-**Docker verified:** Yes (real `docker build` in verification)
+**Docker verified:** Yes (real `docker build` + `docker run` + healthcheck poll in verification)
 
 ## Problem
 
@@ -31,20 +31,11 @@ Change the healthcheck port to match the server port:
 ## Verification
 
 ```bash
-# Build expected image — must succeed
-docker build -t decipher-hc-check scenarios/docker-healthcheck-failure/expected
-
-# Confirm healthcheck uses correct port
-grep 'localhost:3000' scenarios/docker-healthcheck-failure/expected/Dockerfile
-
-# Optional: run container and check health
-docker run -d --name hc-test decipher-hc-check
-sleep 15
-docker inspect hc-test --format='{{.State.Health.Status}}'
-# Expected: healthy
-docker rm -f hc-test
-docker rmi decipher-hc-check
+# End-to-end verification: build expected image, run it, and wait for health=healthy
+./scripts/verify.sh scenarios/docker-healthcheck-failure
 ```
+
+Expected: `PASS`
 
 ## Demo Notes
 

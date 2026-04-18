@@ -83,6 +83,52 @@ test('applyPatch: pure insertion hunk (no paired removal)', async () => {
   await rm(`${testFile}.bak`, { force: true });
 });
 
+test('applyPatch: multiline replacement with context keeps following CMD intact', async () => {
+  const { writeFile, readFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const testFile = join(tmpdir(), `decipher-test-multiline-${Date.now()}.Dockerfile`);
+  const original = [
+    'FROM node:18-alpine',
+    '',
+    'HEALTHCHECK --interval=5s --timeout=3s --retries=3 \\',
+    '  CMD wget -qO- http://localhost:8080/ || exit 1',
+    '',
+    'CMD ["node", "server.js"]',
+    '',
+  ].join('\n');
+  await writeFile(testFile, original, 'utf8');
+
+  const patch = [
+    '--- a/Dockerfile',
+    '+++ b/Dockerfile',
+    '@@ -2,6 +2,6 @@',
+    ' ',
+    '-HEALTHCHECK --interval=5s --timeout=3s --retries=3 \\',
+    '-  CMD wget -qO- http://localhost:8080/ || exit 1',
+    '+HEALTHCHECK --interval=5s --timeout=3s --retries=3 \\',
+    '+  CMD wget -qO- http://localhost:3000/ || exit 1',
+    ' ',
+    ' CMD ["node", "server.js"]',
+  ].join('\n');
+
+  await applyPatch(patch, testFile);
+
+  const content = await readFile(testFile, 'utf8');
+  assert.match(content, /localhost:3000\//, 'replacement must update the healthcheck port');
+  assert.doesNotMatch(content, /localhost:8080\//, 'old healthcheck port must be removed');
+  assert.equal(
+    content.match(/CMD wget -qO- http:\/\/localhost:3000\/ \|\| exit 1/g)?.length ?? 0,
+    1,
+    'replacement line must not be duplicated',
+  );
+  assert.match(content, /CMD \["node", "server\.js"\]/, 'following CMD line must remain intact');
+
+  await rm(testFile, { force: true });
+  await rm(`${testFile}.bak`, { force: true });
+});
+
 // ── runVerification PASS/FAIL detection ────────────────────
 
 test('runVerification: reports FAIL when stdout ends with FAIL (exit 0)', async () => {

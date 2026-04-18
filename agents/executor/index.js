@@ -116,7 +116,10 @@ const ACTION_KEYWORDS = {
 export function detectAction(input, targetType) {
   if (ACTION_KEYWORDS.triage_only.test(input)) return "triage_only";
   if (ACTION_KEYWORDS.demo.test(input))        return "demo";
-  if (ACTION_KEYWORDS.docker_build.test(input) || targetType === "dockerfile") {
+  if (targetType === "dockerfile") {
+    return "docker_build";
+  }
+  if (ACTION_KEYWORDS.docker_build.test(input) && targetType !== "scenario") {
     return "docker_build";
   }
   return "fix"; // default: unified executor loop (triage → fix → verify → writeback)
@@ -131,6 +134,10 @@ const CAPABILITIES = [
   "retry — attempt up to 3 fix iterations automatically",
   "write — write repaired files back to broken/ on success",
 ];
+
+export function shouldConfirmWriteback(state = {}) {
+  return (state.approvalPolicy ?? "on-request") !== "never";
+}
 
 /**
  * One-time session approval prompt (Codex-style).
@@ -167,6 +174,30 @@ export async function askApproval(rl, state) {
   }
 
   return approved;
+}
+
+export async function confirmWriteback(rl, state, files = []) {
+  if (!shouldConfirmWriteback(state)) {
+    return true;
+  }
+
+  process.stdout.write("\n");
+  console.log(pc.bold(pc.yellow("  Confirm write-back")));
+  console.log(pc.dim("  The repaired temp workspace is ready to write back to broken/."));
+  if (files.length > 0) {
+    console.log(pc.dim(`  Files: ${files.join(", ")}`));
+  }
+
+  const answer = await new Promise((res) =>
+    rl.question(`  ${pc.bold("Write repaired files back?")} [y/N] `, res),
+  );
+  const confirmed = /^y/i.test(answer.trim());
+
+  if (!confirmed) {
+    console.log(`\n  ${pc.yellow("✗")} Write-back declined. Preserving temp workspace only.\n`);
+  }
+
+  return confirmed;
 }
 
 // ── Main executor dispatch ────────────────────────────────────────────────────

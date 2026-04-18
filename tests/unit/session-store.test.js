@@ -17,6 +17,7 @@ const {
   clearSessionSnapshot,
   maskSessionSnapshot,
   formatSessionSnapshot,
+  buildSessionSummary,
 } = await import("../../lib/session-store.js");
 
 test("loadSessionSnapshot returns null when no snapshot has been persisted", async () => {
@@ -42,8 +43,11 @@ test("persistSessionSnapshot writes a snapshot that loadSessionSnapshot returns"
   const persisted = await persistSessionSnapshot(snapshot);
   const loaded = await loadSessionSnapshot();
 
-  assert.deepEqual(persisted, snapshot);
-  assert.deepEqual(loaded, snapshot);
+  assert.equal(persisted.scenarioPath, snapshot.scenarioPath);
+  assert.equal(loaded.scenarioPath, snapshot.scenarioPath);
+  assert.deepEqual(loaded.config, snapshot.config);
+  assert.deepEqual(loaded.result, snapshot.result);
+  assert.ok(loaded.summary);
 });
 
 test("clearSessionSnapshot removes the persisted snapshot file", async () => {
@@ -96,6 +100,39 @@ test("formatSessionSnapshot returns pretty JSON and masks secrets in public mode
   assert.match(formatted, /\n  "scenarioPath": "\/tmp\/example"/);
   assert.match(formatted, /"api_key": "sk-\*\*\*90"/);
   assert.doesNotMatch(formatted, /1234567890/);
+});
+
+test("buildSessionSummary compacts a verbose snapshot into resume-friendly fields", () => {
+  const summary = buildSessionSummary({
+    target_path: "/tmp/scenarios/docker-copy-path-bug",
+    target_type: "scenario",
+    scenario_id: "docker-copy-path-bug",
+    execution_mode: "docker_build",
+    iteration: 2,
+    last_verification_state: "BUILD_FAIL",
+    stop_reason: "max_iterations",
+    classification: {
+      classification: "path_or_copy_error",
+      confidence: 0.91,
+    },
+    repair_target_files: ["Dockerfile"],
+    written_back: ["Dockerfile"],
+    transcript: "very long transcript that should not appear verbatim",
+  });
+
+  assert.deepEqual(summary, {
+    target_path: "/tmp/scenarios/docker-copy-path-bug",
+    target_type: "scenario",
+    scenario_id: "docker-copy-path-bug",
+    execution_mode: "docker_build",
+    iteration: 2,
+    last_verification_state: "BUILD_FAIL",
+    stop_reason: "max_iterations",
+    classification: "path_or_copy_error",
+    confidence: 0.91,
+    files_touched: ["Dockerfile"],
+    files_written_back: ["Dockerfile"],
+  });
 });
 
 test("session-store cleanup", async () => {

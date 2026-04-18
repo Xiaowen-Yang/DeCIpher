@@ -13,7 +13,7 @@
 
 ## Verification Command
 ```bash
-docker build -f scenarios/docker-copy-path-bug/expected/Dockerfile -t decipher-test . && echo PASS || echo FAIL
+docker build -t decipher-test scenarios/docker-copy-path-bug/expected && echo PASS || echo FAIL
 ```
 
 ## Pass Criteria
