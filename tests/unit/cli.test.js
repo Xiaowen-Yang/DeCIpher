@@ -1,71 +1,59 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { spawn } from "node:child_process";
+import { join } from "node:path";
 
-async function runCliSession(commands, config = {}) {
-  const configDir = await mkdtemp(join(tmpdir(), "decipher-cli-test-"));
-  await mkdir(configDir, { recursive: true });
-  await writeFile(
-    join(configDir, "config.json"),
-    JSON.stringify({
+process.env.DECIPHER_CONFIG_DIR = join(tmpdir(), `decipher-cli-test-${Date.now()}`);
+
+const {
+  buildCliStatusSnapshot,
+  buildCliReviewSnapshot,
+  suggestCliSlashCommand,
+} = await import("../../lib/cli-surface.js");
+
+test("status snapshot shows approval policy and persistence visibility", () => {
+  const snapshot = buildCliStatusSnapshot(
+    {
       provider: "openai",
       model: "gpt-4o",
-      api_key: "sk-test-cli",
+      base_url: null,
       approval_policy: "never",
-      ...config,
-    }, null, 2),
-    "utf8",
+      max_iterations: 3,
+    },
+    {
+      approved: false,
+      approvalPolicy: "never",
+      currentTarget: null,
+      lastVerificationResult: null,
+      lastRunResult: null,
+    },
   );
 
-  return await new Promise((resolvePromise, reject) => {
-    const child = spawn(process.execPath, [resolve("bin/decipher")], {
-      cwd: resolve("."),
-      env: {
-        ...process.env,
-        DECIPHER_CONFIG_DIR: configDir,
+  assert.equal(snapshot.approval_policy, "never");
+  assert.match(snapshot.persistence.history_path, /history\.jsonl$/);
+  assert.match(snapshot.persistence.session_path, /session\.json$/);
+});
+
+test("review snapshot includes would_write_back and patch preview", () => {
+  const review = buildCliReviewSnapshot({
+    currentTarget: { path: "/tmp/scenario" },
+    lastVerificationResult: "PASS",
+    lastRunResult: {
+      workspace: "/tmp/workspace",
+      writtenBack: ["Dockerfile"],
+      patch: "--- a/Dockerfile\n+++ b/Dockerfile\n@@ -1 +1 @@\n-foo\n+bar",
+      classification: {
+        classification: "path_or_copy_error",
+        confidence: 0.95,
       },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      resolvePromise({ code, stdout, stderr });
-    });
-
-    child.stdin.write(commands.join("\n") + "\n");
-    child.stdin.end();
+    },
   });
-}
 
-test("interactive /status shows approval policy and persistence visibility", async () => {
-  const result = await runCliSession(["/status", "/quit"]);
-
-  assert.equal(result.code, 0);
-  assert.match(result.stdout, /"approval_policy": "never"/);
-  assert.match(result.stdout, /"history_path":/);
-  assert.match(result.stdout, /"session_path":/);
+  assert.deepEqual(review.would_write_back, ["Dockerfile"]);
+  assert.equal(review.classification, "path_or_copy_error");
+  assert.match(review.patch_preview, /Dockerfile/);
 });
 
-test("interactive /review prints current review snapshot", async () => {
-  const result = await runCliSession(["/review", "/quit"]);
-
-  assert.equal(result.code, 0);
-  assert.match(result.stdout, /REVIEW/);
-  assert.match(result.stdout, /"would_write_back": \[/);
-});
-
-test("unknown slash command suggests nearby valid command", async () => {
-  const result = await runCliSession(["/settings", "/quit"]);
-
-  assert.equal(result.code, 0);
-  assert.match(result.stdout, /Did you mean:/);
-  assert.match(result.stdout, /\/setting/);
+test("unknown slash command suggests nearby valid command", () => {
+  assert.equal(suggestCliSlashCommand("settings"), "/setting");
 });

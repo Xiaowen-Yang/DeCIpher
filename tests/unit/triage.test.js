@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTriageResponse, TAXONOMY } from '../../agents/triage/index.js';
+import { parseTriageResponse, TAXONOMY, buildDeterministicTriage } from '../../agents/triage/index.js';
 
 test('parseTriageResponse extracts valid classification artifact', () => {
   const raw = JSON.stringify({
@@ -57,4 +57,47 @@ test('TAXONOMY contains all 10 required labels', () => {
   for (const label of required) {
     assert.ok(TAXONOMY.includes(label), `Missing taxonomy label: ${label}`);
   }
+});
+
+test('buildDeterministicTriage recognizes docker COPY path failures without calling the model', () => {
+  const result = buildDeterministicTriage(
+    [
+      '#6 [3/4] COPY src/ .',
+      '#6 ERROR: failed to solve: failed to read dockerfile: failed to copy files: stat src/: file does not exist',
+    ].join('\n'),
+    { category: 'docker' },
+  );
+
+  assert.ok(result);
+  assert.equal(result.classification, 'path_or_copy_error');
+  assert.equal(result.needs_more_evidence, false);
+});
+
+test('buildDeterministicTriage recognizes unhealthy docker healthcheck failures', () => {
+  const result = buildDeterministicTriage(
+    [
+      '$ docker ps',
+      'demo-app "node server.js" Up 45s (unhealthy)',
+      '$ docker logs demo',
+      'Server listening on port 3000',
+    ].join('\n'),
+    { category: 'docker' },
+  );
+
+  assert.ok(result);
+  assert.equal(result.classification, 'healthcheck_startup_failure');
+});
+
+test('buildDeterministicTriage recognizes missing env runtime contract failures', () => {
+  const result = buildDeterministicTriage(
+    [
+      '$ docker run --rm api-server',
+      'FATAL: DATABASE_URL environment variable is required but not set',
+      'Set it via -e DATABASE_URL=<url> or add ENV in the Dockerfile',
+    ].join('\n'),
+    { category: 'docker' },
+  );
+
+  assert.ok(result);
+  assert.equal(result.classification, 'missing_env_or_secret_contract');
 });

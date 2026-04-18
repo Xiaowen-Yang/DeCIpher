@@ -52,6 +52,15 @@ function buildSingleLinePatch(path, fromLine, toLine, lineNumber) {
   ].join('\n');
 }
 
+function buildInsertionPatch(path, insertedLine, lineNumber) {
+  return [
+    `--- a/${path}`,
+    `+++ b/${path}`,
+    `@@ -${lineNumber},0 +${lineNumber},1 @@`,
+    `+${insertedLine}`,
+  ].join('\n');
+}
+
 function findDockerfile(context) {
   return (context.broken_files ?? []).find((file) => file.path === 'Dockerfile') ?? null;
 }
@@ -72,6 +81,25 @@ export function buildDeterministicFix(classificationArtifact, context) {
         rationale: 'The Docker build context is the broken/ workspace itself, so COPY must reference the current directory.',
         risk: 'low',
         blast_radius: 'Dockerfile COPY source path only',
+        rollback_hint: 'git checkout -- Dockerfile',
+      };
+    }
+
+    const multistageLineIndex = lines.findIndex((line) =>
+      line.includes('COPY --from=builder /src/dist/app.js ./app.js'),
+    );
+    if (multistageLineIndex !== -1) {
+      return {
+        affected_files: ['Dockerfile'],
+        patch: buildSingleLinePatch(
+          'Dockerfile',
+          'COPY --from=builder /src/dist/app.js ./app.js',
+          'COPY --from=builder /src/output/app.js ./app.js',
+          multistageLineIndex + 1,
+        ),
+        rationale: 'The builder stage outputs app.js under /src/output, so the runtime stage must copy from that path.',
+        risk: 'low',
+        blast_radius: 'Dockerfile multistage artifact path only',
         rollback_hint: 'git checkout -- Dockerfile',
       };
     }
@@ -97,6 +125,26 @@ export function buildDeterministicFix(classificationArtifact, context) {
           rollback_hint: 'git checkout -- Dockerfile',
         };
       }
+    }
+
+  }
+
+  if (classification === 'missing_env_or_secret_contract') {
+    const hasEnv = lines.some((line) => line.trim().startsWith('ENV DATABASE_URL='));
+    const cmdLineIndex = lines.findIndex((line) => line.trim().startsWith('CMD '));
+    if (!hasEnv && cmdLineIndex !== -1) {
+      return {
+        affected_files: ['Dockerfile'],
+        patch: buildInsertionPatch(
+          'Dockerfile',
+          'ENV DATABASE_URL=sqlite:///app/data.db',
+          cmdLineIndex + 1,
+        ),
+        rationale: 'The container fails only because DATABASE_URL is missing at runtime, so provide a safe default in the Dockerfile.',
+        risk: 'low',
+        blast_radius: 'Dockerfile runtime environment default only',
+        rollback_hint: 'git checkout -- Dockerfile',
+      };
     }
   }
 

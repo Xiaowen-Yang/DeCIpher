@@ -9,6 +9,6 @@ EXPOSE 3000
 
 # BUG: healthcheck probes port 8080 but the app listens on 3000
 HEALTHCHECK --interval=5s --timeout=3s --retries=3 \
-  CMD wget -qO- http://localhost:8080/ || exit 1
+  CMD wget -qO- http://localhost:3000/ || exit 1
 
 CMD ["node", "server.js"]

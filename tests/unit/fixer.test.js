@@ -100,6 +100,65 @@ test('buildDeterministicFix returns healthcheck port repair when Dockerfile show
   assert.match(artifact.patch, /localhost:3000/);
 });
 
+test('buildDeterministicFix returns multistage artifact path repair for docker path_or_copy_error', () => {
+  const artifact = buildDeterministicFix(
+    {
+      classification: 'path_or_copy_error',
+      confidence: 1,
+      root_causes: [],
+    },
+    {
+      broken_files: [
+        {
+          path: 'Dockerfile',
+          content: [
+            'FROM node:18-alpine AS builder',
+            'WORKDIR /src',
+            'RUN mkdir -p output && cp index.js output/app.js',
+            'FROM node:18-alpine AS runner',
+            'WORKDIR /app',
+            'COPY --from=builder /src/dist/app.js ./app.js',
+            'CMD ["node", "app.js"]',
+          ].join('\n'),
+        },
+      ],
+    },
+  );
+
+  assert.ok(artifact, 'expected deterministic artifact');
+  assert.deepEqual(artifact.affected_files, ['Dockerfile']);
+  assert.match(artifact.patch, /\/src\/dist\/app\.js/);
+  assert.match(artifact.patch, /\/src\/output\/app\.js/);
+});
+
+test('buildDeterministicFix inserts a default DATABASE_URL for missing env runtime failures', () => {
+  const artifact = buildDeterministicFix(
+    {
+      classification: 'missing_env_or_secret_contract',
+      confidence: 1,
+      root_causes: [],
+    },
+    {
+      broken_files: [
+        {
+          path: 'Dockerfile',
+          content: [
+            'FROM node:18-alpine',
+            'WORKDIR /app',
+            'COPY package.json server.js ./',
+            'EXPOSE 3000',
+            'CMD ["node", "server.js"]',
+          ].join('\n'),
+        },
+      ],
+    },
+  );
+
+  assert.ok(artifact, 'expected deterministic artifact');
+  assert.deepEqual(artifact.affected_files, ['Dockerfile']);
+  assert.match(artifact.patch, /ENV DATABASE_URL=sqlite:\/\/\/app\/data\.db/);
+});
+
 test('buildDeterministicFix returns null when no deterministic Docker repair matches', () => {
   const artifact = buildDeterministicFix(
     {

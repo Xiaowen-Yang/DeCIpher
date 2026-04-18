@@ -17,6 +17,7 @@ Thumbs.db
 
 # local agent tooling
 .claude/
+.codex
 
 # reference material (read-only, not part of the product)
 references/

@@ -50,25 +50,41 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
   const { proposeFix } = await import("../fixer/index.js");
   const { applyPatch } = await import("../verifier/index.js");
 
-  const brokenDir     = join(scenarioPath, "broken");
+  const sourceDir = options.sourceDir ?? join(scenarioPath, "broken");
+  const writebackDir = options.writebackDir ?? sourceDir;
+  const targetPath = options.targetPath ?? scenarioPath;
+  const targetType = options.targetType ?? "scenario";
   const executionMode = meta.execution_mode ?? "docker_build";
-  const repairFiles   = meta.repair_target_files ?? meta.broken_files ?? ["Dockerfile"];
-  const writeback     = meta.writeback_on_success !== false;
+  const repairFiles = meta.repair_target_files ?? meta.broken_files ?? ["Dockerfile"];
+  const writeback = meta.writeback_on_success !== false;
   const supplementLog = meta.log_file ? join(scenarioPath, meta.log_file) : null;
 
   const lines = []; // transcript accumulator
   const log = (msg) => { lines.push(msg); };
   const resumeFrom = options.resumeFrom ?? null;
+  const keepRuntimeArtifacts = options.keepRuntimeArtifacts === true;
   const approvalPolicy = options.sessionContext?.approvalPolicy ?? config.approval_policy ?? "on-request";
   const approved = options.sessionContext?.approved ?? false;
+  const notify = async (status, stopReason = null, workspacePath = null) => {
+    try {
+      return await runCompletionNotification(config.notification_command, {
+        status,
+        targetPath,
+        workspacePath,
+        stopReason,
+      });
+    } catch {
+      return null;
+    }
+  };
 
   log(pc.bold(`\n  [executor] scenario: ${meta.id}`));
   log(pc.dim(`  mode: ${executionMode}  max_retries: ${MAX_ITERATIONS}`));
 
   async function saveSnapshot(extra = {}) {
     const snapshot = {
-      target_path: scenarioPath,
-      target_type: "scenario",
+      target_path: targetPath,
+      target_type: targetType,
       scenario_id: meta.id,
       execution_mode: executionMode,
       repair_target_files: repairFiles,
@@ -93,7 +109,7 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
       sp.stop(`Resuming workspace → ${pc.dim(workspace)}`);
       log(`  resumed workspace: ${workspace}`);
     } else {
-      workspace = await createWorkspace(brokenDir, meta.id);
+      workspace = await createWorkspace(sourceDir, meta.id);
       sp.stop(`Workspace ready → ${pc.dim(workspace)}`);
       log(`  workspace: ${workspace}`);
     }
@@ -114,29 +130,29 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
       resumable: false,
       outcome: "FAIL",
       error: err.message,
-    });
+    }).catch(() => null);
     await notify("BUILD_FAIL", "workspace_creation_failed", null);
     return {
       outcome: "FAIL", state: "BUILD_FAIL", writtenBack: [],
       workspace: null, iterations: 0,
       classification: {}, patch: null,
+      executionMode,
+      containerStarted: false,
+      cleanupPerformed: false,
       transcript: lines.join("\n"),
     };
   }
 
-  let lastPatch        = null;
-  let classification   = null;
-  let finalState       = "FAIL";
+  let lastPatch = null;
+  let classification = null;
+  let finalState = resumeFrom?.last_verification_state ?? "BUILD_FAIL";
   let preserveWorkspace = false;
   let completedIterations = startIteration - 1;
-  const notify = async (status, stopReason = null, workspacePath = null) => {
-    return runCompletionNotification(config.notification_command, {
-      status,
-      targetPath: scenarioPath,
-      workspacePath,
-      stopReason,
-    });
-  };
+  let lastVerificationState = resumeFrom?.last_verification_state ?? null;
+  let lastTouchedFiles = [];
+  let anyContainerStarted = false;
+  let cleanupPerformed = false;
+  let preservedArtifacts = null;
 
   try {
     for (let iteration = startIteration; iteration <= MAX_ITERATIONS; iteration++) {
@@ -145,9 +161,16 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
 
       // ── Run real command ────────────────────────────────
       const runSp = startSpinner(`Running ${executionMode}`);
-      const result = await runCommand(executionMode, workspace, meta.id);
+      const result = await runCommand(executionMode, workspace, meta.id, {
+        keepArtifacts: keepRuntimeArtifacts,
+      });
       runSp.stop(`Command finished → ${stateLabel(result.state)}`);
       log(`  command result: ${result.state}`);
+      lastVerificationState = result.state;
+      finalState = result.state;
+      anyContainerStarted = anyContainerStarted || Boolean(result.containerStarted);
+      cleanupPerformed = cleanupPerformed || Boolean(result.cleanupPerformed);
+      preservedArtifacts = result.preservedArtifacts ?? preservedArtifacts;
       await saveSnapshot({
         iteration,
         workspace_path: workspace,
@@ -158,6 +181,9 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
       });
 
       if (result.state === "PASS") {
+        if (result.preservedArtifacts) {
+          log(pc.yellow("  cleanup disabled — preserving runtime artifacts for debugging"));
+        }
         finalState = "PASS";
         break;
       }
@@ -219,6 +245,40 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
       const patchArtifact = await proposeFix(classification, { broken_files: brokenFiles }, config);
       fixSp.stop(`Fix proposed → affects: ${patchArtifact.affected_files.join(", ")}`);
       log(`  patch affects: ${patchArtifact.affected_files.join(", ")}`);
+      const allowedFiles = new Set(repairFiles);
+      const unsupportedFiles = patchArtifact.affected_files.filter((rel) => !allowedFiles.has(rel));
+      const touchedFiles = patchArtifact.affected_files.filter((rel) => allowedFiles.has(rel));
+
+      if (unsupportedFiles.length > 0) {
+        log(pc.yellow(`  patch touches files outside repair target allowlist: ${unsupportedFiles.join(", ")}`));
+        preserveWorkspace = true;
+        const sessionSnapshot = await saveSnapshot({
+          iteration,
+          workspace_path: workspace,
+          last_verification_state: result.state,
+          classification,
+          patch: patchArtifact.patch ?? null,
+          resumable: true,
+          outcome: "NEEDS_HUMAN_REVIEW",
+          stop_reason: "patch_outside_allowlist",
+        });
+        await notify(result.state, "patch_outside_allowlist", workspace);
+        return {
+          outcome: "NEEDS_HUMAN_REVIEW",
+          state: result.state,
+          writtenBack: [],
+          workspace,
+          iterations: iteration,
+          classification,
+          patch: patchArtifact.patch ?? null,
+          sessionSnapshot,
+          executionMode,
+          containerStarted: anyContainerStarted,
+          cleanupPerformed,
+          preservedArtifacts,
+          transcript: lines.join("\n"),
+        };
+      }
 
       // Stop condition: same patch twice
       const patchFingerprint = patchArtifact.patch ?? "";
@@ -270,16 +330,50 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
 
       // ── Apply patch ─────────────────────────────────────
       if (patchArtifact.patch) {
-        for (const rel of repairFiles) {
+        let appliedCount = 0;
+        for (const rel of touchedFiles) {
           try {
             await applyPatch(patchArtifact.patch, join(workspace, rel));
             log(pc.dim(`  patch applied to: ${rel}`));
+            appliedCount += 1;
           } catch (err) {
             log(pc.dim(`  patch apply note for ${rel}: ${err.message}`));
           }
         }
+        lastTouchedFiles = appliedCount > 0 ? touchedFiles : [];
+        if (appliedCount === 0) {
+          log(pc.yellow("  patch could not be applied to any target file — stopping"));
+          preserveWorkspace = true;
+          const sessionSnapshot = await saveSnapshot({
+            iteration,
+            workspace_path: workspace,
+            last_verification_state: result.state,
+            classification,
+            patch: lastPatch,
+            resumable: true,
+            outcome: "NEEDS_HUMAN_REVIEW",
+            stop_reason: "patch_apply_failed",
+          });
+          await notify(result.state, "patch_apply_failed", workspace);
+          return {
+            outcome: "NEEDS_HUMAN_REVIEW",
+            state: result.state,
+            writtenBack: [],
+            workspace,
+            iterations: iteration,
+            classification,
+            patch: lastPatch,
+            sessionSnapshot,
+            executionMode,
+            containerStarted: anyContainerStarted,
+            cleanupPerformed,
+            preservedArtifacts,
+            transcript: lines.join("\n"),
+          };
+        }
       } else {
         log(pc.yellow("  no patch produced — stopping"));
+        lastTouchedFiles = [];
         break;
       }
     }
@@ -287,12 +381,15 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
     // ── Write back on success ───────────────────────────────
     let writtenBack = [];
     if (finalState === "PASS" && writeback) {
+      const filesToWriteBack = lastTouchedFiles.length > 0 ? lastTouchedFiles : repairFiles;
       const writebackAllowed = options.sessionContext?.confirmWriteback
-        ? await options.sessionContext.confirmWriteback(repairFiles)
+        ? await options.sessionContext.confirmWriteback(filesToWriteBack)
         : true;
 
       if (!writebackAllowed) {
         preserveWorkspace = true;
+        log(pc.yellow("  write-back declined — original files remain unchanged"));
+        log(pc.yellow(`  repaired files remain only in temp workspace: ${workspace}`));
         const sessionSnapshot = await saveSnapshot({
           iteration: completedIterations,
           workspace_path: workspace,
@@ -300,6 +397,7 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
           classification,
           patch: lastPatch,
           written_back: [],
+          preserved_artifacts: preservedArtifacts,
           resumable: true,
           outcome: "NEEDS_HUMAN_REVIEW",
           stop_reason: "writeback_declined",
@@ -314,12 +412,20 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
           classification: classification ?? {},
           patch: lastPatch,
           sessionSnapshot,
+          executionMode,
+          containerStarted: anyContainerStarted,
+          cleanupPerformed,
+          preservedArtifacts,
           transcript: lines.join("\n"),
         };
       }
 
       const wbSp = startSpinner("Writing back repaired files");
-      writtenBack = await writeBack(workspace, brokenDir, repairFiles);
+      writtenBack = await writeBack(
+        workspace,
+        writebackDir,
+        lastTouchedFiles.length > 0 ? lastTouchedFiles : repairFiles,
+      );
       wbSp.stop(`Write-back complete: ${writtenBack.join(", ")}`);
       log(`  written back: ${writtenBack.join(", ")}`);
     }
@@ -327,10 +433,11 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
     const sessionSnapshot = await saveSnapshot({
       iteration: completedIterations,
       workspace_path: finalState === "PASS" ? null : workspace,
-      last_verification_state: finalState,
+      last_verification_state: finalState === "PASS" ? "PASS" : (lastVerificationState ?? finalState),
       classification,
       patch: lastPatch,
       written_back: writtenBack,
+      preserved_artifacts: preservedArtifacts,
       resumable: finalState !== "PASS",
       outcome: finalState === "PASS" ? "PASS" : "FAIL",
     });
@@ -345,6 +452,10 @@ export async function runExecutorLoop(scenarioPath, meta, config, options = {}) 
       classification: classification ?? {},
       patch: lastPatch,
       sessionSnapshot,
+      executionMode,
+      containerStarted: anyContainerStarted,
+      cleanupPerformed,
+      preservedArtifacts,
       transcript: lines.join("\n"),
     };
 
@@ -386,8 +497,17 @@ export function printLoopResult(result) {
       ? pc.bold(pc.yellow("NEEDS HUMAN REVIEW"))
       : pc.bold(pc.red("FAIL"));
   console.log(`  Outcome:       ${outcomeLabel}`);
+  if (result.executionMode) {
+    console.log(`  Mode:          ${result.executionMode}`);
+  }
   console.log(`  Final state:   ${result.state}`);
   console.log(`  Iterations:    ${result.iterations}`);
+  console.log(`  Container run: ${result.containerStarted ? pc.green("yes") : pc.yellow("no")}`);
+  if (result.executionMode === "docker_build") {
+    console.log(`  Cleanup:       ${result.cleanupPerformed ? "image cleaned up; no container was started" : "none"}`);
+  } else if (result.executionMode === "docker_run" || result.executionMode === "healthcheck") {
+    console.log(`  Cleanup:       ${result.cleanupPerformed ? "test container/image cleaned up automatically" : "none"}`);
+  }
 
   if (result.classification?.classification) {
     console.log(`  Classification: ${pc.yellow(result.classification.classification)} (${result.classification.confidence})`);
@@ -408,10 +528,29 @@ export function printLoopResult(result) {
     result.writtenBack.forEach(f => console.log(`  ${pc.green("✓")} ${f}`));
   }
 
-  if (result.workspace) {
+  if (result.workspace || result.preservedArtifacts) {
     console.log(pc.bold("\n  [DEBUG ARTIFACTS]"));
-    console.log(`  Workspace preserved for inspection:`);
-    console.log(`  ${pc.cyan(result.workspace)}`);
+    if (result.workspace) {
+      console.log(`  Workspace preserved for inspection:`);
+      console.log(`  ${pc.cyan(result.workspace)}`);
+    }
+    if (result.preservedArtifacts?.image_tag) {
+      console.log(`  Image tag:     ${pc.cyan(result.preservedArtifacts.image_tag)}`);
+    }
+    if (result.preservedArtifacts?.container_name) {
+      console.log(`  Container:     ${pc.cyan(result.preservedArtifacts.container_name)}`);
+    }
+    if (result.preservedArtifacts?.container_status) {
+      console.log(`  Status:        ${result.preservedArtifacts.container_status}`);
+    }
+    if (result.preservedArtifacts?.container_name) {
+      console.log(`  Inspect:       docker inspect ${result.preservedArtifacts.container_name}`);
+      console.log(`  Logs:          docker logs ${result.preservedArtifacts.container_name}`);
+    }
+    if (result.outcome === "NEEDS_HUMAN_REVIEW" && result.state === "PASS" && result.workspace) {
+      console.log(`  ${pc.yellow("Original broken/ files were not modified.")}`);
+      console.log(`  ${pc.yellow("The repaired files exist only in this temp workspace.")}`);
+    }
   }
 
   console.log(`\n${divider}\n`);

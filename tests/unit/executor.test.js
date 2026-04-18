@@ -27,6 +27,22 @@ test('resolveTarget detects a scenario directory from natural-language input', a
   }
 });
 
+test('resolveTarget detects a scenario directory after punctuation in natural-language input', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'decipher-executor-'));
+  const scenarioDir = join(root, 'scenarios', 'sample-scenario');
+  await mkdir(scenarioDir, { recursive: true });
+  await writeFile(join(scenarioDir, 'metadata.json'), JSON.stringify({ id: 'sample', category: 'docker' }), 'utf8');
+
+  try {
+    const target = await resolveTarget(`把这个container run起来。${scenarioDir}`);
+    assert.ok(target);
+    assert.equal(target.type, 'scenario');
+    assert.equal(target.path, scenarioDir);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('resolveTarget detects a Dockerfile path', async () => {
   const root = await mkdtemp(join(tmpdir(), 'decipher-dockerfile-'));
   const dockerfilePath = join(root, 'Dockerfile');

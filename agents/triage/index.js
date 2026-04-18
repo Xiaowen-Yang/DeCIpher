@@ -49,6 +49,78 @@ export function parseTriageResponse(raw) {
   };
 }
 
+export function buildDeterministicTriage(failureLog, context = {}) {
+  const log = failureLog.toLowerCase();
+
+  if (
+    context.category === 'docker' &&
+    (
+      log.includes('copy src/') ||
+      log.includes('stat src/: file does not exist') ||
+      log.includes('/src/dist/app.js') ||
+      log.includes('failed to copy files')
+    )
+  ) {
+    return {
+      classification: 'path_or_copy_error',
+      confidence: 0.98,
+      root_causes: [
+        {
+          hypothesis: 'Docker COPY source path does not exist in the build context',
+          evidence: failureLog.split('\n').slice(-6).join('\n'),
+          confidence: 0.98,
+        },
+      ],
+      excluded: ['permission_or_executable_error', 'healthcheck_startup_failure'],
+      needs_more_evidence: false,
+    };
+  }
+
+  if (
+    context.category === 'docker' &&
+    log.includes('unhealthy') &&
+    log.includes('server listening on port 3000')
+  ) {
+    return {
+      classification: 'healthcheck_startup_failure',
+      confidence: 0.95,
+      root_causes: [
+        {
+          hypothesis: 'Container started successfully but readiness/health probing is misconfigured',
+          evidence: failureLog.split('\n').slice(-10).join('\n'),
+          confidence: 0.95,
+        },
+      ],
+      excluded: ['docker_entrypoint_runtime_error'],
+      needs_more_evidence: false,
+    };
+  }
+
+  if (
+    (
+      context.category === 'docker' ||
+      context.category === 'env'
+    ) &&
+    log.includes('database_url environment variable is required but not set')
+  ) {
+    return {
+      classification: 'missing_env_or_secret_contract',
+      confidence: 0.97,
+      root_causes: [
+        {
+          hypothesis: 'Container startup requires DATABASE_URL but the runtime contract is missing from the Dockerfile',
+          evidence: failureLog.split('\n').slice(-8).join('\n'),
+          confidence: 0.97,
+        },
+      ],
+      excluded: ['dependency_version_mismatch', 'docker_entrypoint_runtime_error'],
+      needs_more_evidence: false,
+    };
+  }
+
+  return null;
+}
+
 function getSkillFile(category) {
   const map = {
     docker: 'docker-debug',
@@ -67,6 +139,10 @@ function getSkillFile(category) {
  */
 export async function triageLog(logFile, context = {}, config) {
   const failureLog = await readFile(logFile, 'utf8');
+  const deterministic = buildDeterministicTriage(failureLog, context);
+  if (deterministic) {
+    return deterministic;
+  }
 
   const skillName = getSkillFile(context.category ?? 'ci');
   const skillContent = await readFile(

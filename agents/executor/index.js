@@ -15,19 +15,30 @@ import { loadSessionSnapshot, formatSessionSnapshot } from "../../lib/session-st
 
 function extractCandidatePaths(input) {
   const candidates = [];
+  const punctuationBoundary = "[\\s\\\"'“”‘’`([{<，。,:;!?)]";
+  const pathTerminator = "[^\\s\\\"'“”‘’`)>\\]}<，。,:;!?]+";
 
   // 1. Quoted paths (double or single)
   for (const m of input.matchAll(/"([^"]+)"|'([^']+)'/g)) {
     candidates.push(m[1] ?? m[2]);
   }
 
-  // 2. Unquoted absolute or home-relative paths
-  for (const m of input.matchAll(/(?:^|\s)((?:~|\/)[^\s]+)/g)) {
+  // 2. Unquoted absolute or home-relative paths.
+  // Accept punctuation boundaries so inputs like "修这个。/tmp/demo" still execute.
+  const absolutePattern = new RegExp(
+    `(?:^|${punctuationBoundary})((?:~|/)${pathTerminator})`,
+    "g",
+  );
+  for (const m of input.matchAll(absolutePattern)) {
     candidates.push(m[1]);
   }
 
   // 3. Unquoted relative paths (./  ../  scenarios/  Dockerfile…)
-  for (const m of input.matchAll(/(?:^|\s)((?:\.\.?\/|scenarios\/|Dockerfile)[^\s]*)/g)) {
+  const relativePattern = new RegExp(
+    `(?:^|${punctuationBoundary})((?:\\.\\.?/|scenarios/|Dockerfile)${pathTerminator})`,
+    "g",
+  );
+  for (const m of input.matchAll(relativePattern)) {
     candidates.push(m[1]);
   }
 
@@ -184,6 +195,8 @@ export async function confirmWriteback(rl, state, files = []) {
   process.stdout.write("\n");
   console.log(pc.bold(pc.yellow("  Confirm write-back")));
   console.log(pc.dim("  The repaired temp workspace is ready to write back to broken/."));
+  console.log(pc.dim("  Declining keeps the original broken/ files unchanged."));
+  console.log(pc.dim("  If you decline, the repaired files remain only in the preserved temp workspace."));
   if (files.length > 0) {
     console.log(pc.dim(`  Files: ${files.join(", ")}`));
   }
@@ -240,6 +253,7 @@ export async function executeTarget(target, action, config, sessionState = {}, o
         const result = await runExecutorLoop(target.path, meta, config, {
           resumeFrom: options.resumeFrom,
           sessionContext: sessionState,
+          keepRuntimeArtifacts: options.keepRuntimeArtifacts,
         });
         sessionState.lastRunResult = result;
         sessionState.lastVerificationResult = result.state;
@@ -312,6 +326,11 @@ export async function executeTarget(target, action, config, sessionState = {}, o
       const result = await runExecutorLoop(dir, syntheticMeta, config, {
         resumeFrom: options.resumeFrom,
         sessionContext: sessionState,
+        sourceDir: dir,
+        writebackDir: dir,
+        targetPath: dir,
+        targetType: "dockerfile",
+        keepRuntimeArtifacts: options.keepRuntimeArtifacts,
       });
       // For ad-hoc docker dir the "brokenDir" is the workspace's parent — override
       result.writtenBack = []; // no write-back for ad-hoc targets

@@ -4,7 +4,6 @@
 import { createInterface, emitKeypressEvents } from 'node:readline';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { pathToFileURL } from 'node:url';
 import {
   readConfig,
   writeConfig,
@@ -25,6 +24,12 @@ import {
   formatSessionSnapshot,
 } from '../lib/session-store.js';
 import pc from 'picocolors';
+import { normalizeOpenAICompatibleUrl } from '../lib/api-client.js';
+import {
+  buildCliStatusSnapshot,
+  buildCliReviewSnapshot,
+  suggestCliSlashCommand,
+} from '../lib/cli-surface.js';
 
 const VERSION = '0.1.0';
 
@@ -126,7 +131,7 @@ function buildHelpBanner() {
     '',
     `  ${B('Commands:')}`,
     `    ${G('decipher')}                    Interactive mode`,
-    `    ${G('decipher demo')} ${D('<scenario>')}   Run a demo scenario`,
+    `    ${G('decipher demo')} ${D('<scenario> [--keep-container]')}   Run a demo scenario`,
     `    ${G('decipher doctor')}              Check environment`,
     `    ${G('decipher triage')} ${D('<log>')}      Triage a failure log`,
     `    ${G('decipher verify')} ${D('"<cmd>"')}    Run a verification command`,
@@ -143,7 +148,7 @@ function buildHelpBanner() {
     `    ${C('/transcript')}                 Show last transcript`,
     `    ${C('/log')}                        Alias for transcript`,
     `    ${C('/artifacts')}                  Show last artifacts`,
-    `    ${C('/demo')} ${D('<scenario>')}           Run a demo scenario`,
+    `    ${C('/demo')} ${D('<scenario> [--keep-container]')} Run a demo scenario`,
     `    ${C('/doctor')}                     Check environment`,
     `    ${C('/agents')}                     List available agents`,
     `    ${C('/quit')}                       Exit`,
@@ -158,6 +163,12 @@ function showSlashSuggestions(prefix = '/') {
     console.log(`  ${C(command.name.padEnd(12))} ${D(command.description)}`);
   });
   console.log('');
+}
+
+function parseExecutionFlags(args = []) {
+  return {
+    keepRuntimeArtifacts: args.includes('--keep-container') || args.includes('--no-cleanup'),
+  };
 }
 
 function buildModelStatus(config) {
@@ -558,7 +569,7 @@ async function callAIMultiTurn(messages, config) {
   }
 
   // OpenAI-compatible format (default)
-  const response = await fetch(url, {
+  const response = await fetch(normalizeOpenAICompatibleUrl(url), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -653,7 +664,7 @@ async function handleSlashCommand(input, config, rl, sessionState) {
 
     case 'status': {
       const persisted = await loadSessionSnapshot();
-      const status = buildStatusSnapshot(config, sessionState, persisted);
+      const status = buildCliStatusSnapshot(config, sessionState, persisted);
       printSectionHeader('STATUS', 'command');
       console.log(`${formatSessionSnapshot(status, { public: true })}\n`);
       return config;
@@ -680,7 +691,8 @@ async function handleSlashCommand(input, config, rl, sessionState) {
 
     case 'review': {
       printSectionHeader('REVIEW', 'command');
-      const review = await buildReviewSnapshot(sessionState);
+      const persisted = await loadSessionSnapshot();
+      const review = buildCliReviewSnapshot(sessionState, persisted);
       console.log(`${formatSessionSnapshot(review, { public: true })}\n`);
       return config;
     }
@@ -705,6 +717,7 @@ async function handleSlashCommand(input, config, rl, sessionState) {
         written_back: sessionState.lastRunResult?.writtenBack ?? persisted?.written_back ?? [],
         last_state: sessionState.lastVerificationResult ?? persisted?.last_verification_state ?? null,
         patch_preview: sessionState.lastRunResult?.patch?.split('\n').slice(0, 8).join('\n') ?? persisted?.patch ?? null,
+        preserved_artifacts: sessionState.lastRunResult?.preservedArtifacts ?? persisted?.preserved_artifacts ?? null,
       };
       console.log(`${formatSessionSnapshot(artifacts, { public: true })}\n`);
       return config;
@@ -712,7 +725,7 @@ async function handleSlashCommand(input, config, rl, sessionState) {
 
     case 'demo':
       if (!args[0]) {
-        console.log(`  ${Y('Usage:')} /demo <scenario-path>\n`);
+        console.log(`  ${Y('Usage:')} /demo <scenario-path> [--keep-container]\n`);
         console.log(`  ${D('Available scenarios:')}`);
         console.log(`    scenarios/docker-copy-path-bug`);
         console.log(`    scenarios/ci-python-version-drift`);
@@ -729,7 +742,7 @@ async function handleSlashCommand(input, config, rl, sessionState) {
           console.log(`  ${Y('Demo cancelled.')}\n`);
           return config;
         }
-        await executeScenarioPath(args[0], config, sessionState);
+        await executeScenarioPath(args[0], config, sessionState, parseExecutionFlags(args.slice(1)));
       } catch (err) {
         console.log(`  ${pc.red('Error:')} ${err.message}\n`);
       }
@@ -797,7 +810,7 @@ async function handleSlashCommand(input, config, rl, sessionState) {
 
     default:
       console.log(`  ${Y('Unknown command:')} /${cmd}.`);
-      const suggestion = suggestSlashCommand(cmd);
+      const suggestion = suggestCliSlashCommand(cmd);
       if (suggestion) {
         console.log(`  ${D('Did you mean:')} ${C(suggestion)}\n`);
       } else {
@@ -963,17 +976,18 @@ const [,, command, ...args] = process.argv;
 async function main() {
   switch (command) {
     case 'demo': {
-      if (!args[0]) {
-        console.error('Usage: decipher demo <scenario-path>');
+      const scenarioPath = args.find((arg) => !arg.startsWith('-'));
+      if (!scenarioPath) {
+        console.error('Usage: decipher demo <scenario-path> [--keep-container]');
         process.exit(1);
       }
       const config = await ensureApiKey();
       if (!config) process.exit(3);
       const { executeScenarioPath } = await import('../agents/executor/index.js');
-      await executeScenarioPath(args[0], config, {
+      await executeScenarioPath(scenarioPath, config, {
         approved: config.approval_policy !== 'on-request',
         approvalPolicy: config.approval_policy ?? 'on-request',
-      });
+      }, parseExecutionFlags(args));
       break;
     }
 
@@ -1057,9 +1071,20 @@ async function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch(err => {
+function flushStream(stream) {
+  return new Promise((resolve) => stream.write('', resolve));
+}
+
+async function flushStdIO() {
+  await Promise.all([flushStream(process.stdout), flushStream(process.stderr)]);
+}
+
+main()
+  .then(async () => {
+    await flushStdIO();
+  })
+  .catch(async (err) => {
     console.error(`Error: ${err.message}`);
+    await flushStdIO();
     process.exit(3);
   });
-}
