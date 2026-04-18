@@ -1,14 +1,44 @@
 # dependencies
 node_modules/
 
-# documentation (tracked separately)
-#documentation
-references/
-tasks/
-decipher-agent-docs
-.claude
-docs/
-tasks
+# config (contains API keys)
+.decipher/
 
 # OS
 .DS_Store
+Thumbs.db
+
+# editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# local agent tooling
+.claude/
+
+# reference material (read-only, not part of the product)
+references/
+
+# agent contract docs (tracked separately from product code)
+decipher-agent-docs/
+
+# design docs and task tracking (local only)
+docs/
+
+# build artifacts
+*.tgz
+*.bak
+
+# logs
+*.log
+!scenarios/*/logs/*.log
+
+# env files
+.env
+.env.*
+!.env.example
+
+# plugin lock files
+skills-lock.json

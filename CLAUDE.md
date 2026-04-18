@@ -62,7 +62,7 @@ skills/                — domain knowledge files injected per node (not global)
 scripts/               — pure shell commands (collect_context.sh, doctor.sh, verify.sh, demo.sh)
 scenarios/             — deterministic demo fixtures (broken/, expected/, logs/, acceptance.md)
 docs/                  — architecture docs, acceptance criteria, runbooks
-tasks/                 — todo.md, lessons.md, review.md, last-known-good.md
+docs/tasks/            — todo.md, lessons.md, review.md, last-known-good.md
 references/codex-main/ — reference CLI for UX/workflow patterns (read-only reference)
 decipher-agent-docs/   — full agent contract docs (AGENTS.md is source of truth)
 ```
@@ -74,16 +74,16 @@ Read these before any significant work:
 - `decipher-agent-docs/AGENTS.md` — source of truth for all operating rules
 - `decipher-agent-docs/ARCHITECTURE.md` — detailed system design and module specs
 - `decipher-agent-docs/COMMANDS.md` — full CLI command reference and output format
-- `tasks/lessons.md` — mistakes to avoid, project constraints
-- `tasks/todo.md` — current plan and progress
+- `docs/tasks/lessons.md` — mistakes to avoid, project constraints
+- `docs/tasks/todo.md` — current plan and progress
 
 ## Task Management
 
-**Before coding:** Update `tasks/todo.md` with a checklist plan. Read `tasks/lessons.md`.
+**Before coding:** Update `docs/tasks/todo.md` with a checklist plan. Read `docs/tasks/lessons.md`.
 
-**After corrections:** Update `tasks/lessons.md` immediately with the mistake pattern as a reusable rule.
+**After corrections:** Update `docs/tasks/lessons.md` immediately with the mistake pattern as a reusable rule.
 
-**Done criteria:** Issue evidenced → fix explicit → verification shown (command + output + conclusion) → result written to `tasks/review.md`.
+**Done criteria:** Issue evidenced → fix explicit → verification shown (command + output + conclusion) → result written to `docs/tasks/review.md`.
 
 ## Failure Taxonomy
 

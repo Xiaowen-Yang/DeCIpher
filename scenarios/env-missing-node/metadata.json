@@ -1,0 +1,13 @@
+{
+  "id": "env-missing-node",
+  "category": "env",
+  "difficulty": "easy",
+  "expected_classification": "missing_env_or_secret_contract",
+  "auto_fixable": false,
+  "required_tools": [],
+  "verification": ["structural"],
+  "demo_time_seconds": 20,
+  "broken_files": [".nvmrc", "package.json"],
+  "log_file": "logs/bootstrap-failure.log",
+  "verification_command": "node --version >/dev/null 2>&1 && echo PASS || echo FAIL"
+}

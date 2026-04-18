@@ -1,0 +1,13 @@
+{
+  "id": "docker-entrypoint-permission",
+  "category": "docker",
+  "difficulty": "easy",
+  "expected_classification": "permission_or_executable_error",
+  "auto_fixable": true,
+  "required_tools": ["docker"],
+  "verification": ["structural"],
+  "demo_time_seconds": 25,
+  "broken_files": ["Dockerfile"],
+  "log_file": "logs/runtime-failure.log",
+  "verification_command": "grep -q 'chmod +x' scenarios/docker-entrypoint-permission/expected/Dockerfile && echo PASS || echo FAIL"
+}
