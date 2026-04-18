@@ -1,0 +1,8 @@
+#documentation
+doc/
+references/
+
+#agent
+.claude
+AGENTS.md
+
