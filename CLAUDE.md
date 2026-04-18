@@ -37,12 +37,18 @@ DeCIpher is a structured pipeline with named nodes, not a monolithic agent. Each
 
 ```
 bin/decipher (CLI entry)
-    → Context Collector + Scenario Loader
-    → Triage Node          → classification artifact
-    → Fix Proposal Node    → patch artifact
-    → Patch Executor
-    → Verification Node    → pass/fail artifact (loops back to Fix, max 3 iterations)
-    → Report Output
+    → Executor Node (agents/executor/)
+        resolveTarget()   — detect path + classify (scenario/dockerfile/logfile)
+        detectAction()    — parse intent (fix/demo/triage_only/docker_build)
+        askApproval()     — one-time session permission grant (Codex-style)
+        executeTarget()   — dispatch to orchestrator or docker build loop
+        [fallback]        — conversational LLM when no target found
+    → Orchestrator (agents/orchestrator/)
+        → Triage Node          → classification artifact
+        → Fix Proposal Node    → patch artifact
+        → Patch Executor
+        → Verification Node    → pass/fail artifact (loops back to Fix, max 3 iterations)
+        → Report Output
 ```
 
 **Failure stop policy:** The orchestrator stops early and returns `NEEDS_HUMAN_REVIEW` if triage confidence < 0.7, the same patch is attempted twice, or the patch touches more than 2 files.
@@ -53,6 +59,7 @@ bin/decipher (CLI entry)
 
 ```
 bin/decipher           — CLI entry point (Node.js ESM, thin orchestration shell)
+agents/executor/       — executor-first gate: target resolution, approval, action dispatch
 agents/orchestrator/   — task router and iteration loop controller
 agents/triage/         — failure classifier (calls AI API with triage prompt)
 agents/fixer/          — minimal fix proposal generator

@@ -1,10 +1,28 @@
 #!/usr/bin/env node
 // DeCIpher CLI entry point
 
-import { createInterface } from 'node:readline';
-import { resolve, relative } from 'node:path';
+import { createInterface, emitKeypressEvents } from 'node:readline';
+import { resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { readConfig, writeConfig } from '../lib/config.js';
+import { pathToFileURL } from 'node:url';
+import {
+  readConfig,
+  writeConfig,
+  maskConfig,
+  normalizeConfigKey,
+  getHistoryPath,
+  getConfigDir,
+} from '../lib/config.js';
+import {
+  appendHistoryEntry,
+  loadHistoryEntries,
+  toReadlineHistory,
+  findReverseHistoryMatches,
+} from '../lib/history.js';
+import {
+  loadSessionSnapshot,
+  formatSessionSnapshot,
+} from '../lib/session-store.js';
 import pc from 'picocolors';
 
 const VERSION = '0.1.0';
@@ -18,6 +36,20 @@ const G  = (s) => pc.green(s);
 const D  = (s) => pc.dim(s);
 const B  = (s) => pc.bold(s);
 const W  = (s) => pc.white(s);
+
+const SLASH_COMMANDS = [
+  { name: '/help', description: 'Show help and commands' },
+  { name: '/model', description: 'Show or change model' },
+  { name: '/setting', description: 'Show or update configuration' },
+  { name: '/status', description: 'Show current session status' },
+  { name: '/resume', description: 'Resume last executor session' },
+  { name: '/transcript', description: 'Show last executor transcript' },
+  { name: '/artifacts', description: 'Show saved artifacts and workspace' },
+  { name: '/demo', description: 'Run a demo scenario' },
+  { name: '/doctor', description: 'Check environment' },
+  { name: '/agents', description: 'List available agents' },
+  { name: '/quit', description: 'Exit' },
+];
 
 // ── Banner ─────────────────────────────────────────────────
 function shortenPath(p) {
@@ -34,11 +66,13 @@ function truncate(s, max) {
   return s.slice(0, max - 3) + '...';
 }
 
-function buildSessionHeader(config) {
+function buildSessionHeader(config, sessionState = {}) {
   const dir = shortenPath(process.cwd());
   const provider = config.provider ?? 'openai';
   const model = config.model ?? 'gpt-4o';
   const hasKey = config.api_key ? G('●') : pc.red('○');
+  const approvalPolicy = sessionState.approvalPolicy ?? config.approval_policy ?? 'on-request';
+  const lastState = sessionState.lastVerificationResult ?? 'idle';
 
   // Truncate base_url for display
   const baseUrlDisplay = config.base_url
@@ -53,6 +87,7 @@ function buildSessionHeader(config) {
     `${D('provider:')}  ${C(provider)}${baseUrlDisplay}`,
     `${D('model:')}     ${C(model)}              ${D('/model to change')}`,
     `${D('directory:')} ${W(dir)}`,
+    `${D('approval:')}  ${C(approvalPolicy)}          ${D(`/status last:${lastState}`)}`,
     `${D('api key:')}   ${hasKey} ${config.api_key ? D('configured') : pc.red('not set')}`,
   ];
 
@@ -91,18 +126,67 @@ function buildHelpBanner() {
     `    ${G('decipher doctor')}              Check environment`,
     `    ${G('decipher triage')} ${D('<log>')}      Triage a failure log`,
     `    ${G('decipher verify')} ${D('"<cmd>"')}    Run a verification command`,
-    `    ${G('decipher config')} ${D('show|set|reset')}  Manage configuration`,
+    `    ${G('decipher setting')} ${D('show|set')}    Manage configuration`,
     '',
     `  ${B('Interactive commands:')}`,
     `    ${C('/help')}                       Show this help`,
-    `    ${C('/model')} ${D('[name]')}              Show or change model`,
+    `    ${C('/model')} ${D('[name]')}              Show model status or change model`,
+    `    ${C('/setting')} ${D('[show|set k v]')}     Configuration`,
+    `    ${C('/status')}                     Current session snapshot`,
+    `    ${C('/resume')}                     Resume last failed session`,
+    `    ${C('/transcript')}                 Show last transcript`,
+    `    ${C('/artifacts')}                  Show last artifacts`,
     `    ${C('/demo')} ${D('<scenario>')}           Run a demo scenario`,
     `    ${C('/doctor')}                     Check environment`,
     `    ${C('/agents')}                     List available agents`,
-    `    ${C('/config')} ${D('show|set <k> <v>')}   Configuration`,
     `    ${C('/quit')}                       Exit`,
     '',
   ].join('\n');
+}
+
+function showSlashSuggestions(prefix = '/') {
+  const matches = SLASH_COMMANDS.filter(command => command.name.startsWith(prefix));
+  console.log('');
+  console.log(`  ${B('Slash Commands')}`);
+  matches.forEach(command => {
+    console.log(`  ${C(command.name.padEnd(12))} ${D(command.description)}`);
+  });
+  console.log('');
+}
+
+function buildModelStatus(config) {
+  const safe = maskConfig(config);
+  return [
+    `  ${D('provider:')} ${C(safe.provider)}`,
+    `  ${D('model:')}    ${C(safe.model)}`,
+    `  ${D('base_url:')} ${safe.base_url ? C(safe.base_url) : D('(default)')}`,
+    `  ${D('api_key:')}  ${safe.api_key ? C(safe.api_key) : D('(not set)')}`,
+  ].join('\n');
+}
+
+function buildStatusSnapshot(config, sessionState, persisted = null) {
+  return {
+    cwd: process.cwd(),
+    target: sessionState.currentTarget?.path ?? persisted?.target_path ?? null,
+    approval_state: sessionState.approved ?? false,
+    approval_policy: sessionState.approvalPolicy ?? config.approval_policy ?? 'on-request',
+    model: config.model,
+    provider: config.provider,
+    base_url: config.base_url,
+    retry_budget: config.max_iterations,
+    last_verification_result: sessionState.lastVerificationResult ?? persisted?.last_verification_state ?? null,
+    temp_workspace_path: sessionState.lastRunResult?.workspace ?? persisted?.workspace_path ?? null,
+    writable_roots: [process.cwd(), '/tmp'],
+    network: 'blocked/unknown',
+  };
+}
+
+function suggestSlashCommand(cmd) {
+  const normalized = `/${cmd}`;
+  if (normalized === '/settings') return '/setting';
+  const exact = SLASH_COMMANDS.find(item => item.name === normalized);
+  if (exact) return exact.name;
+  return SLASH_COMMANDS.find(item => item.name.startsWith(normalized))?.name ?? null;
 }
 
 // ── Hidden input (API key) ─────────────────────────────────
@@ -233,10 +317,55 @@ async function loadSkills() {
   return skills;
 }
 
-async function handleInteractiveInput(input, config) {
-  const { readFile } = await import('node:fs/promises');
-  const { join, dirname } = await import('node:path');
-  const { fileURLToPath } = await import('node:url');
+/**
+ * Executor-first input handler.
+ *
+ * Flow:
+ *  1. Try to resolve an executable target (scenario dir, Dockerfile dir, log file).
+ *  2. If found → ask one-time session approval → execute the pipeline.
+ *  3. If not found → fall back to conversational LLM mode.
+ */
+async function handleInteractiveInput(input, config, rl, sessionState) {
+  const { resolveTarget, detectAction, askApproval, executeTarget } =
+    await import('../agents/executor/index.js');
+
+  // ── Step 1: Target detection ──────────────────────────────
+  let target = null;
+  try {
+    target = await resolveTarget(input);
+  } catch { /* ignore resolution errors */ }
+
+  if (target) {
+    // ── Step 2: One-time approval ───────────────────────────
+    const approved = await askApproval(rl, sessionState);
+    if (!approved) {
+      // Fall through to conversational mode
+      await handleConversationalInput(input, config);
+      return;
+    }
+
+    // ── Step 3: Execute pipeline ────────────────────────────
+    const action = detectAction(input, target.type);
+    console.log(
+      `  ${pc.dim('Target:')} ${pc.cyan(target.path)}  ${pc.dim('Type:')} ${target.type}  ${pc.dim('Action:')} ${action}`,
+    );
+    try {
+      await executeTarget(target, action, config, sessionState);
+    } catch (err) {
+      console.log(`  ${pc.red('Executor error:')} ${err.message}\n`);
+    }
+    return;
+  }
+
+  // ── Step 4: Conversational fallback ────────────────────────
+  await handleConversationalInput(input, config);
+}
+
+/**
+ * Pure conversational mode: sends input to the LLM as a CI/DevOps assistant.
+ * Used when no executable target is detected, or when the user asks a question.
+ */
+async function handleConversationalInput(input, config) {
   const { TAXONOMY } = await import('../agents/triage/index.js');
 
   // Collect project context once per session
@@ -245,13 +374,12 @@ async function handleInteractiveInput(input, config) {
   }
   const skills = await loadSkills();
 
-  // Build the system prompt
   const systemPrompt = `You are DeCIpher, an AI CI/deployment troubleshooting assistant running in an interactive terminal session. You help developers diagnose and fix CI pipeline failures, Docker build errors, deployment issues, and environment setup problems.
 
 ## Your personality
 - Direct, concise, helpful — like a senior DevOps engineer pair-programming with the user
 - Conversational tone, not robotic report format
-- Ask clarifying questions when the problem is unclear
+- If the user pastes a file path or directory, remind them they can paste it directly and DeCIpher will execute automatically
 - If the user greets you or asks non-CI questions, respond briefly and steer back to your expertise
 
 ## Your capabilities
@@ -259,6 +387,7 @@ async function handleInteractiveInput(input, config) {
 - Analyze error logs and suggest root causes
 - Propose minimal fixes with specific file changes
 - Suggest verification commands
+- Execute full triage → fix → verify pipelines when given a path
 
 ## Domain knowledge
 ${skills}
@@ -279,10 +408,8 @@ ${projectContext}
 - Do NOT use the structured report format (**Classification:**, **Root Cause:**, etc.)
 - Respond in the same language the user writes in (Chinese → Chinese, English → English)`;
 
-  // Add user message to history
   conversationHistory.push({ role: 'user', content: input });
 
-  // Build messages array for multi-turn
   const messages = [
     { role: 'system', content: systemPrompt },
     ...conversationHistory,
@@ -290,18 +417,18 @@ ${projectContext}
 
   console.log('');
 
+  const { startSpinner } = await import('../lib/spinner.js');
+  const sp = startSpinner('Thinking');
   try {
     const response = await callAIMultiTurn(messages, config);
+    sp.stop('Response ready');
 
-    // Add assistant response to history
     conversationHistory.push({ role: 'assistant', content: response });
 
-    // Keep history manageable (last 20 turns)
     if (conversationHistory.length > 20) {
       conversationHistory.splice(0, conversationHistory.length - 20);
     }
 
-    // Format response with indentation
     const formatted = response
       .split('\n')
       .map(line => `  ${line}`)
@@ -309,6 +436,7 @@ ${projectContext}
     console.log(formatted);
     console.log('');
   } catch (err) {
+    sp.stop();
     console.log(`  ${pc.red('Error:')} ${err.message}\n`);
   }
 }
@@ -379,7 +507,7 @@ async function callAIMultiTurn(messages, config) {
 }
 
 // ── Slash command handlers ─────────────────────────────────
-async function handleSlashCommand(input, config) {
+async function handleSlashCommand(input, config, rl, sessionState) {
   const parts = input.slice(1).split(/\s+/);
   const cmd = parts[0];
   const args = parts.slice(1);
@@ -394,9 +522,84 @@ async function handleSlashCommand(input, config) {
         config = await writeConfig({ model: args[0] });
         console.log(`  ${G('✓')} Model changed to ${C(args[0])}\n`);
       } else {
-        console.log(`  ${D('Current model:')} ${C(config.model)}\n`);
+        console.log(`\n${buildModelStatus(config)}\n`);
       }
       return config;
+
+    case 'setting':
+    case 'config': {
+      if (!args[0] || args[0] === 'show') {
+        console.log(`${formatSessionSnapshot(maskConfig(config), { public: false })}\n`);
+        return config;
+      }
+
+      if (args[0] === 'set' && args[1]) {
+        const key = normalizeConfigKey(args[1]);
+        let value = args.slice(2).join(' ');
+
+        if (key === 'api_key' && !value) {
+          rl.pause();
+          value = await askHiddenInput(`  ${D('API Key')} ${D('(input hidden)')}: `);
+          rl.resume();
+          if (process.stdin.isTTY) {
+            process.stdin.setRawMode(true);
+          }
+        }
+
+        if (!value) {
+          console.log(`  ${Y('Usage:')} /setting set <provider|base_url|model|api_key|approval_policy> <value>\n`);
+          return config;
+        }
+
+        config = await writeConfig({ [key]: value });
+        console.log(`  ${G('✓')} Updated ${args[1]} = ${key === 'api_key' ? '***' : C(value)}\n`);
+        return config;
+      }
+
+      console.log(`  ${Y('Usage:')} /setting [show] | /setting set <key> <value>\n`);
+      return config;
+    }
+
+    case 'status': {
+      const persisted = await loadSessionSnapshot();
+      const status = buildStatusSnapshot(config, sessionState, persisted);
+      console.log(`${formatSessionSnapshot(status, { public: true })}\n`);
+      return config;
+    }
+
+    case 'resume': {
+      const { askApproval, resumeLastTarget } = await import('../agents/executor/index.js');
+      const approved = await askApproval(rl, sessionState);
+      if (!approved) {
+        console.log(`  ${Y('Resume cancelled.')}\n`);
+        return config;
+      }
+      await resumeLastTarget(config, sessionState);
+      return config;
+    }
+
+    case 'transcript': {
+      const transcript = sessionState.lastRunResult?.transcript;
+      if (!transcript) {
+        console.log(`  ${Y('No transcript available yet.')}\n`);
+        return config;
+      }
+      console.log(`\n${transcript}\n`);
+      return config;
+    }
+
+    case 'artifacts': {
+      const persisted = await loadSessionSnapshot();
+      const artifacts = {
+        target: sessionState.currentTarget?.path ?? persisted?.target_path ?? null,
+        workspace: sessionState.lastRunResult?.workspace ?? persisted?.workspace_path ?? null,
+        written_back: sessionState.lastRunResult?.writtenBack ?? persisted?.written_back ?? [],
+        last_state: sessionState.lastVerificationResult ?? persisted?.last_verification_state ?? null,
+        patch_preview: sessionState.lastRunResult?.patch?.split('\n').slice(0, 8).join('\n') ?? persisted?.patch ?? null,
+      };
+      console.log(`${formatSessionSnapshot(artifacts, { public: true })}\n`);
+      return config;
+    }
 
     case 'demo':
       if (!args[0]) {
@@ -411,10 +614,13 @@ async function handleSlashCommand(input, config) {
         return config;
       }
       try {
-        const { runScenario } = await import('../agents/orchestrator/index.js');
-        const report = await runScenario(args[0], config);
-        const { formatReport } = await import('../lib/reporter.js');
-        console.log(formatReport(report));
+        const { askApproval, executeScenarioPath } = await import('../agents/executor/index.js');
+        const approved = await askApproval(rl, sessionState);
+        if (!approved) {
+          console.log(`  ${Y('Demo cancelled.')}\n`);
+          return config;
+        }
+        await executeScenarioPath(args[0], config, sessionState);
       } catch (err) {
         console.log(`  ${pc.red('Error:')} ${err.message}\n`);
       }
@@ -476,66 +682,159 @@ async function handleSlashCommand(input, config) {
       console.log(`\n  ${D('Add skill: mkdir -p ~/.decipher/skills/my-skill && cp skill.md ~/.decipher/skills/my-skill/SKILL.md')}\n`);
       return config;
 
-    case 'config':
-      if (args[0] === 'show') {
-        const safe = { ...config, api_key: config.api_key ? '***' : null };
-        console.log(JSON.stringify(safe, null, 2));
-      } else if (args[0] === 'set' && args[1] && args[2]) {
-        config = await writeConfig({ [args[1].replace(/-/g, '_')]: args[2] });
-        console.log(`  ${G('✓')} Set ${args[1]} = ${args[2]}\n`);
-      } else {
-        console.log(`  ${D('Usage:')} /config show | /config set <key> <value>\n`);
-      }
-      return config;
-
     case 'quit':
     case 'exit':
       return null; // Signal to exit
 
     default:
-      console.log(`  ${Y('Unknown command:')} /${cmd}. Type /help for available commands.\n`);
+      console.log(`  ${Y('Unknown command:')} /${cmd}.`);
+      const suggestion = suggestSlashCommand(cmd);
+      if (suggestion) {
+        console.log(`  ${D('Did you mean:')} ${C(suggestion)}\n`);
+      } else {
+        console.log(`  ${D('Type /help for available commands.')}\n`);
+      }
       return config;
   }
+}
+
+// ── Codex-style boxed prompt ───────────────────────────────
+function termWidth() {
+  return process.stdout.columns || 80;
+}
+function dividerLine() {
+  return pc.dim('─'.repeat(termWidth()));
 }
 
 // ── Interactive mode ───────────────────────────────────────
 async function runInteractive() {
   let config = await ensureApiKey();
   if (!config) return;
+  const historyEntries = await loadHistoryEntries(getHistoryPath());
 
-  console.log(buildSessionHeader(config));
-  console.log(`\n  ${D('Tip: Use')} ${C('/help')} ${D('to see available commands')}\n`);
+  const sessionState = {
+    approved: false,
+    approvalPolicy: config.approval_policy ?? 'on-request',
+    currentTarget: null,
+    lastVerificationResult: null,
+    lastRunResult: null,
+    historyEntries,
+    reverseSearch: { active: false, originalLine: '' },
+  };
+
+  console.log(buildSessionHeader(config, sessionState));
+  console.log(`\n  ${D('Paste a path to execute, or type')} ${C('/help')} ${D('for commands.')}\n`);
 
   const rl = createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: `${C('›')} `,
+    prompt: `${C('❯')} `,
+    terminal: true,
   });
+  rl.history = toReadlineHistory(historyEntries);
+
+  emitKeypressEvents(process.stdin, rl);
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+  }
 
   let closed = false;
-  rl.prompt();
+  let processing = false;
+
+  function showPrompt() {
+    if (closed) return;
+    // Top border + prompt (Codex-style boxed input)
+    process.stdout.write(dividerLine() + '\n');
+    rl.prompt();
+  }
+
+  process.stdin.on('keypress', (_char, key) => {
+    if (closed || processing) return;
+
+    if (sessionState.reverseSearch.active && key?.name === 'escape') {
+      sessionState.reverseSearch.active = false;
+      rl.setPrompt(`${C('❯')} `);
+      rl.prompt();
+      rl.write(sessionState.reverseSearch.originalLine);
+      return;
+    }
+
+    if (key?.ctrl && key.name === 'r') {
+      sessionState.reverseSearch = {
+        active: true,
+        originalLine: rl.line,
+      };
+      console.log(`\n  ${D('Reverse search: type a query and press Enter to restore a match.')}\n`);
+      rl.setPrompt(`${C('search❯')} `);
+      rl.prompt();
+      return;
+    }
+
+    if (key?.sequence === '/' && rl.line === '') {
+      showSlashSuggestions('/');
+    }
+  });
+
+  showPrompt();
 
   rl.on('line', async (input) => {
+    if (processing) return; // drop input while processing
+    processing = true;
+
     const trimmed = input.trim();
 
+    // Bottom border — closes the input box
+    process.stdout.write(dividerLine() + '\n');
+
     if (!trimmed) {
-      if (!closed) rl.prompt();
+      processing = false;
+      showPrompt();
+      return;
+    }
+
+    if (sessionState.reverseSearch.active) {
+      const matches = findReverseHistoryMatches(sessionState.historyEntries, trimmed);
+      sessionState.reverseSearch.active = false;
+      rl.setPrompt(`${C('❯')} `);
+      if (matches.length === 0) {
+        console.log(`  ${Y('No history match found.')}\n`);
+        processing = false;
+        showPrompt();
+        rl.write(sessionState.reverseSearch.originalLine);
+        return;
+      }
+      processing = false;
+      showPrompt();
+      rl.write(matches[0]);
       return;
     }
 
     if (trimmed.startsWith('/')) {
-      config = await handleSlashCommand(trimmed, config);
+      if (trimmed === '/') {
+        showSlashSuggestions('/');
+        processing = false;
+        showPrompt();
+        return;
+      }
+      await appendHistoryEntry(getHistoryPath(), trimmed);
+      sessionState.historyEntries.push({ text: trimmed });
+      config = await handleSlashCommand(trimmed, config, rl, sessionState);
+      sessionState.approvalPolicy = config?.approval_policy ?? sessionState.approvalPolicy;
       if (config === null) {
         closed = true;
         rl.close();
+        processing = false;
         return;
       }
     } else {
-      // Natural language input — conversational triage
-      await handleInteractiveInput(trimmed, config);
+      await appendHistoryEntry(getHistoryPath(), trimmed);
+      sessionState.historyEntries.push({ text: trimmed });
+      // Executor-first: detect if input contains an actionable target
+      await handleInteractiveInput(trimmed, config, rl, sessionState);
     }
 
-    if (!closed) rl.prompt();
+    processing = false;
+    showPrompt();
   });
 
   rl.on('close', () => {
@@ -556,10 +855,11 @@ async function main() {
       }
       const config = await ensureApiKey();
       if (!config) process.exit(3);
-      const { runScenario } = await import('../agents/orchestrator/index.js');
-      const report = await runScenario(args[0], config);
-      const { formatReport } = await import('../lib/reporter.js');
-      console.log(formatReport(report));
+      const { executeScenarioPath } = await import('../agents/executor/index.js');
+      await executeScenarioPath(args[0], config, {
+        approved: config.approval_policy !== 'on-request',
+        approvalPolicy: config.approval_policy ?? 'on-request',
+      });
       break;
     }
 
@@ -608,24 +908,22 @@ async function main() {
       process.exit(result.result === 'PASS' ? 0 : 1);
     }
 
-    case 'config': {
+    case 'config':
+    case 'setting': {
       if (args[0] === 'set' && args[1] && args[2]) {
-        await writeConfig({ [args[1].replace(/-/g, '_')]: args[2] });
-        console.log(`Set ${args[1]} = ${args[2]}`);
+        await writeConfig({ [normalizeConfigKey(args[1])]: args[2] });
+        console.log(`Set ${args[1]} = ${args[1].includes('key') ? '***' : args[2]}`);
       } else if (args[0] === 'show') {
         const config = await readConfig();
-        const safe = { ...config, api_key: config.api_key ? '***' : null };
-        console.log(JSON.stringify(safe, null, 2));
+        console.log(JSON.stringify(maskConfig(config), null, 2));
       } else if (args[0] === 'reset') {
         const { rm } = await import('node:fs/promises');
-        const { join } = await import('node:path');
-        const configDir = process.env.DECIPHER_CONFIG_DIR ?? join(homedir(), '.decipher');
-        await rm(configDir, { recursive: true, force: true });
+        await rm(getConfigDir(), { recursive: true, force: true });
         console.log('Config reset.');
       } else {
-        console.log('Usage: decipher config set <key> <value>');
-        console.log('       decipher config show');
-        console.log('       decipher config reset');
+        console.log('Usage: decipher setting set <key> <value>');
+        console.log('       decipher setting show');
+        console.log('       decipher setting reset');
       }
       break;
     }
@@ -645,7 +943,9 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  console.error(`Error: ${err.message}`);
-  process.exit(3);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(err => {
+    console.error(`Error: ${err.message}`);
+    process.exit(3);
+  });
+}
