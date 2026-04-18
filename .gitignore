@@ -1,7 +1,6 @@
 #documentation
 doc/
 references/
-
-#agent
+tasks/
+decipher-agent-docs
 .claude
-AGENTS.md
