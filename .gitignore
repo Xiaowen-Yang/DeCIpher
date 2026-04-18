@@ -1,8 +1,14 @@
+# dependencies
+node_modules/
+
+# documentation (tracked separately)
 #documentation
-doc/
 references/
 tasks/
 decipher-agent-docs
 .claude
+docs/
+tasks
 
+# OS
 .DS_Store

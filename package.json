@@ -1,0 +1,19 @@
+{
+  "name": "decipher",
+  "version": "0.1.0",
+  "description": "Automated CI/Deployment Troubleshooting Agent",
+  "type": "module",
+  "bin": {
+    "decipher": "./bin/decipher"
+  },
+  "scripts": {
+    "test": "node --test 'tests/**/*.test.js'",
+    "test:unit": "node --test 'tests/unit/**/*.test.js'"
+  },
+  "dependencies": {
+    "picocolors": "^1.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
