@@ -1,0 +1,1 @@
+My Docker build is failing. Here is the error from the build log. Please triage the failure, identify the root cause, and propose a fix.

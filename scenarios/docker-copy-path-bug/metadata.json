@@ -1,0 +1,13 @@
+{
+  "id": "docker-copy-path-bug",
+  "category": "docker",
+  "difficulty": "easy",
+  "expected_classification": "path_or_copy_error",
+  "auto_fixable": true,
+  "required_tools": ["docker"],
+  "verification": ["build"],
+  "demo_time_seconds": 25,
+  "broken_files": ["Dockerfile"],
+  "log_file": "logs/build-failure.log",
+  "verification_command": "docker build -f scenarios/docker-copy-path-bug/expected/Dockerfile -t decipher-test . && echo PASS || echo FAIL"
+}
