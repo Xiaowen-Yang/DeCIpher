@@ -1,0 +1,14 @@
+{
+  "id": "docker-multistage-wrong-artifact",
+  "category": "docker",
+  "difficulty": "medium",
+  "expected_classification": "path_or_copy_error",
+  "auto_fixable": true,
+  "required_tools": ["docker"],
+  "docker_verified": true,
+  "verification": ["docker_build"],
+  "demo_time_seconds": 35,
+  "broken_files": ["Dockerfile"],
+  "log_file": "logs/build-failure.log",
+  "verification_command": "docker build -t decipher-ms-check scenarios/docker-multistage-wrong-artifact/expected -q 2>/dev/null && docker rmi decipher-ms-check -f >/dev/null 2>&1 && echo PASS || echo FAIL"
+}

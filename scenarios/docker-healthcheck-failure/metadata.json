@@ -1,0 +1,14 @@
+{
+  "id": "docker-healthcheck-failure",
+  "category": "docker",
+  "difficulty": "easy",
+  "expected_classification": "healthcheck_startup_failure",
+  "auto_fixable": true,
+  "required_tools": ["docker"],
+  "docker_verified": true,
+  "verification": ["docker_build", "structural"],
+  "demo_time_seconds": 30,
+  "broken_files": ["Dockerfile"],
+  "log_file": "logs/runtime-failure.log",
+  "verification_command": "docker build -t decipher-hc-check scenarios/docker-healthcheck-failure/expected -q 2>/dev/null && grep -q 'localhost:3000' scenarios/docker-healthcheck-failure/expected/Dockerfile && docker rmi decipher-hc-check -f >/dev/null 2>&1 && echo PASS || echo FAIL"
+}

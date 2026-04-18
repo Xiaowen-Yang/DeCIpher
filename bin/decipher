@@ -105,6 +105,51 @@ function buildHelpBanner() {
   ].join('\n');
 }
 
+// ── Hidden input (API key) ─────────────────────────────────
+/**
+ * Read a line from stdin without echoing characters (for API keys).
+ * Uses TTY raw mode when available; falls back to normal readline in
+ * non-TTY environments (pipes, CI).
+ */
+function askHiddenInput(prompt) {
+  return new Promise((resolve) => {
+    process.stdout.write(prompt);
+
+    if (process.stdin.isTTY) {
+      // Raw mode: characters are not echoed
+      let value = '';
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdin.setEncoding('utf8');
+
+      const onData = (char) => {
+        if (char === '\n' || char === '\r' || char === '\u0004') {
+          process.stdin.setRawMode(false);
+          process.stdin.pause();
+          process.stdin.removeListener('data', onData);
+          process.stdout.write('\n');
+          resolve(value.trim());
+        } else if (char === '\u0003') {
+          process.exit(); // Ctrl-C
+        } else if (char === '\u007f' || char === '\u0008') {
+          value = value.slice(0, -1); // Backspace
+        } else {
+          value += char;
+        }
+      };
+
+      process.stdin.on('data', onData);
+    } else {
+      // Non-TTY (pipe / CI): read normally — no echoing in non-interactive shells
+      const linerl = createInterface({ input: process.stdin });
+      linerl.once('line', (line) => {
+        linerl.close();
+        resolve(line.trim());
+      });
+    }
+  });
+}
+
 // ── First-run setup ────────────────────────────────────────
 async function firstRunSetup() {
   console.log(`\n  ${B('Welcome to DeCIpher')} — ${D('AI CI Troubleshooter')}\n`);
@@ -123,8 +168,10 @@ async function firstRunSetup() {
   const model = (await ask(`  ${D('Model')} [${provider === 'anthropic' ? 'claude-sonnet-4-20250514' : 'gpt-4o'}]: `)).trim() ||
     (provider === 'anthropic' ? 'claude-sonnet-4-20250514' : 'gpt-4o');
 
-  const api_key = (await ask(`  ${D('API Key')}: `)).trim();
-  rl.close();
+  rl.close(); // Close before reading secret
+
+  // Ask for API key with hidden input (no echo)
+  const api_key = await askHiddenInput(`  ${D('API Key')} ${D('(input hidden)')}: `);
 
   if (!api_key) {
     console.log(`\n  ${pc.red('No API key provided. Exiting setup.')}\n`);
@@ -301,7 +348,9 @@ async function callAIMultiTurn(messages, config) {
       throw new Error(`Anthropic API error ${response.status}: ${error}`);
     }
     const data = await response.json();
-    return data.content[0].text.trim();
+    const text = data?.content?.[0]?.text;
+    if (typeof text !== 'string') throw new Error(`Unexpected Anthropic response shape: ${JSON.stringify(data).slice(0, 200)}`);
+    return text.trim();
   }
 
   // OpenAI-compatible format (default)
@@ -324,7 +373,9 @@ async function callAIMultiTurn(messages, config) {
   }
 
   const data = await response.json();
-  return data.choices[0].message.content.trim();
+  const text = data?.choices?.[0]?.message?.content;
+  if (typeof text !== 'string') throw new Error(`Unexpected API response shape: ${JSON.stringify(data).slice(0, 200)}`);
+  return text.trim();
 }
 
 // ── Slash command handlers ─────────────────────────────────
@@ -352,7 +403,11 @@ async function handleSlashCommand(input, config) {
         console.log(`  ${Y('Usage:')} /demo <scenario-path>\n`);
         console.log(`  ${D('Available scenarios:')}`);
         console.log(`    scenarios/docker-copy-path-bug`);
-        console.log(`    scenarios/ci-python-version-drift\n`);
+        console.log(`    scenarios/ci-python-version-drift`);
+        console.log(`    scenarios/docker-healthcheck-failure`);
+        console.log(`    scenarios/docker-multistage-wrong-artifact`);
+        console.log(`    scenarios/docker-run-missing-env`);
+        console.log(`    scenarios/env-missing-node\n`);
         return config;
       }
       try {
@@ -379,24 +434,46 @@ async function handleSlashCommand(input, config) {
       console.log(`  ${G('●')} triage      CI/deployment failure classifier`);
       console.log(`  ${G('●')} fixer       Minimal patch proposer`);
       console.log(`  ${G('●')} verifier    Command runner + evidence capture`);
-      console.log(`\n  ${B('Custom Skills')} ${D('(~/.decipher/skills/)')}`);
-      // Check for custom skills
+      // Built-in skills (directory format: skills/<name>/SKILL.md)
       try {
         const { readdir } = await import('node:fs/promises');
+        const { join, dirname } = await import('node:path');
+        const { fileURLToPath } = await import('node:url');
+        const __dir = dirname(fileURLToPath(import.meta.url));
+        const builtinDir = join(__dir, '..', 'skills');
+        const entries = await readdir(builtinDir, { withFileTypes: true });
+        const builtinSkills = entries.filter(e => e.isDirectory()).map(e => e.name);
+        if (builtinSkills.length > 0) {
+          console.log(`\n  ${B('Built-in Skills:')}`);
+          builtinSkills.forEach(s => console.log(`  ${G('●')} ${s}`));
+        }
+      } catch { /* skills dir may not exist */ }
+      // User skills — unified directory format: ~/.decipher/skills/<name>/SKILL.md
+      console.log(`\n  ${B('User Skills')} ${D('(~/.decipher/skills/<name>/SKILL.md)')}`);
+      try {
+        const { readdir, access } = await import('node:fs/promises');
         const { join } = await import('node:path');
         const { homedir: hd } = await import('node:os');
-        const skillsDir = join(hd(), '.decipher', 'skills');
-        const files = await readdir(skillsDir);
-        const skills = files.filter(f => f.endsWith('.md'));
+        const userSkillsDir = join(hd(), '.decipher', 'skills');
+        const entries = await readdir(userSkillsDir, { withFileTypes: true });
+        // Accept both directory format (name/SKILL.md) and legacy flat .md files
+        const skills = [];
+        for (const e of entries) {
+          if (e.isDirectory()) {
+            skills.push(e.name);
+          } else if (e.isFile() && e.name.endsWith('.md')) {
+            skills.push(e.name.replace('.md', '') + ' (legacy)');
+          }
+        }
         if (skills.length > 0) {
-          skills.forEach(s => console.log(`  ${C('●')} ${s.replace('.md', '')}`));
+          skills.forEach(s => console.log(`  ${C('●')} ${s}`));
         } else {
           console.log(`    ${D('(none installed)')}`);
         }
       } catch {
         console.log(`    ${D('(none installed)')}`);
       }
-      console.log(`\n  ${D('Add domain knowledge: cp your-skill.md ~/.decipher/skills/')}\n`);
+      console.log(`\n  ${D('Add skill: mkdir -p ~/.decipher/skills/my-skill && cp skill.md ~/.decipher/skills/my-skill/SKILL.md')}\n`);
       return config;
 
     case 'config':
@@ -519,16 +596,16 @@ async function main() {
         console.error('Usage: decipher verify "<command>"');
         process.exit(1);
       }
-      const { runCommand } = await import('../agents/verifier/index.js');
+      const { runVerification } = await import('../agents/verifier/index.js');
       const { formatSection } = await import('../lib/reporter.js');
-      const result = await runCommand(cmd);
+      const result = await runVerification(cmd);
       console.log(formatSection('VERIFICATION', [
         `  Command:   ${cmd}`,
-        `  Exit code: ${result.exitCode}`,
-        `  Result:    ${result.exitCode === 0 ? 'PASS' : 'FAIL'}`,
-        result.stdout ? `\n${result.stdout.split('\n').slice(0, 5).map(l => `  ${l}`).join('\n')}` : '',
+        `  Exit code: ${result.exit_code}`,
+        `  Result:    ${result.result}`,
+        result.stdout_excerpt ? `\n${result.stdout_excerpt.split('\n').slice(0, 5).map(l => `  ${l}`).join('\n')}` : '',
       ].join('\n')));
-      process.exit(result.exitCode === 0 ? 0 : 1);
+      process.exit(result.result === 'PASS' ? 0 : 1);
     }
 
     case 'config': {

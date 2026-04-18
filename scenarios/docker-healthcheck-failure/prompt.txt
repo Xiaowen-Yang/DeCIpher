@@ -1,0 +1,1 @@
+Docker container starts successfully and the app is running, but the container is always reported as "unhealthy" in `docker ps`. The application listens on port 3000 and responds correctly at /healthz, but the healthcheck keeps failing. Container never becomes healthy.

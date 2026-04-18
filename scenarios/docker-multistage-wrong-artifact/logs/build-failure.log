@@ -1,0 +1,23 @@
+$ docker build -t demo-app .
+[+] Building 6.3s (8/9)
+ => [internal] load build definition from Dockerfile                       0.0s
+ => [internal] load .dockerignore                                          0.0s
+ => [internal] load metadata for docker.io/library/node:18-alpine          1.2s
+ => [builder 1/4] FROM docker.io/library/node:18-alpine                    0.0s
+ => [builder 2/4] WORKDIR /src                                             0.0s
+ => [builder 3/4] COPY package.json index.js ./                            0.0s
+ => [builder 4/4] RUN mkdir -p output && cp index.js output/app.js        0.3s
+ => ERROR [runner 2/2] COPY --from=builder /src/dist/app.js ./app.js      0.0s
+------
+ > [runner 2/2] COPY --from=builder /src/dist/app.js ./app.js:
+------
+Dockerfile:9
+------
+8 |     WORKDIR /app
+9 | >>> COPY --from=builder /src/dist/app.js ./app.js
+10|     CMD ["node", "app.js"]
+------
+ERROR: failed to solve: failed to copy files: unable to copy to destination: stat /src/dist/app.js: no such file or directory
+
+$ echo "exit code: $?"
+exit code: 1

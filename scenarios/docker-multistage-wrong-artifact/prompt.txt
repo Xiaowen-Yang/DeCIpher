@@ -1,0 +1,1 @@
+Multi-stage Docker build is failing. The builder stage runs successfully but the final stage fails with: "COPY --from=builder /src/dist/app.js: not found". The build script produces output files but they appear to be in a different location than what the COPY instruction expects.

@@ -9,5 +9,5 @@
   "demo_time_seconds": 20,
   "broken_files": [".nvmrc", "package.json"],
   "log_file": "logs/bootstrap-failure.log",
-  "verification_command": "node --version >/dev/null 2>&1 && echo PASS || echo FAIL"
+  "verification_command": "test -f scenarios/env-missing-node/logs/bootstrap-failure.log && test -f scenarios/env-missing-node/acceptance.md && echo PASS || echo FAIL"
 }

@@ -1,0 +1,50 @@
+$ docker build -t demo-app .
+[+] Building 4.2s (7/7) FINISHED
+ => [1/3] FROM docker.io/library/node:18-alpine
+ => [2/3] WORKDIR /app
+ => [3/3] COPY server.js .
+ => exporting to image
+
+$ docker run -d --name demo demo-app
+a3f7c91b2d4e5f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4
+
+$ docker ps
+CONTAINER ID   IMAGE      COMMAND             STATUS
+a3f7c91b2d4e   demo-app   "node server.js"    Up 15s (health: starting)
+
+# 30 seconds later...
+
+$ docker ps
+CONTAINER ID   IMAGE      COMMAND             STATUS
+a3f7c91b2d4e   demo-app   "node server.js"    Up 45s (unhealthy)
+
+$ docker inspect demo --format='{{json .State.Health}}' | jq .
+{
+  "Status": "unhealthy",
+  "FailingStreak": 3,
+  "Log": [
+    {
+      "Start": "2024-01-15T10:00:05Z",
+      "End": "2024-01-15T10:00:08Z",
+      "ExitCode": 1,
+      "Output": "wget: bad address 'localhost'\nwget: download failure\n"
+    },
+    {
+      "Start": "2024-01-15T10:00:13Z",
+      "End": "2024-01-15T10:00:16Z",
+      "ExitCode": 1,
+      "Output": "wget: bad address 'localhost'\nwget: download failure\n"
+    },
+    {
+      "Start": "2024-01-15T10:00:21Z",
+      "End": "2024-01-15T10:00:24Z",
+      "ExitCode": 1,
+      "Output": "wget: bad address 'localhost'\nwget: download failure\n"
+    }
+  ]
+}
+
+$ docker logs demo
+Server listening on port 3000
+
+# Container is running fine on port 3000 but healthcheck probes port 8080 — always fails

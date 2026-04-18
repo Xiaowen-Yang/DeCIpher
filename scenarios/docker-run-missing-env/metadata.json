@@ -1,0 +1,14 @@
+{
+  "id": "docker-run-missing-env",
+  "category": "docker",
+  "difficulty": "easy",
+  "expected_classification": "missing_env_or_secret_contract",
+  "auto_fixable": true,
+  "required_tools": ["docker"],
+  "docker_verified": true,
+  "verification": ["docker_build", "docker_run"],
+  "demo_time_seconds": 30,
+  "broken_files": ["Dockerfile"],
+  "log_file": "logs/runtime-failure.log",
+  "verification_command": "docker build -t decipher-env-check scenarios/docker-run-missing-env/expected -q 2>/dev/null && docker run --rm decipher-env-check node -e \"const v=process.env.DATABASE_URL; if(!v){process.exit(1);} console.log('ENV OK:', v);\" && docker rmi decipher-env-check -f >/dev/null 2>&1 && echo PASS || echo FAIL"
+}

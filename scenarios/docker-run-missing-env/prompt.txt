@@ -1,0 +1,1 @@
+Docker build succeeds but the container exits immediately on startup with error: "FATAL: DATABASE_URL environment variable is required but not set". The application needs a database connection URL to start. Running with `-e DATABASE_URL=...` works, but the Dockerfile doesn't set a default value, making the container unusable without manual env injection.

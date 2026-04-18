@@ -7,7 +7,7 @@ const execAsync = promisify(exec);
 
 const ENV_CHECKS = [
   { name: "Node.js", command: "node --version", minMajor: 18 },
-  { name: "pnpm", command: "pnpm --version", minMajor: 8 },
+  { name: "pnpm", command: "pnpm --version", minMajor: 8, fallback: "corepack pnpm --version" },
   { name: "Docker", command: "docker --version", minMajor: null },
 ];
 
@@ -32,13 +32,24 @@ export async function runCommand(command, options = {}) {
 
 /**
  * Check all required dev environment dependencies.
+ * Supports corepack pnpm as a fallback for pnpm detection.
  */
 export async function checkEnvironment() {
   const items = [];
   let allPassed = true;
 
   for (const check of ENV_CHECKS) {
-    const result = await runCommand(check.command);
+    let result = await runCommand(check.command);
+
+    // Fallback detection (e.g. corepack pnpm)
+    if (result.exitCode !== 0 && check.fallback) {
+      const fallbackResult = await runCommand(check.fallback);
+      if (fallbackResult.exitCode === 0) {
+        result = fallbackResult;
+        console.log(pc.dim(`  (detected via fallback: ${check.fallback})`));
+      }
+    }
+
     if (result.exitCode !== 0) {
       console.log(`  ${pc.red("✗")} ${check.name.padEnd(10)} not found`);
       items.push({ name: check.name, passed: false, error: "not found" });
@@ -92,7 +103,8 @@ export async function generateBootstrapPlan() {
         "  Install: curl -fsSL https://fnm.vercel.app/install | bash && fnm use 18",
       );
     } else if (item.name === "pnpm") {
-      console.log("  Install: npm install -g pnpm");
+      console.log("  Global:  npm install -g pnpm");
+      console.log("  Corepack (recommended): corepack enable && corepack prepare pnpm@latest --activate");
     }
     console.log("");
   }
@@ -101,6 +113,9 @@ export async function generateBootstrapPlan() {
 /**
  * Apply a unified diff patch to a target file.
  * Creates a .bak backup first.
+ *
+ * Handles both replacement hunks (- then +) and pure insertion hunks (+ only).
+ * Pure insertions are inserted BEFORE the line at the target position.
  */
 export async function applyPatch(patch, targetFile) {
   // Backup the original
@@ -111,40 +126,68 @@ export async function applyPatch(patch, targetFile) {
   const originalLines = original.split("\n");
 
   const removals = new Set();
+  // Each addition: { at: lineIndex, content: string, isReplacement: boolean }
+  // isReplacement=true  → goes in place of the removed line at `at`
+  // isReplacement=false → inserted BEFORE the line at `at`
   const additions = [];
-  let targetLine = 0;
 
-  let lastRemovalLine = null;
+  let targetLine = 0;
+  let inRemoval = false;
+  let lastRemovalLine = -1;
 
   for (const line of lines) {
     if (line.startsWith("@@")) {
-      // Parse hunk header: @@ -L,S +L,S @@
       const match = line.match(/@@ -(\d+)/);
       if (match) targetLine = parseInt(match[1], 10) - 1;
-      lastRemovalLine = null;
+      inRemoval = false;
+      lastRemovalLine = -1;
     } else if (line.startsWith("-") && !line.startsWith("---")) {
-      lastRemovalLine = targetLine;
       removals.add(targetLine);
+      lastRemovalLine = targetLine;
+      inRemoval = true;
       targetLine++;
     } else if (line.startsWith("+") && !line.startsWith("+++")) {
-      // Associate addition with the removal position (or current position if no prior removal)
-      const insertAt = lastRemovalLine !== null ? lastRemovalLine : targetLine;
-      additions.push({ at: insertAt, content: line.slice(1) });
+      if (inRemoval) {
+        // Replacement: emitted in place of the last removed line
+        additions.push({ at: lastRemovalLine, content: line.slice(1), isReplacement: true });
+      } else {
+        // Pure insertion: emitted BEFORE the current targetLine
+        additions.push({ at: targetLine, content: line.slice(1), isReplacement: false });
+      }
     } else if (!line.startsWith("---") && !line.startsWith("+++")) {
-      lastRemovalLine = null;
+      // Context line — resets removal tracking
+      inRemoval = false;
+      lastRemovalLine = -1;
       targetLine++;
     }
   }
 
   const result = [];
   for (let i = 0; i < originalLines.length; i++) {
+    // Emit pure insertions scheduled before this line
+    for (const add of additions) {
+      if (!add.isReplacement && add.at === i) {
+        result.push(add.content);
+      }
+    }
+
     if (removals.has(i)) {
-      // Insert additions at this position
-      const adds = additions.filter((a) => a.at === i);
-      for (const add of adds) result.push(add.content);
-      // Skip the removed line
+      // Emit replacement lines in place of the removed line
+      for (const add of additions) {
+        if (add.isReplacement && add.at === i) {
+          result.push(add.content);
+        }
+      }
+      // Skip the original line (it was removed)
     } else {
       result.push(originalLines[i]);
+    }
+  }
+
+  // Emit any insertions at or beyond end of file
+  for (const add of additions) {
+    if (!add.isReplacement && add.at >= originalLines.length) {
+      result.push(add.content);
     }
   }
 
@@ -152,12 +195,27 @@ export async function applyPatch(patch, targetFile) {
 }
 
 /**
- * Run verification command from scenario metadata and return structured result.
+ * Run verification command and return structured result.
+ *
+ * Determines pass/fail by checking stdout for an explicit "PASS" or "FAIL"
+ * marker on the last line — this handles the common `&& echo PASS || echo FAIL`
+ * pattern where `echo FAIL` exits 0 and would otherwise mask the failure.
+ * Falls back to exit code when no such marker is present.
  */
 export async function runVerification(verificationCommand, options = {}) {
   console.log(`  Running: ${verificationCommand}`);
   const result = await runCommand(verificationCommand, options);
-  const passed = result.exitCode === 0;
+
+  // Check last stdout line for explicit PASS/FAIL marker
+  const lastLine = result.stdout.trim().split("\n").pop()?.trim().toUpperCase() ?? "";
+  let passed;
+  if (lastLine === "PASS") {
+    passed = true;
+  } else if (lastLine === "FAIL") {
+    passed = false;
+  } else {
+    passed = result.exitCode === 0;
+  }
 
   return {
     command: verificationCommand,
