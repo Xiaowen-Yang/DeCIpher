@@ -1,0 +1,12 @@
+{
+  "id": "github-docker-clone",
+  "category": "docker",
+  "difficulty": "medium",
+  "description": "Clone a GitHub repo and run it in Docker — from a single URL + sentence",
+  "mission_type": "clone_and_run",
+  "start_state": "empty",
+  "mission_stop_boundary": "container_running",
+  "required_tools": ["docker", "git"],
+  "prompt": "Clone this GitHub repository and run it in Docker: https://github.com/docker/getting-started-app",
+  "acceptance": "acceptance.json"
+}

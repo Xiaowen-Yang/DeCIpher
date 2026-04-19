@@ -1,0 +1,17 @@
+{
+  "id": "hpl-build-and-start",
+  "category": "docker",
+  "difficulty": "medium",
+  "description": "HPL benchmark — build the image and start the container, verify it is running",
+  "execution_mode": "docker_run",
+  "workspace_mode": "temp_then_writeback",
+  "writeback_on_success": true,
+  "mission_type": "build_start",
+  "mission_stop_boundary": "container_running",
+  "required_tools": ["docker"],
+  "broken_files": ["Dockerfile"],
+  "log_file": "logs/build-failure.log",
+  "expected_classification": "dependency_install_failure",
+  "verification_command": "docker build -t decipher-hpl-start scenarios/hpl-build-and-start/expected -q && docker run --rm decipher-hpl-start echo 'container_started' | grep -q container_started && echo PASS || echo FAIL",
+  "demo_time_seconds": 40
+}

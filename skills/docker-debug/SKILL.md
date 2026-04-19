@@ -1,4 +1,7 @@
-# Docker Debug Domain Knowledge
+# Docker Repair Subsystem Knowledge
+
+This skill supports DeCIpher's mission runtime when the selected subsystem is
+repair and the target is Docker-related.
 
 ## Common Docker Failure Patterns
 

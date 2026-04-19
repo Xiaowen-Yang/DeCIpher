@@ -1,0 +1,46 @@
+{
+  "checks": [
+    {
+      "id": "dockerfile_created",
+      "type": "file_exists",
+      "path": "Dockerfile",
+      "description": "Agent generated a Dockerfile"
+    },
+    {
+      "id": "dockerfile_has_hpl",
+      "type": "file_contains",
+      "path": "Dockerfile",
+      "contains": "hpcc",
+      "description": "Dockerfile installs an HPL-capable package (hpcc)"
+    },
+    {
+      "id": "dockerfile_has_mpi",
+      "type": "file_contains",
+      "path": "Dockerfile",
+      "contains": "openmpi",
+      "description": "Dockerfile includes MPI runtime"
+    },
+    {
+      "id": "run_script_created",
+      "type": "file_exists",
+      "path": "run_hpl.sh",
+      "description": "Agent generated a benchmark run script"
+    },
+    {
+      "id": "docker_build",
+      "type": "command",
+      "command": "docker build -t decipher-hpl-scratch-check .",
+      "expect_exit": 0,
+      "timeout": 300000,
+      "description": "Docker image builds successfully"
+    },
+    {
+      "id": "container_starts",
+      "type": "command",
+      "command": "docker run --rm decipher-hpl-scratch-check echo 'container_ok'",
+      "expect_stdout_contains": "container_ok",
+      "timeout": 30000,
+      "description": "Container starts and can execute commands"
+    }
+  ]
+}

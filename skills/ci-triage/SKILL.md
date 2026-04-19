@@ -1,4 +1,7 @@
-# CI Triage Domain Knowledge
+# CI Triage Repair Subsystem Knowledge
+
+This skill supports the repair subsystem inside DeCIpher's mission-driven
+runtime. It is not the whole product.
 
 ## Common CI Failure Patterns
 

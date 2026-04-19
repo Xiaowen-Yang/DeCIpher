@@ -8,23 +8,9 @@ import { applyPatch, runVerification } from "../verifier/index.js";
 
 const MAX_ITERATIONS = 3;
 
-/**
- * Run a full scenario: triage → fix → patch-apply → verify loop.
- *
- * The patch is applied to a temp copy of broken/ so verification runs against
- * the AI-patched workspace, not the pre-baked expected/ directory.
- *
- * @param {string} scenarioPath - path to scenario directory
- * @param {object} config - API config
- * @returns {Promise<object>} report artifact with all 7 sections
- */
-export async function runScenario(scenarioPath, config) {
+export async function runStructuralScenarioLoop(scenarioPath, meta, config) {
   const absPath = resolve(scenarioPath);
-
-  const metaRaw = await readFile(join(absPath, "metadata.json"), "utf8");
-  const meta = JSON.parse(metaRaw);
-
-  const logFile = join(absPath, meta.log_file);
+  const logFile = meta.log_file ? join(absPath, meta.log_file) : null;
   const brokenDir = join(absPath, "broken");
 
   console.log(pc.dim(`\nLoading scenario: ${meta.id}`));
@@ -34,7 +20,22 @@ export async function runScenario(scenarioPath, config) {
     ),
   );
 
-  // ── Step 1: Triage ────────────────────────────────────────
+  if (!logFile) {
+    return buildReport({
+      meta,
+      classification: null,
+      patchArtifact: null,
+      verificationArtifact: {
+        command: "N/A",
+        exit_code: -1,
+        stdout_excerpt: "Scenario has no log_file configured.",
+        result: "SKIPPED",
+      },
+      patchApplied: false,
+      stopped: "NEEDS_HUMAN_REVIEW — scenario log_file missing",
+    });
+  }
+
   console.log(pc.bold("[1/3] Triaging failure..."));
   const classificationArtifact = await triageLog(
     logFile,
@@ -59,23 +60,16 @@ export async function runScenario(scenarioPath, config) {
     });
   }
 
-  // Scenarios marked auto_fixable:false require human-driven remediation.
-  // Skip both patch generation AND the metadata verification_command — that command
-  // checks live environment state (e.g. `node --version`), which is always true on the
-  // developer's machine and does NOT validate the broken scenario definition.
-  // Instead, report SKIPPED and direct the user to bootstrap/doctor.
   if (meta.auto_fixable === false) {
     console.log(
       pc.yellow("  Not auto-fixable — providing bootstrap guidance only."),
     );
     console.log(pc.bold("\n[2/3] Fix skipped (auto_fixable: false)"));
-    console.log(`  → Run: node bin/decipher bootstrap`);
     console.log(
-      `  → See: ${scenarioPath}/README.md for OS-specific instructions`,
+      `  → See: ${scenarioPath}/README.md for remediation instructions`,
     );
     console.log(pc.bold("\n[3/3] Verification skipped"));
     console.log(`  → Cannot verify broken state on a functional machine`);
-    console.log(`  → See acceptance criteria: ${scenarioPath}/acceptance.md`);
     return buildReport({
       meta,
       classification: classificationArtifact,
@@ -93,20 +87,16 @@ export async function runScenario(scenarioPath, config) {
     });
   }
 
-  // Load broken file contents for fixer context
   const brokenFiles = [];
   for (const relPath of meta.broken_files ?? []) {
     try {
       const content = await readFile(join(brokenDir, relPath), "utf8");
       brokenFiles.push({ path: relPath, content });
     } catch {
-      // File may not exist in broken/; skip
+      // skip unreadable broken files
     }
   }
 
-  // ── Create temp workspace from broken/ ───────────────────
-  // AI-generated patch will be applied here; verification runs against this
-  // workspace rather than the pre-baked expected/ directory.
   let tmpWorkspace = null;
   try {
     tmpWorkspace = await mkdtemp(join(tmpdir(), `decipher-${meta.id}-`));
@@ -120,10 +110,11 @@ export async function runScenario(scenarioPath, config) {
   let verificationArtifact = null;
   let previousPatchSummary = null;
   let patchApplied = false;
+  let iterationsRun = 0;
 
   try {
     for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
-      // ── Step 2: Fix ───────────────────────────────────────
+      iterationsRun = iteration;
       console.log(
         pc.bold(
           `\n[2/3] Proposing fix (attempt ${iteration}/${MAX_ITERATIONS})...`,
@@ -138,7 +129,6 @@ export async function runScenario(scenarioPath, config) {
       console.log(`  Affected: ${patchSummary}`);
       console.log(`  Risk: ${patchArtifact.risk}`);
 
-      // Stop condition: same patch attempted twice
       if (patchSummary === previousPatchSummary) {
         console.log(pc.yellow("  Same patch attempted twice — stopping."));
         return buildReport({
@@ -152,7 +142,6 @@ export async function runScenario(scenarioPath, config) {
       }
       previousPatchSummary = patchSummary;
 
-      // Stop condition: patch touches too many files
       if (patchArtifact.affected_files.length > 2) {
         console.log(
           pc.yellow(
@@ -169,7 +158,6 @@ export async function runScenario(scenarioPath, config) {
         });
       }
 
-      // ── Apply patch to temp workspace ─────────────────────
       patchApplied = false;
       if (tmpWorkspace && patchArtifact.patch) {
         for (const relPath of meta.broken_files ?? []) {
@@ -181,20 +169,8 @@ export async function runScenario(scenarioPath, config) {
             console.log(pc.dim(`  Patch apply note: ${err.message}`));
           }
         }
-        if (patchApplied) {
-          console.log(pc.dim(`  Patch applied to workspace`));
-        } else {
-          console.log(
-            pc.yellow(
-              `  Patch format not directly applicable — verifying structurally`,
-            ),
-          );
-        }
       }
 
-      // ── Step 3: Verify ────────────────────────────────────
-      // If patch applied to workspace, redirect expected/ references to the
-      // patched temp directory so we verify the actual AI output.
       console.log(pc.bold("\n[3/3] Verifying fix..."));
       let verifyCmd = meta.verification_command;
       if (tmpWorkspace && patchApplied) {
@@ -209,14 +185,8 @@ export async function runScenario(scenarioPath, config) {
         `  Result: ${verificationArtifact.result === "PASS" ? pc.green("PASS") : pc.red("FAIL")}`,
       );
 
-      if (verificationArtifact.result === "PASS") break;
-
-      if (iteration < MAX_ITERATIONS) {
-        console.log(
-          pc.yellow(
-            `  Verification failed — retrying fix (${iteration + 1}/${MAX_ITERATIONS})...`,
-          ),
-        );
+      if (verificationArtifact.result === "PASS") {
+        break;
       }
     }
   } finally {
@@ -224,7 +194,7 @@ export async function runScenario(scenarioPath, config) {
       try {
         await rm(tmpWorkspace, { recursive: true, force: true });
       } catch {
-        /* ignore */
+        // ignore cleanup errors
       }
     }
   }
@@ -236,16 +206,34 @@ export async function runScenario(scenarioPath, config) {
     verificationArtifact,
     patchApplied,
     stopped: null,
+    iterationsRun,
   });
 }
 
-function buildReport({
+function mapOutcome(result, stopped) {
+  if (stopped && stopped.includes("NEEDS_HUMAN_REVIEW"))
+    return "NEEDS_HUMAN_REVIEW";
+  if (result === "PASS") return "PASS";
+  if (result === "NOT_RUN" || result === "SKIPPED") return "NEEDS_HUMAN_REVIEW";
+  return "FAIL";
+}
+
+function mapState(result, stopped) {
+  if (stopped && stopped.includes("NEEDS_HUMAN_REVIEW"))
+    return "NEEDS_HUMAN_REVIEW";
+  if (result === "PASS") return "PASS";
+  if (result === "FAIL") return "BUILD_FAIL";
+  return result ?? "NOT_RUN";
+}
+
+export function buildReport({
   meta,
   classification,
   patchArtifact,
   verificationArtifact,
   patchApplied,
   stopped,
+  iterationsRun = 1,
 }) {
   const evidenceLines = (classification?.root_causes ?? [])
     .filter((rc) => rc.evidence)
@@ -254,10 +242,30 @@ function buildReport({
   const patch = patchArtifact?.patch ?? "";
   const result = verificationArtifact?.result ?? "NOT_RUN";
 
+  // False-positive guard: if a patch was proposed but never applied and the
+  // verification still reports PASS, this is a false positive — the original
+  // broken state cannot legitimately pass a targeted verification command.
+  const effectiveResult =
+    result === "PASS" &&
+    patchArtifact?.patch &&
+    !patchApplied &&
+    stopped == null
+      ? "FAIL"
+      : result;
+
   return {
+    // LoopResult-compatible fields
+    outcome: mapOutcome(effectiveResult, stopped),
+    state: mapState(effectiveResult, stopped),
+    writtenBack: [],
+    workspace: null,
+    iterations: iterationsRun,
+    executionMode: "structural",
+
+    // Structural-specific fields
     summary: stopped
       ? stopped
-      : result === "PASS"
+      : effectiveResult === "PASS"
         ? `${meta.id}: ${classification.classification} — fix applied and verified.`
         : `${meta.id}: fix applied but verification failed.`,
 
@@ -274,7 +282,7 @@ function buildReport({
       command:
         verificationArtifact?.command ?? meta.verification_command ?? "N/A",
       exit_code: verificationArtifact?.exit_code ?? -1,
-      result,
+      result: effectiveResult,
       excerpt: verificationArtifact?.stdout_excerpt ?? "",
     },
 
@@ -285,7 +293,7 @@ function buildReport({
 
     next: stopped
       ? "Human review required. See logs for details."
-      : result === "PASS"
+      : effectiveResult === "PASS"
         ? "Commit the fix and re-run your CI pipeline."
         : "Manual intervention required — automated fix unsuccessful.",
   };

@@ -1,4 +1,7 @@
-# Environment Bootstrap Domain Knowledge
+# Environment Bootstrap Mission Support
+
+This skill supports environment setup and generation/repair decisions inside the
+mission-driven runtime.
 
 ## Dependency Detection
 
@@ -14,7 +17,7 @@
 
 ### Docker
 - Check: `docker --version` and `docker info`
-- Required for: docker-copy-path-bug, docker-entrypoint-permission scenarios
+- Required for many container missions
 - Install: Docker Desktop (macOS/Windows), or `curl -fsSL https://get.docker.com | sh` (Linux)
 
 ### Python
@@ -23,12 +26,11 @@
 - Install: `pyenv install 3.11` or system package manager
 
 ## Version Comparison
-To check if installed version meets minimum:
 - Split version string: `node --version` → `v18.19.0` → `18`
 - Compare major version numerically
 
-## Install Script Safety Rules
+## Safety Rules
 - Always prompt before installing anything
 - Never use sudo without explicit user consent
 - Always show the install command before running it
-- Provide OS-specific instructions (macOS/Linux/Windows)
+- Provide OS-specific instructions when the mission requires manual remediation

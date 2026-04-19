@@ -4,6 +4,8 @@
   "difficulty": "easy",
   "expected_classification": "dependency_version_mismatch",
   "auto_fixable": true,
+  "mission_type": "repair",
+  "mission_stop_boundary": "issue_resolved",
   "required_tools": [],
   "verification": ["structural"],
   "demo_time_seconds": 25,

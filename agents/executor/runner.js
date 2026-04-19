@@ -49,7 +49,13 @@ async function safeExec(cmd, opts = {}) {
   }
 }
 
-function buildPreservedArtifacts({ imageTag = null, containerName = null, status = null, mode = null, running = null }) {
+function buildPreservedArtifacts({
+  imageTag = null,
+  containerName = null,
+  status = null,
+  mode = null,
+  running = null,
+}) {
   return {
     mode,
     image_tag: imageTag,
@@ -158,10 +164,8 @@ export async function runDockerRun(workspace, scenarioId, options = {}) {
   );
   const logsResult = await safeExec(`docker logs ${containerName} 2>&1`);
 
-  const [runningRaw = "", exitCodeRaw = "", statusRaw = ""] = inspectResult.output
-    .trim()
-    .replace(/'/g, "")
-    .split("|");
+  const [runningRaw = "", exitCodeRaw = "", statusRaw = ""] =
+    inspectResult.output.trim().replace(/'/g, "").split("|");
   const running = runningRaw === "true";
   const exitCode = Number.parseInt(exitCodeRaw, 10);
   const status = statusRaw || "unknown";
@@ -333,9 +337,84 @@ export async function runHealthcheck(workspace, scenarioId, options = {}) {
   };
 }
 
+const BENCHMARK_TIMEOUT = 300_000; // 5 min — benchmarks can take time
+
+/**
+ * benchmark_run mode — build the image, run the container to completion,
+ * capture all output. The container must exit 0 for PASS.
+ *
+ * The benchmark command can be supplied via options.benchmark_cmd or defaults
+ * to whatever the image CMD specifies.
+ */
+export async function runBenchmark(workspace, scenarioId, options = {}) {
+  const imageTag = tag(scenarioId);
+  const benchmarkCmd = options.benchmark_cmd ?? "";
+  const keepArtifacts = options.keepArtifacts === true;
+
+  // Build
+  const buildResult = await safeExec(
+    `docker build -t ${imageTag} ${workspace} 2>&1`,
+    { timeout: BUILD_TIMEOUT },
+  );
+  if (buildResult.exitCode !== 0) {
+    await safeExec(`docker rmi ${imageTag} -f 2>/dev/null`);
+    return {
+      state: "BUILD_FAIL",
+      output: buildResult.output,
+      tag: null,
+      containerStarted: false,
+      cleanupPerformed: true,
+      preservedArtifacts: null,
+    };
+  }
+
+  // Run to completion
+  const runResult = await safeExec(
+    `docker run --rm ${imageTag} ${benchmarkCmd} 2>&1`.trim(),
+    { timeout: BENCHMARK_TIMEOUT },
+  );
+
+  const combinedOutput = [
+    "=== docker build output ===",
+    buildResult.output,
+    "=== benchmark run output ===",
+    runResult.output,
+  ].join("\n");
+
+  if (runResult.exitCode !== 0) {
+    if (!keepArtifacts) {
+      await safeExec(`docker rmi ${imageTag} -f 2>/dev/null`);
+    }
+    return {
+      state: "BENCHMARK_FAIL",
+      output: combinedOutput,
+      tag: keepArtifacts ? imageTag : null,
+      containerStarted: true,
+      cleanupPerformed: !keepArtifacts,
+      preservedArtifacts: keepArtifacts
+        ? buildPreservedArtifacts({ imageTag, mode: "benchmark_run" })
+        : null,
+    };
+  }
+
+  if (!keepArtifacts) {
+    await safeExec(`docker rmi ${imageTag} -f 2>/dev/null`);
+  }
+  return {
+    state: "PASS",
+    output: combinedOutput,
+    tag: keepArtifacts ? imageTag : null,
+    containerStarted: true,
+    cleanupPerformed: !keepArtifacts,
+    preservedArtifacts: keepArtifacts
+      ? buildPreservedArtifacts({ imageTag, mode: "benchmark_run" })
+      : null,
+  };
+}
+
 /**
  * Dispatch to the correct runner based on execution_mode.
- * @param {'docker_build'|'docker_run'|'healthcheck'} mode
+ * @param {'docker_build'|'docker_run'|'healthcheck'|'benchmark_run'} mode
  * @param {string} workspace
  * @param {string} scenarioId
  */
@@ -345,6 +424,8 @@ export async function runCommand(mode, workspace, scenarioId, options = {}) {
       return runDockerRun(workspace, scenarioId, options);
     case "healthcheck":
       return runHealthcheck(workspace, scenarioId, options);
+    case "benchmark_run":
+      return runBenchmark(workspace, scenarioId, options);
     case "docker_build":
     default:
       return runDockerBuild(workspace, scenarioId, options);

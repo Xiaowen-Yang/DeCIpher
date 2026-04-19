@@ -13,6 +13,8 @@ const {
   maskSecret,
   maskConfig,
   normalizeConfigKey,
+  canUpdateConfigKey,
+  coerceConfigValue,
   validateConfigUpdates,
 } = await import('../../lib/config.js');
 
@@ -20,7 +22,7 @@ test('readConfig returns defaults when no config file exists', async () => {
   const config = await readConfig();
   assert.equal(config.provider, 'openai');
   assert.equal(config.max_iterations, 3);
-  assert.equal(config.auto_approve, false);
+  assert.equal(config.approval_policy, 'on-request');
 });
 
 test('writeConfig persists and readConfig retrieves values', async () => {
@@ -35,7 +37,6 @@ test('CONFIG_DEFAULTS has required keys', () => {
   assert.ok('provider' in CONFIG_DEFAULTS);
   assert.ok('model' in CONFIG_DEFAULTS);
   assert.ok('max_iterations' in CONFIG_DEFAULTS);
-  assert.ok('auto_approve' in CONFIG_DEFAULTS);
   assert.ok('approval_policy' in CONFIG_DEFAULTS);
   assert.ok('notification_command' in CONFIG_DEFAULTS);
 });
@@ -66,6 +67,22 @@ test('normalizeConfigKey maps slash-command keys to stored keys', () => {
   assert.equal(normalizeConfigKey('approval-policy'), 'approval_policy');
 });
 
+test('canUpdateConfigKey constrains model and setting scopes', () => {
+  assert.equal(canUpdateConfigKey('model', 'model'), true);
+  assert.equal(canUpdateConfigKey('base_url', 'model'), true);
+  assert.equal(canUpdateConfigKey('approval_policy', 'model'), false);
+  assert.equal(canUpdateConfigKey('approval_policy', 'setting'), true);
+  assert.equal(canUpdateConfigKey('max_iterations', 'setting'), true);
+});
+
+test('coerceConfigValue normalizes nullable and numeric config values', () => {
+  assert.equal(coerceConfigValue('base_url', 'default'), null);
+  assert.equal(coerceConfigValue('api-key', 'none'), null);
+  assert.equal(coerceConfigValue('notification_command', 'null'), null);
+  assert.equal(coerceConfigValue('max_iterations', '5'), 5);
+  assert.equal(coerceConfigValue('model', 'gpt-5.2'), 'gpt-5.2');
+});
+
 test('validateConfigUpdates rejects invalid provider, url, and approval policy', () => {
   assert.throws(
     () => validateConfigUpdates({ provider: 'bogus' }),
@@ -79,6 +96,10 @@ test('validateConfigUpdates rejects invalid provider, url, and approval policy',
     () => validateConfigUpdates({ approval_policy: 'maybe' }),
     { message: /approval_policy/i },
   );
+  assert.throws(
+    () => validateConfigUpdates({ max_iterations: 0 }),
+    { message: /max_iterations/i },
+  );
 });
 
 test('writeConfig persists approval policy and normalized keys', async () => {
@@ -90,4 +111,11 @@ test('writeConfig persists approval policy and normalized keys', async () => {
   const config = await readConfig();
   assert.equal(config.approval_policy, 'never');
   assert.equal(config.api_key, 'sk-test-value');
+});
+
+test('coerceConfigValue rejects invalid max_iterations', () => {
+  assert.throws(
+    () => coerceConfigValue('max_iterations', 'zero'),
+    { message: /max_iterations/i },
+  );
 });

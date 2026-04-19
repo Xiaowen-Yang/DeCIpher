@@ -7,11 +7,12 @@ import { homedir } from 'node:os';
 import {
   readConfig,
   writeConfig,
-  maskConfig,
+  maskSecret,
   normalizeConfigKey,
+  canUpdateConfigKey,
+  coerceConfigValue,
   getHistoryPath,
   getConfigDir,
-  getSessionPath,
 } from '../lib/config.js';
 import {
   appendHistoryEntry,
@@ -22,12 +23,19 @@ import {
 import {
   loadSessionSnapshot,
   formatSessionSnapshot,
+  persistSessionSnapshot,
 } from '../lib/session-store.js';
 import pc from 'picocolors';
 import { normalizeOpenAICompatibleUrl } from '../lib/api-client.js';
 import {
+  SLASH_COMMANDS,
+  buildCliModelView,
+  buildCliSettingsView,
   buildCliStatusSnapshot,
   buildCliReviewSnapshot,
+  buildCliPlanView,
+  buildCliTranscriptView,
+  buildCliArtifactsView,
   suggestCliSlashCommand,
 } from '../lib/cli-surface.js';
 
@@ -43,22 +51,7 @@ const D  = (s) => pc.dim(s);
 const B  = (s) => pc.bold(s);
 const W  = (s) => pc.white(s);
 
-const SLASH_COMMANDS = [
-  { name: '/help', description: 'Show help and commands' },
-  { name: '/model', description: 'Show or change model' },
-  { name: '/setting', description: 'Show or update configuration' },
-  { name: '/status', description: 'Show current session status' },
-  { name: '/resume', description: 'Resume last executor session' },
-  { name: '/plan', description: 'Show current repair plan' },
-  { name: '/review', description: 'Review current repair state and patch' },
-  { name: '/transcript', description: 'Show last executor transcript' },
-  { name: '/log', description: 'Alias for transcript' },
-  { name: '/artifacts', description: 'Show saved artifacts and workspace' },
-  { name: '/demo', description: 'Run a demo scenario' },
-  { name: '/doctor', description: 'Check environment' },
-  { name: '/agents', description: 'List available agents' },
-  { name: '/quit', description: 'Exit' },
-];
+// SLASH_COMMANDS is imported from lib/cli-surface.js (single source of truth)
 
 // ── Banner ─────────────────────────────────────────────────
 function shortenPath(p) {
@@ -88,31 +81,20 @@ function buildSessionHeader(config, sessionState = {}) {
     ? D('  (' + truncate(config.base_url, 40) + ')')
     : '';
 
-  const contentLines = [
-    `                  ${BY('/\\_/\\')}`,
-    `                 ${BY('( •ᴥ• )')}`,
-    `${B('>_')} ${BC('DeCIpher')} ${D(`(v${VERSION})`)}`,
+  const lines = [
     ``,
-    `${D('provider:')}  ${C(provider)}${baseUrlDisplay}`,
-    `${D('model:')}     ${C(model)}              ${D('/model to change')}`,
-    `${D('directory:')} ${W(dir)}`,
-    `${D('approval:')}  ${C(approvalPolicy)}          ${D(`/status last:${lastState}`)}`,
-    `${D('api key:')}   ${hasKey} ${config.api_key ? D('configured') : pc.red('not set')}`,
+    `    ${BY('/\\_/\\')}`,
+    `   ${BY('( •ᴥ• )')}  ${BC('DeCIpher')} ${D(`v${VERSION}`)}`,
+    ``,
+    `  ${D('provider')}   ${C(provider)}${baseUrlDisplay}`,
+    `  ${D('model')}      ${C(model)}`,
+    `  ${D('directory')}  ${W(dir)}`,
+    `  ${D('approval')}   ${C(approvalPolicy)}  ${D('last:')} ${D(lastState)}`,
+    `  ${D('api key')}    ${hasKey} ${config.api_key ? D('configured') : pc.red('not set')}`,
+    ``,
   ];
 
-  // Dynamic width: at least 60, expand if needed
-  const maxContent = Math.max(...contentLines.map(l => stripAnsi(l).length));
-  const width = Math.max(60, maxContent + 4);
-
-  const top = `╭${'─'.repeat(width)}╮`;
-  const bot = `╰${'─'.repeat(width)}╯`;
-  const boxed = contentLines.map(line => {
-    const stripped = stripAnsi(line);
-    const pad = Math.max(0, width - 2 - stripped.length);
-    return `│ ${line}${' '.repeat(pad)} │`;
-  });
-
-  return [top, ...boxed, bot].join('\n');
+  return lines.join('\n');
 }
 
 function buildHelpBanner() {
@@ -156,12 +138,32 @@ function buildHelpBanner() {
   ].join('\n');
 }
 
-function showSlashSuggestions(prefix = '/') {
-  const matches = SLASH_COMMANDS.filter(command => command.name.startsWith(prefix));
-  printSectionHeader('COMMAND PALETTE', 'command');
-  matches.forEach(command => {
-    console.log(`  ${C(command.name.padEnd(12))} ${D(command.description)}`);
+function fuzzyMatchCommands(prefix) {
+  // Exact prefix match first
+  const exact = SLASH_COMMANDS.filter(c => c.name.startsWith(prefix));
+  if (exact.length > 0) return exact;
+  // Fuzzy: match if all chars of prefix appear in order in the command name
+  const chars = prefix.replace('/', '').toLowerCase();
+  return SLASH_COMMANDS.filter(c => {
+    const name = c.name.slice(1).toLowerCase();
+    let ci = 0;
+    for (let ni = 0; ni < name.length && ci < chars.length; ni++) {
+      if (name[ni] === chars[ci]) ci++;
+    }
+    return ci === chars.length;
   });
+}
+
+function showSlashSuggestions(prefix = '/') {
+  const matches = fuzzyMatchCommands(prefix);
+  printSectionHeader('COMMANDS', 'command');
+  if (matches.length === 0) {
+    console.log(`  ${D('(no matching commands)')}`);
+  } else {
+    matches.forEach(command => {
+      console.log(`  ${C(command.name.padEnd(14))} ${D(command.description)}`);
+    });
+  }
   console.log('');
 }
 
@@ -171,60 +173,85 @@ function parseExecutionFlags(args = []) {
   };
 }
 
-function buildModelStatus(config) {
-  const safe = maskConfig(config);
-  return [
-    `  ${D('provider:')} ${C(safe.provider)}`,
-    `  ${D('model:')}    ${C(safe.model)}`,
-    `  ${D('base_url:')} ${safe.base_url ? C(safe.base_url) : D('(default)')}`,
-    `  ${D('api_key:')}  ${safe.api_key ? C(safe.api_key) : D('(not set)')}`,
-  ].join('\n');
+async function promptForConfigValue(rl, key) {
+  if (key !== 'api_key') {
+    return null;
+  }
+
+  rl.pause();
+  const value = await askHiddenInput(`  ${D('API Key')} ${D('(input hidden)')}: `);
+  rl.resume();
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+  }
+  return value;
 }
 
-function buildStatusSnapshot(config, sessionState, persisted = null) {
+async function applyConfigUpdate(config, scope, key, rawValue, rl) {
+  const normalizedKey = normalizeConfigKey(key);
+  if (!canUpdateConfigKey(normalizedKey, scope)) {
+    throw new Error(
+      `Unsupported ${scope} setting '${key}'.`,
+    );
+  }
+
+  let value = rawValue;
+  if ((value == null || value === '') && normalizedKey === 'api_key') {
+    value = await promptForConfigValue(rl, normalizedKey);
+  }
+
+  if (value == null || value === '') {
+    throw new Error(`Missing value for ${normalizedKey}.`);
+  }
+
+  const coercedValue = coerceConfigValue(normalizedKey, value);
+  const next = await writeConfig({ [normalizedKey]: coercedValue });
+  const displayValue = normalizedKey === 'api_key'
+    ? maskSecret(next.api_key)
+    : coercedValue ?? '(default)';
+
   return {
-    cwd: process.cwd(),
-    target: sessionState.currentTarget?.path ?? persisted?.target_path ?? null,
-    approval_state: sessionState.approved ?? false,
-    approval_policy: sessionState.approvalPolicy ?? config.approval_policy ?? 'on-request',
-    model: config.model,
-    provider: config.provider,
-    base_url: config.base_url,
-    retry_budget: config.max_iterations,
-    last_verification_result: sessionState.lastVerificationResult ?? persisted?.last_verification_state ?? null,
-    temp_workspace_path: sessionState.lastRunResult?.workspace ?? persisted?.workspace_path ?? null,
-    writable_roots: [process.cwd(), '/tmp'],
-    persistence: {
-      config_dir: getConfigDir(),
-      history_path: getHistoryPath(),
-      session_path: getSessionPath(),
-    },
-    network: 'blocked/unknown',
+    config: next,
+    key: normalizedKey,
+    displayValue,
   };
-}
-
-function suggestSlashCommand(cmd) {
-  const normalized = `/${cmd}`;
-  if (normalized === '/settings') return '/setting';
-  const exact = SLASH_COMMANDS.find(item => item.name === normalized);
-  if (exact) return exact.name;
-  return SLASH_COMMANDS.find(item => item.name.startsWith(normalized))?.name ?? null;
 }
 
 function completeSlashCommand(line) {
   if (!line.startsWith('/')) {
+    // Path completion: if line contains path-like chars, complete file paths
+    if (/[.\/~]/.test(line) || line.startsWith('scenarios')) {
+      return completeFilePath(line);
+    }
     return [[], line];
   }
 
-  const hits = SLASH_COMMANDS
-    .map((command) => command.name)
-    .filter((name) => name.startsWith(line));
-
-  return [hits.length ? hits : SLASH_COMMANDS.map((command) => command.name), line];
+  const matches = fuzzyMatchCommands(line);
+  const hits = matches.map(c => c.name);
+  return [hits.length ? hits : SLASH_COMMANDS.map(c => c.name), line];
 }
 
-function panelWidth(title) {
-  return Math.max(54, Math.min(termWidth() - 2, 78), stripAnsi(title).length + 10);
+function completeFilePath(partial) {
+  try {
+    const path = require('node:path');
+    const fs = require('node:fs');
+    const resolved = partial.startsWith('~')
+      ? partial.replace('~', require('node:os').homedir())
+      : partial;
+    const dir = fs.statSync(resolved).isDirectory() ? resolved : path.dirname(resolved);
+    const prefix = fs.statSync(resolved).isDirectory() ? '' : path.basename(resolved);
+    const entries = fs.readdirSync(dir);
+    const matches = entries
+      .filter(e => e.startsWith(prefix))
+      .map(e => {
+        const full = path.join(dir === resolved ? partial : path.dirname(partial), e);
+        const isDir = fs.statSync(path.join(dir, e)).isDirectory();
+        return isDir ? full + '/' : full;
+      });
+    return [matches, partial];
+  } catch {
+    return [[], partial];
+  }
 }
 
 function printSectionHeader(label, tone = 'agent') {
@@ -233,47 +260,10 @@ function printSectionHeader(label, tone = 'agent') {
 }
 
 function buildPromptFrame(mode = 'YOU') {
-  const width = panelWidth(mode);
-  const top = `${D('╭')}${D('─')} ${mode === 'SEARCH' ? Y(mode) : BY(mode)} ${D('─'.repeat(Math.max(8, width - stripAnsi(mode) - 4)))}`;
+  const top = `${D('╭─')}`;
   const prompt = `${D('│')} ${mode === 'SEARCH' ? Y('SEARCH') : BY('YOU')} ${C('›')} `;
-  const bottom = `${D('╰')}${D('─'.repeat(width))}`;
+  const bottom = `${D('╰─')}`;
   return { top, prompt, bottom };
-}
-
-function buildCurrentPlan(sessionState, persisted = null) {
-  const target = sessionState.currentTarget?.path ?? persisted?.target_path;
-  const lastState = sessionState.lastVerificationResult ?? persisted?.last_verification_state;
-  const patch = sessionState.lastRunResult?.patch ?? persisted?.patch;
-  const writtenBack = sessionState.lastRunResult?.writtenBack ?? persisted?.written_back ?? [];
-
-  const steps = [
-    { label: 'Resolve target', done: Boolean(target) },
-    { label: 'Reproduce failure', done: Boolean(lastState && lastState !== 'PASS') },
-    { label: 'Classify root cause', done: Boolean(sessionState.lastRunResult?.classification?.classification ?? persisted?.classification?.classification) },
-    { label: 'Propose patch', done: Boolean(patch) },
-    { label: 'Verify fix', done: lastState === 'PASS' },
-    { label: 'Write back repaired files', done: writtenBack.length > 0 },
-  ];
-
-  return steps.map((step) => `  ${step.done ? G('●') : D('○')} ${step.label}`).join('\n');
-}
-
-async function buildReviewSnapshot(sessionState) {
-  const persisted = await loadSessionSnapshot();
-  const patch = sessionState.lastRunResult?.patch ?? persisted?.patch ?? null;
-  const writtenBack = sessionState.lastRunResult?.writtenBack ?? persisted?.written_back ?? [];
-  const classification = sessionState.lastRunResult?.classification?.classification ?? persisted?.classification?.classification ?? null;
-  const confidence = sessionState.lastRunResult?.classification?.confidence ?? persisted?.classification?.confidence ?? null;
-
-  return {
-    target: sessionState.currentTarget?.path ?? persisted?.target_path ?? null,
-    classification,
-    confidence,
-    last_state: sessionState.lastVerificationResult ?? persisted?.last_verification_state ?? null,
-    workspace: sessionState.lastRunResult?.workspace ?? persisted?.workspace_path ?? null,
-    would_write_back: writtenBack,
-    patch_preview: patch ? patch.split('\n').slice(0, 12).join('\n') : null,
-  };
 }
 
 // ── Hidden input (API key) ─────────────────────────────────
@@ -405,52 +395,154 @@ async function loadSkills() {
 }
 
 /**
- * Executor-first input handler.
+ * Mission-first input handler — Codex Plan Mode style.
  *
  * Flow:
- *  1. Try to resolve an executable target (scenario dir, Dockerfile dir, log file).
- *  2. If found → ask one-time session approval → execute the pipeline.
- *  3. If not found → fall back to conversational LLM mode.
+ *  1. Resolve a concrete target from the input (path detection, no LLM).
+ *  2. Call the LLM to analyze intent and produce a plan (show spinner).
+ *  3. Announce what was understood + the plan steps.
+ *  4. If clarification needed → ask one focused question.
+ *  5. Otherwise → one-time session approval → execute.
+ *  6. No target + conversational input → fall back to chat mode.
  */
 async function handleInteractiveInput(input, config, rl, sessionState) {
-  const { resolveTarget, detectAction, askApproval, executeTarget } =
+  const { resolveTarget, askApproval, executeTarget } =
     await import('../agents/executor/index.js');
+  const { analyzeMission } = await import('../lib/mission-analyzer.js');
+  const { startSpinner } = await import('../lib/spinner.js');
 
-  // ── Step 1: Target detection ──────────────────────────────
+  // ── Step 1: Fast target resolution (no LLM) ──────────────
   let target = null;
   try {
     target = await resolveTarget(input);
   } catch { /* ignore resolution errors */ }
 
-  if (target) {
-    // ── Step 2: One-time approval ───────────────────────────
-    const approved = await askApproval(rl, sessionState);
-    if (!approved) {
-      // Fall through to conversational mode
-      await handleConversationalInput(input, config);
-      return;
+  // If no explicit path resolved but the user implies "here" / "this folder" /
+  // "current directory", use cwd as the target. Don't force clarification when
+  // the intent is clear.
+  if (!target && /\b(this folder|this dir|here|current|当前|这个|这里)\b/i.test(input)) {
+    const { resolvePathTarget } = await import('../agents/executor/index.js');
+    target = await resolvePathTarget(process.cwd()).catch(() => null);
+    if (!target) {
+      target = { path: process.cwd(), type: 'directory' };
     }
+  }
 
-    // ── Step 3: Execute pipeline ────────────────────────────
-    const action = detectAction(input, target.type);
-    console.log(
-      `  ${pc.dim('Target:')} ${pc.cyan(target.path)}  ${pc.dim('Type:')} ${target.type}  ${pc.dim('Action:')} ${action}`,
-    );
-    try {
-      await executeTarget(target, action, config, sessionState);
-    } catch (err) {
-      console.log(`  ${pc.red('Executor error:')} ${err.message}\n`);
-    }
+  sessionState.currentTarget = target ?? sessionState.currentTarget;
+
+  // ── Step 2: LLM mission analysis ─────────────────────────
+  // Always send the user's full input to the LLM — their words are the best
+  // signal for intent. Don't replace with meta.prompt or strip to just a path.
+  const meta = target?.meta ?? {};
+  const isGreenfield = meta.start_state === 'empty' || meta.mission_type === 'greenfield';
+
+  const sp = startSpinner('Understanding mission');
+  const analysis = await analyzeMission(input, target, config);
+
+  // If the LLM returned a generic fallback ("Run DeCIpher on path"), use
+  // the user's original input or the scenario prompt as the goal instead.
+  let missionGoal;
+  if (analysis.inferred) {
+    // Fallback path — extract the natural language part from user input
+    // by removing the path, or use the scenario prompt
+    const pathPattern = target?.path ? new RegExp(target.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g') : null;
+    const naturalText = pathPattern ? input.replace(pathPattern, '').replace(/["']/g, '').trim() : input;
+    missionGoal = naturalText.length > 10 ? naturalText : (meta.prompt ?? analysis.understood_as);
+  } else {
+    missionGoal = analysis.understood_as;
+  }
+  sp.stop(missionGoal);
+
+  sessionState.currentMission = {
+    type: isGreenfield ? 'greenfield' : analysis.action,
+    goal: missionGoal,
+    domain: 'deployment',
+    stop_boundary: meta.mission_stop_boundary ?? 'mission_complete',
+    requires_clarification: analysis.requires_clarification,
+    clarification_question: analysis.clarification_question,
+  };
+
+  await persistSessionSnapshot({
+    target_path: target?.path ?? sessionState.currentTarget?.path ?? null,
+    target_type: target?.type ?? sessionState.currentTarget?.type ?? null,
+    mission: sessionState.currentMission,
+    mission_summary: analysis.understood_as,
+    analysis,
+    approval_policy: sessionState.approvalPolicy ?? config.approval_policy ?? 'on-request',
+    approved: sessionState.approved ?? false,
+    last_verification_state: sessionState.lastVerificationResult ?? null,
+    outcome: analysis.requires_clarification ? 'NEEDS_CLARIFICATION' : 'PENDING',
+    resumable: true,
+  });
+
+  // ── Step 3: Announce understood mission + plan ────────────
+  // For greenfield, use the planner to get proper plan steps
+  const { createMissionPlan } = await import('../agents/planner/index.js');
+  const plan = createMissionPlan(sessionState.currentMission);
+  sessionState.currentPlan = plan;
+
+  // Use plan steps if available, fall back to analysis steps
+  const displaySteps = (plan.steps?.length > 0)
+    ? plan.steps.map(s => s.label)
+    : analysis.steps;
+
+  printSectionHeader('MISSION', 'agent');
+  console.log(`  ${BY('Understood:')} ${W(missionGoal)}`);
+  if (target) {
+    console.log(`  ${D('Target:')} ${C(target.path)} ${D(`(${target.type})`)}`);
+  }
+  if (displaySteps.length > 0) {
+    console.log(`\n  ${D('Plan:')}`);
+    displaySteps.forEach((step, i) => {
+      console.log(`    ${D(`${i + 1}.`)} ${step}`);
+    });
+  }
+  console.log('');
+
+  // ── Step 4: Clarification gate ────────────────────────────
+  // If the LLM understood the mission but no target was resolved, use cwd.
+  // The LLM already decided the intent is clear — don't second-guess it
+  // with a hardcoded clarification gate.
+  if (!target && !analysis.requires_clarification) {
+    target = { path: process.cwd(), type: 'directory' };
+    sessionState.currentTarget = target;
+  }
+
+  if (analysis.requires_clarification) {
+    printSectionHeader('CLARIFICATION NEEDED', 'command');
+    console.log(`  ${BY('DeCIpher asks:')} ${W(analysis.clarification_question ?? 'What do you want DeCIpher to do exactly?')}`);
+    console.log(`  ${D('Reply below and DeCIpher will continue from this mission context.')}\n`);
     return;
   }
 
-  // ── Step 4: Conversational fallback ────────────────────────
-  await handleConversationalInput(input, config);
+  // ── Step 5: No target → conversational mode ───────────────
+  if (!target) {
+    await handleConversationalInput(input, config);
+    return;
+  }
+
+  // ── Step 6: One-time approval + execution ─────────────────
+  const approved = await askApproval(rl, sessionState);
+  if (!approved) {
+    await handleConversationalInput(input, config);
+    return;
+  }
+
+  try {
+    const result = await executeTarget(target, analysis.action, config, sessionState);
+    if (result?.needs_clarification) {
+      printSectionHeader('CLARIFICATION NEEDED', 'command');
+      console.log(`  ${BY('AI asks:')} ${W(result.needs_clarification)}`);
+      console.log(`  ${D('Please provide more information below to resume.')}\n`);
+    }
+  } catch (err) {
+    console.log(`  ${pc.red('Executor error:')} ${err.message}\n`);
+  }
 }
 
 /**
- * Pure conversational mode: sends input to the LLM as a CI/DevOps assistant.
- * Used when no executable target is detected, or when the user asks a question.
+ * Conversational fallback for explicit questions and non-execution turns.
+ * The default runtime remains mission-first; this path is now the exception.
  */
 async function handleConversationalInput(input, config) {
   const { TAXONOMY } = await import('../agents/triage/index.js');
@@ -461,20 +553,19 @@ async function handleConversationalInput(input, config) {
   }
   const skills = await loadSkills();
 
-  const systemPrompt = `You are DeCIpher, an AI CI/deployment troubleshooting assistant running in an interactive terminal session. You help developers diagnose and fix CI pipeline failures, Docker build errors, deployment issues, and environment setup problems.
+  const systemPrompt = `You are DeCIpher, a mission-driven local engineering agent running in an interactive terminal session. You can operate as a general local agent, but your strongest specialty is CI, deployment, Docker, and environment workflows.
 
 ## Your personality
-- Direct, concise, helpful — like a senior DevOps engineer pair-programming with the user
-- Conversational tone, not robotic report format
-- If the user pastes a file path or directory, remind them they can paste it directly and DeCIpher will execute automatically
-- If the user greets you or asks non-CI questions, respond briefly and steer back to your expertise
+- Direct, concise, helpful — like a senior engineer pair-programming with the user
+- Mission-first, not chatty
+- If the user asks a question, answer it directly
+- If the user is actually trying to get work done, steer them toward concrete execution inputs
 
 ## Your capabilities
+- Understand local engineering missions and clarify missing requirements
 - Classify CI/deployment failures into these categories: ${TAXONOMY.join(', ')}
-- Analyze error logs and suggest root causes
-- Propose minimal fixes with specific file changes
-- Suggest verification commands
-- Execute full triage → fix → verify pipelines when given a path
+- Analyze error logs, suggest root causes, and propose concrete fixes
+- Suggest commands, generated files, and verification steps when execution is not happening directly
 
 ## Domain knowledge
 ${skills}
@@ -484,9 +575,9 @@ Directory: ${process.cwd()}
 ${projectContext}
 
 ## Response guidelines
-- For greetings/casual input: respond naturally in 1-2 sentences, mention what you can help with
-- For vague problems: ask 1-2 specific follow-up questions (which error? which file? which CI step?)
-- For clear CI/deployment problems: give a direct diagnosis with:
+- For greetings/casual input: respond naturally in 1-2 sentences
+- For vague engineering requests: ask only the blocking question
+- For clear engineering problems: give a direct diagnosis with:
   - What's wrong (1 sentence)
   - Why (brief root cause)
   - How to fix (specific commands or file changes)
@@ -605,11 +696,24 @@ async function handleSlashCommand(input, config, rl, sessionState) {
       return config;
 
     case 'model':
-      if (args[0]) {
-        config = await writeConfig({ model: args[0] });
-        console.log(`  ${G('✓')} Model changed to ${C(args[0])}\n`);
-      } else {
-        console.log(`\n${buildModelStatus(config)}\n`);
+      if (!args[0] || args[0] === 'show') {
+        printSectionHeader('MODEL', 'command');
+        console.log(`${formatSessionSnapshot(buildCliModelView(config), { public: true })}\n`);
+        return config;
+      }
+
+      try {
+        let update;
+        if (args[0] === 'set' && args[1]) {
+          update = await applyConfigUpdate(config, 'model', args[1], args.slice(2).join(' '), rl);
+        } else {
+          update = await applyConfigUpdate(config, 'model', 'model', args.join(' '), rl);
+        }
+        config = update.config;
+        console.log(`  ${G('✓')} Updated ${update.key} = ${C(String(update.displayValue ?? '(default)'))}\n`);
+      } catch (err) {
+        console.log(`  ${Y(err.message)}\n`);
+        console.log(`  ${D('Usage:')} /model [show] | /model <model> | /model set <provider|model|base_url|api_key> <value>\n`);
       }
       return config;
 
@@ -617,48 +721,31 @@ async function handleSlashCommand(input, config, rl, sessionState) {
     case 'config': {
       if (!args[0] || args[0] === 'show') {
         const persisted = await loadSessionSnapshot();
-        const settingsView = {
-          ...maskConfig(config),
-          execution_visibility: {
-            writable_roots: [process.cwd(), '/tmp'],
-            network: 'blocked/unknown',
-            temp_workspace_path: sessionState.lastRunResult?.workspace ?? persisted?.workspace_path ?? null,
-            persistence: {
-              config_dir: getConfigDir(),
-              history_path: getHistoryPath(),
-              session_path: getSessionPath(),
-            },
-          },
-        };
+        const settingsView = buildCliSettingsView(config, sessionState, persisted);
         printSectionHeader('SETTINGS', 'command');
         console.log(`${formatSessionSnapshot(settingsView, { public: false })}\n`);
         return config;
       }
 
-      if (args[0] === 'set' && args[1]) {
-        const key = normalizeConfigKey(args[1]);
-        let value = args.slice(2).join(' ');
-
-        if (key === 'api_key' && !value) {
-          rl.pause();
-          value = await askHiddenInput(`  ${D('API Key')} ${D('(input hidden)')}: `);
-          rl.resume();
-          if (process.stdin.isTTY) {
-            process.stdin.setRawMode(true);
-          }
+      try {
+        let update;
+        if (args[0] === 'set' && args[1]) {
+          update = await applyConfigUpdate(config, 'setting', args[1], args.slice(2).join(' '), rl);
+        } else if (args[0]) {
+          update = await applyConfigUpdate(config, 'setting', args[0], args.slice(1).join(' '), rl);
         }
-
-        if (!value) {
-          console.log(`  ${Y('Usage:')} /setting set <provider|base_url|model|api_key|approval_policy> <value>\n`);
+        if (!update) {
+          console.log(`  ${Y('Usage:')} /setting [show] | /setting set <key> <value>\n`);
           return config;
         }
-
-        config = await writeConfig({ [key]: value });
-        console.log(`  ${G('✓')} Updated ${args[1]} = ${key === 'api_key' ? '***' : C(value)}\n`);
+        config = update.config;
+        console.log(`  ${G('✓')} Updated ${update.key} = ${C(String(update.displayValue ?? '(default)'))}\n`);
         return config;
+      } catch (err) {
+        console.log(`  ${Y(err.message)}\n`);
       }
 
-      console.log(`  ${Y('Usage:')} /setting [show] | /setting set <key> <value>\n`);
+      console.log(`  ${Y('Usage:')} /setting [show] | /setting set <provider|base_url|model|api_key|approval_policy|max_iterations|notification_command> <value>\n`);
       return config;
     }
 
@@ -684,7 +771,7 @@ async function handleSlashCommand(input, config, rl, sessionState) {
     case 'plan': {
       const persisted = await loadSessionSnapshot();
       printSectionHeader('REPAIR PLAN', 'command');
-      console.log(buildCurrentPlan(sessionState, persisted));
+      console.log(buildCliPlanView(sessionState, persisted));
       console.log('');
       return config;
     }
@@ -699,26 +786,21 @@ async function handleSlashCommand(input, config, rl, sessionState) {
 
     case 'transcript':
     case 'log': {
-      const transcript = sessionState.lastRunResult?.transcript;
-      if (!transcript) {
+      const persisted = await loadSessionSnapshot();
+      const transcript = buildCliTranscriptView(sessionState, persisted);
+      if (!transcript.transcript) {
         console.log(`  ${Y('No transcript available yet.')}\n`);
         return config;
       }
-      console.log(`\n${transcript}\n`);
+      printSectionHeader('TRANSCRIPT', 'command');
+      console.log(`${formatSessionSnapshot(transcript, { public: true })}\n`);
       return config;
     }
 
     case 'artifacts': {
       const persisted = await loadSessionSnapshot();
       printSectionHeader('ARTIFACTS', 'command');
-      const artifacts = {
-        target: sessionState.currentTarget?.path ?? persisted?.target_path ?? null,
-        workspace: sessionState.lastRunResult?.workspace ?? persisted?.workspace_path ?? null,
-        written_back: sessionState.lastRunResult?.writtenBack ?? persisted?.written_back ?? [],
-        last_state: sessionState.lastVerificationResult ?? persisted?.last_verification_state ?? null,
-        patch_preview: sessionState.lastRunResult?.patch?.split('\n').slice(0, 8).join('\n') ?? persisted?.patch ?? null,
-        preserved_artifacts: sessionState.lastRunResult?.preservedArtifacts ?? persisted?.preserved_artifacts ?? null,
-      };
+      const artifacts = buildCliArtifactsView(sessionState, persisted);
       console.log(`${formatSessionSnapshot(artifacts, { public: true })}\n`);
       return config;
     }
@@ -808,15 +890,19 @@ async function handleSlashCommand(input, config, rl, sessionState) {
     case 'exit':
       return null; // Signal to exit
 
-    default:
-      console.log(`  ${Y('Unknown command:')} /${cmd}.`);
+    default: {
+      // Check if it's a close fuzzy match to a real command
       const suggestion = suggestCliSlashCommand(cmd);
-      if (suggestion) {
+      if (suggestion && cmd.length <= suggestion.length) {
         console.log(`  ${D('Did you mean:')} ${C(suggestion)}\n`);
-      } else {
-        console.log(`  ${D('Type /help for available commands.')}\n`);
+        return config;
       }
+      // Not a command — treat as natural language mission input.
+      // Strip the leading / and pass through to the mission handler.
+      console.log(pc.dim(`  (tip: / is for commands like /model, /status — treating as mission)\n`));
+      await handleInteractiveInput(input.slice(1).trim(), config, rl, sessionState);
       return config;
+    }
   }
 }
 
@@ -838,18 +924,17 @@ async function runInteractive() {
     approved: false,
     approvalPolicy: config.approval_policy ?? 'on-request',
     currentTarget: null,
+    currentMission: null,
+    currentPlan: null,
     lastVerificationResult: null,
     lastRunResult: null,
     historyEntries,
     reverseSearch: { active: false, originalLine: '' },
-    confirmWriteback: async (files) => {
-      const { confirmWriteback } = await import('../agents/executor/index.js');
-      return confirmWriteback(rl, sessionState, files);
-    },
   };
 
   console.log(buildSessionHeader(config, sessionState));
-  console.log(`\n  ${D('Paste a path to execute, or type')} ${C('/help')} ${D('for commands.')}\n`);
+  console.log(`  ${D('Type a mission, paste a path, or')} ${C('/help')} ${D('for commands.')}`)
+  console.log(`  ${D('ctrl+r')} ${D('history')}  ${D('ctrl+c')} ${D('quit')}\n`);
 
   const rl = createInterface({
     input: process.stdin,
@@ -860,6 +945,61 @@ async function runInteractive() {
   });
   rl.history = toReadlineHistory(historyEntries);
 
+  // Override _ttyWrite to intercept ALL keys before readline processes them.
+  // For popup navigation keys (Up/Down/Enter/Tab/Escape): swallow completely.
+  // For typing keys: clear popup → let readline process → re-render popup.
+  // This prevents the cursor position fight between readline and our popup.
+  const originalTtyWrite = rl._ttyWrite.bind(rl);
+  rl._ttyWrite = function (char, key) {
+    if (popupActive && key) {
+      // Navigation keys — swallow, don't pass to readline
+      if (key.name === 'up') {
+        popupIndex = Math.max(0, popupIndex - 1);
+        popup.render(popupItems, popupIndex);
+        rl._refreshLine(); // restore cursor on input line
+        return;
+      }
+      if (key.name === 'down') {
+        popupIndex = Math.min(popupItems.length - 1, popupIndex + 1);
+        popup.render(popupItems, popupIndex);
+        rl._refreshLine();
+        return;
+      }
+      if (key.name === 'return') {
+        selectPopupItem();
+        return;
+      }
+      if (key.name === 'tab') {
+        selectPopupItem();
+        return;
+      }
+      if (key.name === 'escape') {
+        dismissPopup(true);
+        return;
+      }
+    }
+
+    // Clear popup before readline processes the key
+    if (popupActive) {
+      popup.clear();
+    }
+
+    // Let readline handle the key normally
+    originalTtyWrite(char, key);
+
+    // After readline updates, check if we should show/update the popup
+    setImmediate(() => {
+      if (closed || processing) return;
+      const line = rl.line ?? '';
+      if (line.startsWith('/') || /[.\/~]/.test(line) || line.startsWith('scenarios')) {
+        updatePopup();
+        rl._refreshLine(); // restore cursor after popup renders
+      } else if (popupActive) {
+        dismissPopup();
+      }
+    });
+  };
+
   emitKeypressEvents(process.stdin, rl);
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true);
@@ -867,6 +1007,87 @@ async function runInteractive() {
 
   let closed = false;
   let processing = false;
+
+  // ── Command palette popup state ──────────────────────────
+  const { createPopup, filterCommandsForPopup, filterPathsForPopup } =
+    await import('../lib/popup.js');
+  const popup = createPopup();
+  let popupActive = false;
+  let popupItems = [];
+  let popupIndex = 0;
+  let popupOriginalLine = '';
+
+  function updatePopup() {
+    const line = rl.line ?? '';
+    if (line.startsWith('/')) {
+      if (!popupActive) {
+        popupOriginalLine = line;
+        popupIndex = 0;
+      }
+      const newItems = filterCommandsForPopup(line, SLASH_COMMANDS);
+      // Reset index when filter results change
+      if (newItems.length !== popupItems.length) popupIndex = 0;
+      popupItems = newItems;
+      popupIndex = Math.min(popupIndex, Math.max(0, popupItems.length - 1));
+      if (popupItems.length > 0) {
+        popup.render(popupItems, popupIndex);
+        popupActive = true;
+      } else {
+        popup.clear();
+        popupActive = false;
+      }
+      popupOriginalLine = line; // always track latest typed text
+    } else if (/[.\/~]/.test(line) || line.startsWith('scenarios')) {
+      if (!popupActive) {
+        popupOriginalLine = line;
+        popupIndex = 0;
+      }
+      popupItems = filterPathsForPopup(line);
+      popupIndex = Math.min(popupIndex, Math.max(0, popupItems.length - 1));
+      if (popupItems.length > 0) {
+        popup.render(popupItems, popupIndex);
+        popupActive = true;
+      } else {
+        popup.clear();
+        popupActive = false;
+      }
+      popupOriginalLine = line;
+    } else {
+      dismissPopup();
+    }
+  }
+
+  function dismissPopup(restoreOriginal = false) {
+    if (popupActive) {
+      popup.clear();
+      popupActive = false;
+      popupItems = [];
+      popupIndex = 0;
+      if (restoreOriginal && popupOriginalLine) {
+        rl.line = popupOriginalLine;
+        rl.cursor = popupOriginalLine.length;
+      }
+      popupOriginalLine = '';
+      rl._refreshLine();
+    }
+  }
+
+  function selectPopupItem() {
+    if (!popupActive || popupItems.length === 0) return false;
+    const selected = popupItems[popupIndex];
+    if (!selected) return false;
+    popup.clear();
+    popupActive = false;
+    popupItems = [];
+    popupIndex = 0;
+
+    // Directly replace readline buffer — no simulated keypresses.
+    // rl.write() would re-trigger keypress events and cause loops.
+    rl.line = selected.label;
+    rl.cursor = selected.label.length;
+    rl._refreshLine();
+    return true;
+  }
 
   function showPrompt() {
     if (closed) return;
@@ -877,9 +1098,22 @@ async function runInteractive() {
     rl.prompt();
   }
 
+  // Ctrl+C: interrupt or quit
+  rl.on('SIGINT', () => {
+    if (processing) {
+      console.log(pc.yellow('\n  Interrupted.'));
+      processing = false;
+      showPrompt();
+    } else {
+      closed = true;
+      rl.close();
+    }
+  });
+
   process.stdin.on('keypress', (_char, key) => {
     if (closed || processing) return;
 
+    // ── Reverse search mode ──────────────────────────────────
     if (sessionState.reverseSearch.active && key?.name === 'escape') {
       sessionState.reverseSearch.active = false;
       rl.prompt();
@@ -888,6 +1122,7 @@ async function runInteractive() {
     }
 
     if (key?.ctrl && key.name === 'r') {
+      dismissPopup();
       sessionState.reverseSearch = {
         active: true,
         originalLine: rl.line,
@@ -898,15 +1133,17 @@ async function runInteractive() {
       return;
     }
 
-    if (key?.sequence === '/' && rl.line === '') {
-      showSlashSuggestions('/');
-    }
+    // Popup triggering and rendering is fully handled in rl._ttyWrite override.
+    // No duplicate logic here.
   });
 
   showPrompt();
 
   rl.on('line', async (input) => {
-    if (processing) return; // drop input while processing
+    // Popup selection inserts the command into the buffer — suppress this
+    // empty line event so the user can review and press Enter again to submit.
+    dismissPopup();
+    if (processing) return;
     processing = true;
 
     const trimmed = input.trim();
@@ -1039,11 +1276,16 @@ async function main() {
     case 'config':
     case 'setting': {
       if (args[0] === 'set' && args[1] && args[2]) {
-        await writeConfig({ [normalizeConfigKey(args[1])]: args[2] });
-        console.log(`Set ${args[1]} = ${args[1].includes('key') ? '***' : args[2]}`);
+        const key = normalizeConfigKey(args[1]);
+        if (!canUpdateConfigKey(key, 'setting')) {
+          throw new Error(`Unsupported setting '${args[1]}'`);
+        }
+        const value = coerceConfigValue(key, args.slice(2).join(' '));
+        const next = await writeConfig({ [key]: value });
+        console.log(`Set ${key} = ${key === 'api_key' ? maskSecret(next.api_key) : value ?? '(default)'}`);
       } else if (args[0] === 'show') {
         const config = await readConfig();
-        console.log(JSON.stringify(maskConfig(config), null, 2));
+        console.log(JSON.stringify(buildCliSettingsView(config, { lastRunResult: null }, null), null, 2));
       } else if (args[0] === 'reset') {
         const { rm } = await import('node:fs/promises');
         await rm(getConfigDir(), { recursive: true, force: true });

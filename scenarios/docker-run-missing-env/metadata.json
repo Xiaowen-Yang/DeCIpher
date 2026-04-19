@@ -5,6 +5,8 @@
   "expected_classification": "missing_env_or_secret_contract",
   "auto_fixable": true,
   "execution_mode": "docker_run",
+  "mission_type": "repair",
+  "mission_stop_boundary": "issue_resolved",
   "workspace_mode": "temp_then_writeback",
   "writeback_on_success": true,
   "repair_target_files": ["Dockerfile"],

@@ -1,0 +1,16 @@
+{
+  "id": "hpl-docker-missing-dockerfile",
+  "category": "docker",
+  "difficulty": "medium",
+  "description": "HPL benchmark container — Dockerfile must be generated before building",
+  "execution_mode": "docker_build",
+  "workspace_mode": "temp_then_writeback",
+  "writeback_on_success": true,
+  "repair_target_files": ["Dockerfile"],
+  "generate_on_missing": true,
+  "mission_type": "generate_and_build",
+  "required_tools": ["docker"],
+  "broken_files": ["Dockerfile"],
+  "log_file": null,
+  "verification_command": "docker build -t decipher-hpl-check scenarios/hpl-docker-missing-dockerfile/expected -q && echo PASS || echo FAIL"
+}

@@ -20,6 +20,15 @@ export function parseFixResponse(raw) {
     throw new Error(`Failed to parse fix response: ${err.message}`);
   }
 
+  if (parsed.needs_clarification) {
+    return {
+      needs_clarification: parsed.needs_clarification,
+      affected_files: [],
+      patch: '',
+      rationale: parsed.rationale ?? 'Needs clarification from user.',
+    };
+  }
+
   if (!parsed.affected_files || parsed.affected_files.length === 0) {
     throw new Error('No affected files in fix response — patch cannot be applied.');
   }

@@ -1,0 +1,12 @@
+{
+  "id": "hpl-from-scratch",
+  "category": "docker",
+  "difficulty": "hard",
+  "description": "Run HPL benchmark in Docker — starting from nothing. The agent must generate all files, build, debug, and run.",
+  "mission_type": "greenfield",
+  "start_state": "empty",
+  "mission_stop_boundary": "benchmark_completed",
+  "required_tools": ["docker"],
+  "acceptance": "acceptance.json",
+  "prompt": "I want to run an HPL benchmark on my macOS machine in a Docker container. I don't have any files yet — please set everything up from scratch."
+}

@@ -96,3 +96,31 @@ test("findReverseHistoryMatches returns newest-first exact-text deduped matches"
 
   assert.deepEqual(matches, ["deploy web", "deploy api"]);
 });
+
+test("findReverseHistoryMatches is case-insensitive and can return newest-first history on empty query", () => {
+  const matches = findReverseHistoryMatches(
+    [
+      { text: "Deploy API" },
+      { text: "run tests" },
+      { text: "deploy web" },
+      { text: "Deploy API" },
+    ],
+    "",
+  );
+
+  assert.deepEqual(matches, ["Deploy API", "deploy web", "run tests"]);
+});
+
+test("findReverseHistoryMatches respects a result limit", () => {
+  const matches = findReverseHistoryMatches(
+    [
+      { text: "deploy api" },
+      { text: "deploy web" },
+      { text: "deploy worker" },
+    ],
+    "deploy",
+    { limit: 2 },
+  );
+
+  assert.deepEqual(matches, ["deploy worker", "deploy web"]);
+});

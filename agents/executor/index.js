@@ -1,8 +1,11 @@
 import { access, readFile } from "node:fs/promises";
-import { resolve, join } from "node:path";
+import { resolve, join, dirname } from "node:path";
 import { homedir } from "node:os";
 import pc from "picocolors";
-import { loadSessionSnapshot, formatSessionSnapshot } from "../../lib/session-store.js";
+import {
+  loadSessionSnapshot,
+  formatSessionSnapshot,
+} from "../../lib/session-store.js";
 
 // ── Target resolution ─────────────────────────────────────────────────────────
 
@@ -51,12 +54,21 @@ function expandHome(p) {
 }
 
 async function exists(p) {
-  try { await access(p); return true; } catch { return false; }
+  try {
+    await access(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function isDir(p) {
   const { stat } = await import("node:fs/promises");
-  try { return (await stat(p)).isDirectory(); } catch { return false; }
+  try {
+    return (await stat(p)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 async function classifyPath(rawPath) {
@@ -93,11 +105,56 @@ export async function resolvePathTarget(rawPath) {
 }
 
 /**
+ * Extract a git repo URL from user input.
+ * Supports github.com, gitlab.com, bitbucket.org — HTTPS and SSH formats.
+ */
+function extractGitUrl(input) {
+  // HTTPS: https://github.com/user/repo or https://github.com/user/repo.git
+  const httpsMatch = input.match(
+    /https?:\/\/(github\.com|gitlab\.com|bitbucket\.org)\/[^\s"'<>]+/i,
+  );
+  if (httpsMatch) {
+    const url = httpsMatch[0].replace(/\/+$/, "").replace(/\.git$/, "");
+    const parts = url.split("/");
+    const repoName = parts[parts.length - 1];
+    return { url: httpsMatch[0], repoName, host: httpsMatch[1] };
+  }
+
+  // SSH: git@github.com:user/repo.git
+  const sshMatch = input.match(
+    /git@(github\.com|gitlab\.com|bitbucket\.org):([^\s"'<>]+)/i,
+  );
+  if (sshMatch) {
+    const repoPath = sshMatch[2].replace(/\.git$/, "");
+    const repoName = repoPath.split("/").pop();
+    return { url: sshMatch[0], repoName, host: sshMatch[1] };
+  }
+
+  return null;
+}
+
+/**
  * Try to resolve an executable target from the user's input.
  * @param {string} input
  * @returns {Promise<ResolvedTarget|null>}
  */
 export async function resolveTarget(input) {
+  // Git repo URL takes priority over file paths
+  const gitInfo = extractGitUrl(input);
+  if (gitInfo) {
+    return {
+      path: gitInfo.url,
+      type: "git_repo",
+      meta: {
+        url: gitInfo.url,
+        repoName: gitInfo.repoName,
+        host: gitInfo.host,
+        start_state: "empty",
+        mission_type: "clone_and_run",
+      },
+    };
+  }
+
   for (const raw of extractCandidatePaths(input)) {
     const target = await classifyPath(raw);
     if (target) return target;
@@ -105,73 +162,125 @@ export async function resolveTarget(input) {
   return null;
 }
 
-// ── Action detection ──────────────────────────────────────────────────────────
+export { extractGitUrl };
+
+// ── Action routing ────────────────────────────────────────────────────────────
 
 /**
  * @typedef {'demo'|'triage_only'|'docker_build'|'fix'} Action
  */
 
-const ACTION_KEYWORDS = {
-  triage_only: /\b(triage|classify|analyze|what.s wrong|diagnose)\b/i,
-  docker_build: /\b(build|docker build|rebuild|image)\b/i,
-  demo:         /\b(demo|show|run scenario|walk.?through)\b/i,
-};
+export function resolveScenarioRuntime(meta = {}) {
+  // Greenfield scenarios always go through the agent loop — no structural path
+  if (meta.start_state === "empty" || meta.mission_type === "greenfield") {
+    return {
+      kind: "runtime",
+      meta: {
+        ...meta,
+        execution_mode: "agent",
+      },
+    };
+  }
 
-/**
- * Detect the intended action from natural language input.
- * Falls back to 'fix' (full executor loop) when ambiguous.
- * @param {string} input
- * @param {TargetType} targetType
- * @returns {Action}
- */
-export function detectAction(input, targetType) {
-  if (ACTION_KEYWORDS.triage_only.test(input)) return "triage_only";
-  if (ACTION_KEYWORDS.demo.test(input))        return "demo";
-  if (targetType === "dockerfile") {
-    return "docker_build";
+  if (meta.execution_mode) {
+    return {
+      kind: "runtime",
+      meta,
+    };
   }
-  if (ACTION_KEYWORDS.docker_build.test(input) && targetType !== "scenario") {
-    return "docker_build";
+
+  if (meta.category === "docker") {
+    return {
+      kind: "runtime",
+      meta: {
+        ...meta,
+        execution_mode: "docker_build",
+        repair_target_files: meta.repair_target_files ??
+          meta.broken_files ?? ["Dockerfile"],
+      },
+    };
   }
-  return "fix"; // default: unified executor loop (triage → fix → verify → writeback)
+
+  return {
+    kind: "structural",
+    meta: {
+      ...meta,
+      repair_target_files: meta.repair_target_files ?? meta.broken_files ?? [],
+    },
+  };
 }
 
 // ── Approval model ────────────────────────────────────────────────────────────
 
 const CAPABILITIES = [
   "read  — read scenario files, logs, and Dockerfiles",
-  "fix   — propose and apply minimal patches to a temp workspace",
-  "run   — execute verification commands (docker build, grep, node)",
+  "fix   — propose and apply patches directly to your files",
+  "run   — execute commands (docker build, grep, node, etc.)",
   "retry — attempt up to 3 fix iterations automatically",
-  "write — write repaired files back to broken/ on success",
+  "write — create or modify files in the working directory",
 ];
 
-export function shouldConfirmWriteback(state = {}) {
-  return (state.approvalPolicy ?? "on-request") !== "never";
-}
-
 /**
- * One-time session approval prompt (Codex-style).
- * @param {object} rl    readline.Interface open in the interactive session
- * @param {object} state mutable session state { approved: boolean }
+ * One-time session approval prompt.
+ * Shows what the agent is about to do and asks for permission.
+ *
+ * @param {object} rl      readline.Interface open in the interactive session
+ * @param {object} state   mutable session state { approved: boolean }
+ * @param {object} [action] optional context: { tool, args, reasoning }
  * @returns {Promise<boolean>}
  */
-export async function askApproval(rl, state) {
-  if (state.approvalPolicy === "never" || state.approvalPolicy === "on-failure") {
+export async function askApproval(rl, state, action = null) {
+  if (
+    state.approvalPolicy === "never" ||
+    state.approvalPolicy === "on-failure"
+  ) {
     state.approved = true;
     return true;
   }
   if (state.approved) return true;
 
   process.stdout.write("\n");
-  console.log(pc.bold(pc.cyan("  DeCIpher executor — one-time session approval")));
-  console.log(pc.dim("  " + "─".repeat(50)));
-  console.log(pc.dim("  Granting approval authorises this session to:"));
-  CAPABILITIES.forEach(c => console.log(`    ${pc.yellow("›")} ${c}`));
-  console.log(pc.dim("\n  Scope: current session only. No files pushed or deployed."));
-  console.log(pc.dim("  Destructive changes (editing original files) still ask per-action.\n"));
+  console.log(pc.dim("  ┌─ APPROVAL ─────────────────────────────────────"));
+  console.log(pc.dim("  │"));
 
-  const answer = await new Promise(res =>
+  if (action) {
+    console.log(
+      `  ${pc.dim("│")} ${pc.bold("Action:")}  ${pc.cyan(action.tool)} ${action.args?.cmd ? pc.dim(String(action.args.cmd).slice(0, 60)) : action.args?.path ? pc.dim(action.args.path) : ""}`,
+    );
+    if (action.reasoning) {
+      console.log(
+        `  ${pc.dim("│")} ${pc.bold("Reason:")}  ${pc.dim(action.reasoning.slice(0, 80))}`,
+      );
+    }
+    // Preview content for write_file
+    if (action.tool === "write_file" && action.args?.content) {
+      const preview = action.args.content
+        .split("\n")
+        .slice(0, 6)
+        .map((l) => `  ${pc.dim("│")}   ${pc.dim(l)}`)
+        .join("\n");
+      console.log(`  ${pc.dim("│")} ${pc.bold("Preview:")}`);
+      console.log(preview);
+      if (action.args.content.split("\n").length > 6) {
+        console.log(`  ${pc.dim("│")}   ${pc.dim("...")}`);
+      }
+    }
+  } else {
+    console.log(
+      `  ${pc.dim("│")} DeCIpher needs permission to modify files and run commands.`,
+    );
+    CAPABILITIES.forEach((c) =>
+      console.log(`  ${pc.dim("│")}   ${pc.yellow("›")} ${c}`),
+    );
+  }
+
+  console.log(`  ${pc.dim("│")}`);
+  console.log(
+    pc.dim("  │  Scope: this session only. Nothing pushed or deployed."),
+  );
+  console.log(pc.dim("  └──────────────────────────────────────────────────"));
+
+  const answer = await new Promise((res) =>
     rl.question(`  ${pc.bold("Allow?")} [Y/n] `, res),
   );
 
@@ -179,51 +288,73 @@ export async function askApproval(rl, state) {
   state.approved = approved;
 
   if (approved) {
-    console.log(`\n  ${pc.green("✓")} Approved for this session.\n`);
+    console.log(`\n  ${pc.green("✓")} Approved.\n`);
   } else {
-    console.log(`\n  ${pc.yellow("✗")} Approval denied — conversational mode only.\n`);
+    console.log(`\n  ${pc.yellow("✗")} Denied.\n`);
   }
 
   return approved;
 }
 
-export async function confirmWriteback(rl, state, files = []) {
-  if (!shouldConfirmWriteback(state)) {
-    return true;
-  }
-
-  process.stdout.write("\n");
-  console.log(pc.bold(pc.yellow("  Confirm write-back")));
-  console.log(pc.dim("  The repaired temp workspace is ready to write back to broken/."));
-  console.log(pc.dim("  Declining keeps the original broken/ files unchanged."));
-  console.log(pc.dim("  If you decline, the repaired files remain only in the preserved temp workspace."));
-  if (files.length > 0) {
-    console.log(pc.dim(`  Files: ${files.join(", ")}`));
-  }
-
-  const answer = await new Promise((res) =>
-    rl.question(`  ${pc.bold("Write repaired files back?")} [y/N] `, res),
-  );
-  const confirmed = /^y/i.test(answer.trim());
-
-  if (!confirmed) {
-    console.log(`\n  ${pc.yellow("✗")} Write-back declined. Preserving temp workspace only.\n`);
-  }
-
-  return confirmed;
-}
-
 // ── Main executor dispatch ────────────────────────────────────────────────────
 
 /**
- * Execute an identified target + action using the unified executor loop.
+ * Build a synthetic mission object when no session mission exists.
+ * Maps the legacy action name to a natural-language goal so the agent
+ * loop has meaningful context to work from.
+ */
+function buildSyntheticMission(action, target) {
+  const path = target?.path ?? "";
+  const typeLabel = target?.type ?? "target";
+  const meta = target?.meta ?? {};
+
+  // Greenfield scenarios carry a user prompt — use it as the mission goal
+  if (
+    meta.prompt &&
+    (meta.start_state === "empty" || meta.mission_type === "greenfield")
+  ) {
+    return {
+      goal: meta.prompt,
+      type: meta.mission_type ?? "greenfield",
+      id: meta.id ?? "greenfield-adhoc",
+      stop_boundary: meta.mission_stop_boundary ?? "user_satisfied",
+    };
+  }
+
+  // Git repo URL — clone and run in Docker
+  if (target?.type === "git_repo") {
+    const repoName = meta.repoName ?? "repo";
+    return {
+      goal: `Clone the repository ${path}, read the README to understand the project, then build and run it in Docker. The container must be running when you are done.`,
+      type: "clone_and_run",
+      id: `clone-${repoName}`,
+      stop_boundary: "container_running",
+    };
+  }
+
+  const goalMap = {
+    fix: `Fix the failing ${typeLabel} at ${path}`,
+    demo: `Demonstrate and fix the ${typeLabel} at ${path}`,
+    docker_build: `Build the Docker image at ${path} successfully`,
+    build_start: `Build and start the container at ${path}. The container must still be running when you are done.`,
+    benchmark_run: `Run the benchmark at ${path} to completion`,
+    generate: `Generate the required files for ${path}`,
+    triage_only: `Triage and explain the failure at ${path}`,
+  };
+  return {
+    goal: goalMap[action] ?? `Complete the ${action} task on ${path}`,
+    type: action,
+    id: `${action}-adhoc`,
+  };
+}
+
+/**
+ * Execute an identified target + action.
  *
- * For scenarios with execution_mode metadata (docker_build / docker_run /
- * healthcheck), the loop runs the real command, captures failure, triages,
- * patches the temp workspace, and writes repaired files back on success.
+ * Primary path: agent loop (LLM decides what tools to call to achieve the goal).
+ * The agent understands the action as a goal, not a hardcoded execution mode.
  *
- * Falls back to the orchestrator's runScenario for legacy scenarios without
- * execution_mode.
+ * triage_only is the sole exception — it is a read-only analysis, not a loop.
  *
  * @param {ResolvedTarget} target
  * @param {Action} action
@@ -231,127 +362,166 @@ export async function confirmWriteback(rl, state, files = []) {
  * @param {object} sessionState
  * @param {object} options
  */
-export async function executeTarget(target, action, config, sessionState = {}, options = {}) {
+export async function executeTarget(
+  target,
+  action,
+  config,
+  sessionState = {},
+  options = {},
+) {
   sessionState.currentTarget = target;
-  switch (action) {
-    case "demo":
-    case "fix": {
-      if (target.type !== "scenario") {
-        console.log(pc.yellow(
-          `  Target type '${target.type}' does not support the '${action}' action.\n`,
-        ));
-        return;
-      }
 
-      console.log(pc.bold(`\n  Executor loop starting on: ${pc.cyan(target.path)}\n`));
-
-      const meta = target.meta;
-
-      // Scenarios with execution_mode use the unified loop (real commands + writeback)
-      if (meta?.execution_mode) {
-        const { runExecutorLoop, printLoopResult } = await import("./loop.js");
-        const result = await runExecutorLoop(target.path, meta, config, {
-          resumeFrom: options.resumeFrom,
-          sessionContext: sessionState,
-          keepRuntimeArtifacts: options.keepRuntimeArtifacts,
-        });
-        sessionState.lastRunResult = result;
-        sessionState.lastVerificationResult = result.state;
-        printLoopResult(result);
-        return result;
-      } else {
-        // Legacy scenarios: use orchestrator (pre-captured logs, no writeback)
-        const { runScenario } = await import("../orchestrator/index.js");
-        const { formatReport } = await import("../../lib/reporter.js");
-        const report = await runScenario(target.path, config);
-        console.log(formatReport(report));
-        sessionState.lastRunResult = report;
-        sessionState.lastVerificationResult = report?.verification?.result ?? null;
-        return report;
-      }
-    }
-
-    case "triage_only": {
-      const logPath = target.type === "logfile"
+  // ── triage_only — standalone read-only analysis, not a loop ──────────────
+  if (action === "triage_only") {
+    const logPath =
+      target.type === "logfile"
         ? target.path
         : target.meta?.log_file
           ? join(target.path, target.meta.log_file)
           : null;
 
-      if (!logPath) {
-        console.log(pc.yellow("  Cannot determine log file for triage. Provide a .log path.\n"));
-        return null;
-      }
-
-      const { triageLog } = await import("../triage/index.js");
-      const { formatSection } = await import("../../lib/reporter.js");
-      const { startSpinner } = await import("../../lib/spinner.js");
-
-      console.log(pc.bold(`\n  Triaging: ${pc.cyan(logPath)}\n`));
-      const sp = startSpinner("Triaging failure");
-      const result = await triageLog(logPath, {}, config);
-      sp.stop(`${pc.yellow(result.classification)} (confidence: ${result.confidence})`);
-
-      console.log(formatSection("CLASSIFICATION",
-        `  label:      ${pc.yellow(result.classification)}\n  confidence: ${result.confidence}`,
-      ));
-      if (result.root_causes?.length) {
-        console.log(formatSection("EVIDENCE",
-          result.root_causes.map(rc => `  ${rc.hypothesis}: ${rc.evidence}`).join("\n"),
-        ));
-      }
-      console.log("");
-      sessionState.lastRunResult = result;
-      sessionState.lastVerificationResult = null;
-      return result;
-    }
-
-    case "docker_build": {
-      // Dockerfile dir without a scenario wrapper — create synthetic meta
-      const dir = await isDir(target.path)
-        ? target.path
-        : target.path.replace(/\/Dockerfile.*$/, "");
-
-      const syntheticMeta = {
-        id:                  "docker-adhoc",
-        category:            "docker",
-        execution_mode:      "docker_build",
-        repair_target_files: ["Dockerfile"],
-        writeback_on_success: false, // ad-hoc: don't overwrite originals
-        log_file:            null,
-      };
-
-      console.log(pc.bold(`\n  Executor loop starting on: ${pc.cyan(dir)}\n`));
-      const { runExecutorLoop, printLoopResult } = await import("./loop.js");
-      const result = await runExecutorLoop(dir, syntheticMeta, config, {
-        resumeFrom: options.resumeFrom,
-        sessionContext: sessionState,
-        sourceDir: dir,
-        writebackDir: dir,
-        targetPath: dir,
-        targetType: "dockerfile",
-        keepRuntimeArtifacts: options.keepRuntimeArtifacts,
-      });
-      // For ad-hoc docker dir the "brokenDir" is the workspace's parent — override
-      result.writtenBack = []; // no write-back for ad-hoc targets
-      sessionState.lastRunResult = result;
-      sessionState.lastVerificationResult = result.state;
-      printLoopResult(result);
-      return result;
-    }
-
-    default:
-      console.log(pc.yellow(`  Unknown action '${action}'.\n`));
+    if (!logPath) {
+      console.log(
+        pc.yellow(
+          "  Cannot determine log file for triage. Provide a .log path.\n",
+        ),
+      );
       return null;
+    }
+
+    const { triageLog } = await import("../triage/index.js");
+    const { formatSection } = await import("../../lib/reporter.js");
+    const { startSpinner } = await import("../../lib/spinner.js");
+
+    console.log(pc.bold(`\n  Triaging: ${pc.cyan(logPath)}\n`));
+    const sp = startSpinner("Triaging failure");
+    const result = await triageLog(logPath, {}, config);
+    sp.stop(
+      `${pc.yellow(result.classification)} (confidence: ${result.confidence})`,
+    );
+    console.log(
+      formatSection(
+        "CLASSIFICATION",
+        `  label:      ${pc.yellow(result.classification)}\n  confidence: ${result.confidence}`,
+      ),
+    );
+    if (result.root_causes?.length) {
+      console.log(
+        formatSection(
+          "EVIDENCE",
+          result.root_causes
+            .map((rc) => `  ${rc.hypothesis}: ${rc.evidence}`)
+            .join("\n"),
+        ),
+      );
+    }
+    console.log("");
+    sessionState.lastRunResult = result;
+    sessionState.lastVerificationResult = null;
+    return result;
   }
+
+  // ── All other actions → agent loop ────────────────────────────────────────
+  const mission =
+    sessionState.currentMission ?? buildSyntheticMission(action, target);
+
+  console.log(
+    pc.bold(
+      `\n  Agent starting on: ${pc.cyan(target.path ?? "(no target)")}\n`,
+    ),
+  );
+  console.log(pc.dim(`  Goal: ${mission.goal}`));
+
+  const { runAgentLoop, printAgentLoopResult } =
+    await import("./agent-loop.js");
+
+  const result = await runAgentLoop(mission, target, config, {
+    ...options,
+    sessionContext: sessionState,
+    rl: options.rl ?? sessionState.rl ?? null,
+  });
+
+  sessionState.lastRunResult = result;
+  sessionState.lastVerificationResult = result.state;
+  printAgentLoopResult(result);
+
+  // ── Acceptance checks for greenfield scenarios ────────────────────────────
+  const meta = target?.meta ?? {};
+  if (meta.acceptance && result.workspace) {
+    try {
+      const {
+        loadAcceptanceChecks,
+        runAcceptanceChecks,
+        printAcceptanceSummary,
+      } = await import("../verifier/acceptance.js");
+
+      console.log(pc.bold("\n  [ACCEPTANCE CHECKS]\n"));
+      const checks = await loadAcceptanceChecks(target.path);
+      const report = await runAcceptanceChecks(checks, result.workspace);
+      printAcceptanceSummary(report);
+
+      // Override the result outcome based on acceptance
+      if (report.passed && result.outcome === "PASS") {
+        result.acceptancePassed = true;
+      } else if (!report.passed) {
+        result.outcome = "FAIL";
+        result.state = "ACCEPTANCE_FAIL";
+        result.acceptancePassed = false;
+      }
+    } catch (err) {
+      console.log(pc.yellow(`  Acceptance check error: ${err.message}\n`));
+    }
+  }
+
+  return result;
 }
 
-export async function executeScenarioPath(scenarioPath, config, sessionState = {}, options = {}) {
+export async function executeScenarioPath(
+  scenarioPath,
+  config,
+  sessionState = {},
+  options = {},
+) {
   const target = await resolvePathTarget(scenarioPath);
   if (!target || target.type !== "scenario") {
     throw new Error(`Scenario not found or invalid: ${scenarioPath}`);
   }
+
+  const meta = target.meta ?? {};
+
+  // Greenfield scenarios use the scenario's prompt as the action
+  if (meta.start_state === "empty" || meta.mission_type === "greenfield") {
+    return executeTarget(target, "generate", config, sessionState, options);
+  }
+
   return executeTarget(target, "fix", config, sessionState, options);
+}
+
+export function decideResumeAction(snapshot = {}) {
+  if (!snapshot?.resumable) {
+    return { mode: "not_resumable" };
+  }
+
+  if (
+    snapshot.stop_reason === "needs_clarification" ||
+    snapshot.plan?.requires_clarification
+  ) {
+    return {
+      mode: "clarify",
+      question:
+        snapshot.plan?.clarification_question ??
+        "What do you want DeCIpher to do exactly?",
+    };
+  }
+
+  if (snapshot.target_path) {
+    return {
+      mode: "execute_target",
+      targetPath: snapshot.target_path,
+    };
+  }
+
+  return { mode: "not_resumable" };
 }
 
 export async function resumeLastTarget(config, sessionState = {}) {
@@ -361,21 +531,64 @@ export async function resumeLastTarget(config, sessionState = {}) {
     return null;
   }
 
-  if (!snapshot.resumable || !snapshot.target_path) {
+  const resumeAction = decideResumeAction(snapshot);
+  if (resumeAction.mode === "not_resumable") {
     console.log(pc.yellow("  The last saved session is not resumable.\n"));
     console.log(`  ${formatSessionSnapshot(snapshot, { public: true })}\n`);
     return null;
   }
 
+  sessionState.currentMission =
+    snapshot.mission ?? sessionState.currentMission ?? null;
+  sessionState.currentPlan = snapshot.plan ?? sessionState.currentPlan ?? null;
+  sessionState.lastVerificationResult =
+    snapshot.last_verification_state ??
+    sessionState.lastVerificationResult ??
+    null;
+  sessionState.approved = snapshot.approved ?? sessionState.approved ?? false;
+
+  if (resumeAction.mode === "clarify") {
+    console.log(pc.bold("\n  Resuming mission clarification\n"));
+    if (snapshot.mission_summary) {
+      console.log(pc.dim(`  mission: ${snapshot.mission_summary}`));
+    }
+    console.log(
+      pc.dim(
+        `  previous state: ${snapshot.last_verification_state ?? "needs clarification"}`,
+      ),
+    );
+    console.log(pc.yellow(`  question: ${resumeAction.question}\n`));
+    return {
+      needs_clarification: resumeAction.question,
+      resumed: true,
+      mode: "clarify",
+      snapshot,
+    };
+  }
+
   const target = await resolvePathTarget(snapshot.target_path);
   if (!target) {
-    throw new Error(`Saved target is no longer available: ${snapshot.target_path}`);
+    throw new Error(
+      `Saved target is no longer available: ${snapshot.target_path}`,
+    );
   }
+
+  sessionState.currentTarget = target;
 
   console.log(pc.bold("\n  Resuming executor session\n"));
   console.log(pc.dim(`  target: ${snapshot.target_path}`));
-  console.log(pc.dim(`  previous state: ${snapshot.last_verification_state ?? "unknown"}`));
-  console.log(pc.dim(`  iteration: ${snapshot.iteration ?? 0}/${snapshot.max_iterations ?? 3}\n`));
+  console.log(
+    pc.dim(
+      `  previous state: ${snapshot.last_verification_state ?? "unknown"}`,
+    ),
+  );
+  console.log(
+    pc.dim(
+      `  iteration: ${snapshot.iteration ?? 0}/${snapshot.max_iterations ?? 3}\n`,
+    ),
+  );
 
-  return executeTarget(target, "fix", config, sessionState, { resumeFrom: snapshot });
+  return executeTarget(target, "fix", config, sessionState, {
+    resumeFrom: snapshot,
+  });
 }
