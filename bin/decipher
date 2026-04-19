@@ -38,8 +38,10 @@ import {
   buildCliArtifactsView,
   suggestCliSlashCommand,
 } from '../lib/cli-surface.js';
+import { createRequire } from 'node:module';
 
-const VERSION = '0.1.0';
+const _require = createRequire(import.meta.url);
+const { version: VERSION } = _require('../package.json');
 
 // ── Color helpers ──────────────────────────────────────────
 const C  = (s) => pc.cyan(s);
@@ -934,6 +936,14 @@ async function runInteractive() {
   };
 
   console.log(buildSessionHeader(config, sessionState));
+
+  // Non-blocking update check — fire and print if available
+  import('../lib/update-check.js').then(({ checkForUpdate }) =>
+    checkForUpdate(VERSION).then(msg => {
+      if (msg) console.log(`  ${Y(msg)}\n`);
+    })
+  ).catch(() => {});
+
   console.log(`  ${D('Type a mission, paste a path, or')} ${C('/help')} ${D('for commands.')}`)
   console.log(`  ${D('ctrl+r')} ${D('history')}  ${D('ctrl+c')} ${D('quit')}\n`);
 
