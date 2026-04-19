@@ -23,17 +23,17 @@ Primary development commands:
 
 ```bash
 # Run the CLI
-node bin/decipher
+./bin/decipher
 
 # Unit tests
 pnpm test
 
 # Demo scenarios
-node bin/decipher demo scenarios/docker-copy-path-bug
-node bin/decipher demo scenarios/ci-python-version-drift
+./bin/decipher demo scenarios/docker-copy-path-bug
+./bin/decipher demo scenarios/ci-python-version-drift
 
 # Environment check
-node bin/decipher doctor
+./bin/decipher doctor
 
 # Structural verification
 make verify
@@ -79,6 +79,38 @@ User Goal
    -> Mission Complete
 ```
 
+## Repository Map
+
+```text
+bin/decipher               — CLI entry point and interactive surface
+agents/executor/           — target resolution, approval, execution dispatch, resume
+agents/planner/            — V2 mission planner layer
+agents/triage/             — repair subsystem classifier
+agents/fixer/              — repair subsystem patch generator
+agents/verifier/           — verification and patch application utilities
+lib/api-client.js          — OpenAI / Anthropic / custom provider abstraction
+lib/cli-surface.js         — slash command definitions, view builders
+lib/config.js              — ~/.decipher/config.json read/write
+lib/history.js             — prompt history and reverse-search support
+lib/mission.js             — V2 mission parsing and update logic
+lib/mission-analyzer.js    — mission intent analysis
+lib/mission-memory.js      — mission context persistence
+lib/notifications.js       — terminal notification utilities
+lib/popup.js               — popup/modal rendering
+lib/preference-memory.js   — user preference persistence
+lib/reporter.js            — structured output formatter
+lib/session-store.js       — persisted mission/session state
+lib/spinner.js             — terminal spinner animation
+lib/template.js            — {variable} interpolation for prompt templates
+prompts/                   — prompt contracts
+scenarios/                 — deterministic fixtures and proving missions
+docs/v2/                   — active V2 design docs
+docs/legacy/               — archived V1/V1.5 material
+docs/tasks/v2-todo.md      — active implementation backlog
+docs/tasks/lessons.md      — reusable lessons from corrections
+references/codex-main/     — implementation reference
+```
+
 ## Workflow Orchestration
 
 ### Plan Discipline
@@ -109,7 +141,7 @@ User Goal
 - Never mark work complete without proof.
 - Run targeted tests first, then broader regression checks.
 - When relevant, compare intended V2 behavior against the legacy path being replaced.
-- Hold the bar at “would a strong staff engineer approve this change?”
+- Hold the bar at "would a strong staff engineer approve this change?"
 
 ### Simplicity And Elegance
 
@@ -135,28 +167,6 @@ Rules:
 - After any correction from the user, update `docs/tasks/lessons.md`.
 - Capture the reusable mistake pattern and the rule that should prevent it.
 - Keep progress logs current in `docs/tasks/v2-todo.md`.
-
-## Repository Map
-
-```text
-bin/decipher            — CLI entry point and interactive surface
-agents/executor/        — target resolution, approval, execution dispatch, resume
-agents/orchestrator/    — legacy scenario-oriented orchestration to be reduced over time
-agents/triage/          — repair subsystem classifier
-agents/fixer/           — repair subsystem patch generator
-agents/verifier/        — verification and patch application utilities
-agents/planner/         — V2 mission planner layer
-lib/mission.js          — V2 mission parsing and update logic
-lib/session-store.js    — persisted mission/session state
-lib/history.js          — prompt history and reverse-search support
-prompts/                — prompt contracts, currently under redesign
-scenarios/              — deterministic fixtures and proving missions
-docs/v2/                — active V2 design docs
-docs/legacy/            — archived V1/V1.5 material
-docs/tasks/v2-todo.md   — active implementation backlog
-docs/tasks/lessons.md   — reusable lessons from corrections
-references/codex-main/  — implementation reference
-```
 
 ## Git Rules
 

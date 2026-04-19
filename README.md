@@ -1,153 +1,148 @@
 # DeCIpher
 
 ```
-                  /\_/\
-                 ( •ᴥ• )
->_ DeCIpher — AI CI Troubleshooter
+     /\_/\
+    ( •ᴥ• )   DeCIpher v0.1.0
 ```
 
-An interactive CLI tool that triages, patches, and verifies CI/deployment failures end-to-end. Think Codex or Claude Code, but narrowed to **CI pipelines, Docker builds, deployment issues, and environment setup**.
+A mission-driven local execution agent for CI/deployment tasks. Give it a goal — it plans, executes, verifies, and adapts until the job is done.
 
-## Quick Start
+## Install
 
 ```bash
-# Install
+# Clone and install
+git clone <repo-url> && cd DeCIpher
 pnpm install
 
-# Run interactive mode
-./bin/decipher
-
-# Or run a demo scenario directly
-node bin/decipher demo scenarios/docker-copy-path-bug
+# Set up your AI provider
+./bin/decipher setting set provider openai
+./bin/decipher setting set api-key sk-xxx
 ```
 
-## What It Does
+Requires **Node.js 18+** and **pnpm**.
 
-```
-User describes problem
-    → DeCIpher collects context (git, Dockerfiles, workflows)
-    → Triage Node classifies the failure
-    → Fixer Node proposes a minimal patch
-    → Verifier Node runs verification command
-    → Structured report output
-```
+Optional: **Docker** (for container scenarios).
 
-DeCIpher stops early and says `NEEDS_HUMAN_REVIEW` when confidence is low, the same patch is attempted twice, or the fix touches too many files. Knowing when to stop is a feature.
-
-## Demo Scenarios
-
-| Scenario | Failure Type | Auto-Fix |
-|----------|-------------|----------|
-| `docker-copy-path-bug` | COPY path doesn't exist | `COPY src/ .` → `COPY . .` |
-| `ci-python-version-drift` | CI uses Python 3.10, project needs 3.11 | Update workflow |
-| `docker-entrypoint-permission` | Entrypoint script not executable | Add `chmod +x` |
-| `env-missing-node` | Node.js not installed | Install instructions |
+## Usage
 
 ```bash
-node bin/decipher demo scenarios/docker-copy-path-bug
-node bin/decipher demo scenarios/ci-python-version-drift
-node bin/decipher demo scenarios/docker-entrypoint-permission
-node bin/decipher demo scenarios/env-missing-node
-```
-
-## Interactive Mode
-
-```bash
+# Start interactive mode
 ./bin/decipher
+
+# Run a demo scenario
+./bin/decipher demo scenarios/docker-copy-path-bug
+
+# Check environment
+./bin/decipher doctor
 ```
+
+### Interactive Mode
 
 ```
 ╭─────────────────────────────────────────────────────────╮
-│                   /\_/\                                 │
-│                  ( •ᴥ• )                                │
-│ >_ DeCIpher (v0.1.0)                                    │
+│       /\_/\                                             │
+│      ( •ᴥ• )  DeCIpher v0.1.0                          │
 │                                                         │
-│ provider:  openai                                       │
-│ model:     gpt-4o              /model to change         │
-│ directory: ~/my-project                                 │
-│ api key:   ● configured                                 │
+│  provider   openai                                      │
+│  model      gpt-4o                                      │
+│  directory  ~/my-project                                │
+│  approval   on-request   last: idle                     │
+│  api key    ● configured                                │
 ╰─────────────────────────────────────────────────────────╯
 
-› My Docker build fails with COPY src/ not found
-  ...DeCIpher responds conversationally...
+YOU › Fix this Docker build failure
+  ✓ Fix this Docker build failure (14.8s)
 
-› /demo scenarios/docker-copy-path-bug
-  ...runs full triage → fix → verify pipeline...
+┌ MISSION ────────────────────────────────────────────────
+│ Understood: Fix this Docker build failure
+│
+│ Plan:
+│   1. Inspect target
+│   2. Execute action
+│   3. Verify result
+└─────────────────────────────────────────────────────────
 
-› /doctor
-  ✓ Node.js    24.x    (>= 18)
-  ✓ pnpm       10.x    (>= 8)
-  ✓ Docker     28.x
+┌ CLARIFICATION NEEDED ───────────────────────────────────
+│ DeCIpher asks: Which directory, Dockerfile, or log
+│ file should DeCIpher work on?
+└─────────────────────────────────────────────────────────
+
+YOU ›
 ```
 
-### Slash Commands
+Type natural language to start a mission. Use slash commands to control the session:
 
 | Command | Description |
 |---------|-------------|
 | `/help` | Show all commands |
 | `/model [name]` | Show or change AI model |
+| `/setting show\|set` | Manage configuration |
+| `/status` | Current session snapshot |
+| `/plan` | Current mission plan |
+| `/review` | Review patch before write-back |
+| `/resume` | Resume last interrupted mission |
+| `/transcript` | Show command transcript |
+| `/artifacts` | Show saved artifacts |
 | `/demo <scenario>` | Run a demo scenario |
-| `/doctor` | Check environment dependencies |
-| `/agents` | List built-in agents + custom skills |
-| `/config show` | Show current configuration |
+| `/doctor` | Check environment |
+| `/agents` | List available agents |
 | `/quit` | Exit |
 
 ## Configuration
 
 ```bash
-# OpenAI
-node bin/decipher config set provider openai
-node bin/decipher config set api-key sk-xxx
+# OpenAI (default)
+./bin/decipher setting set provider openai
+./bin/decipher setting set api-key sk-xxx
 
 # Anthropic
-node bin/decipher config set provider anthropic
-node bin/decipher config set api-key sk-ant-xxx
+./bin/decipher setting set provider anthropic
+./bin/decipher setting set api-key sk-ant-xxx
 
-# Custom OpenAI-compatible API (DeepSeek, Ollama, etc.)
-node bin/decipher config set provider custom
-node bin/decipher config set base_url https://your-api.com/v1/chat/completions
-node bin/decipher config set model your-model
-node bin/decipher config set api-key your-key
+# Custom OpenAI-compatible (DeepSeek, Ollama, etc.)
+./bin/decipher setting set provider custom
+./bin/decipher setting set base_url https://your-api.com/v1/chat/completions
+./bin/decipher setting set model your-model
+./bin/decipher setting set api-key your-key
 ```
 
 Config stored at `~/.decipher/config.json`.
 
-## CLI Commands
+## Demo Scenarios
 
 ```bash
-./bin/decipher                          # Interactive mode
-node bin/decipher demo <scenario>       # Run demo scenario
-node bin/decipher doctor                # Check environment
-node bin/decipher triage <log-file>     # Triage a failure log
-node bin/decipher verify "<command>"    # Run verification
-node bin/decipher config show|set|reset # Manage config
-node bin/decipher --help                # Full help
+./bin/decipher demo scenarios/<name>
 ```
 
-## Architecture
+| Scenario | Failure Type |
+|----------|-------------|
+| `docker-copy-path-bug` | COPY path doesn't exist |
+| `docker-entrypoint-permission` | Entrypoint not executable |
+| `docker-healthcheck-failure` | Health check misconfiguration |
+| `docker-multistage-wrong-artifact` | Wrong artifact in multi-stage build |
+| `docker-run-missing-env` | Missing environment variable |
+| `docker-runtime-port-mismatch-loop` | Port mismatch with auto-retry |
+| `ci-python-version-drift` | CI/project Python version mismatch |
+| `ci-missing-workflow` | Missing CI workflow file |
+| `env-missing-node` | Node.js not installed |
+| `hpl-from-scratch` | Full HPL benchmark setup |
+| `hpl-build-only` | HPL build-only mission |
+| `hpl-build-and-start` | HPL build + start |
+| `hpl-benchmark-run` | HPL benchmark execution |
+| `hpl-docker-missing-dockerfile` | Missing Dockerfile for HPL |
+| `github-docker-clone` | Clone and containerize from GitHub |
+
+## How It Works
 
 ```
-bin/decipher          CLI entry — boxed header, slash commands, routing
-agents/orchestrator/  triage → fix → verify loop (max 3 iterations)
-agents/triage/        AI-powered failure classifier (10 taxonomy labels)
-agents/fixer/         AI-powered minimal patch proposer
-agents/verifier/      Command runner + environment checker
-lib/config.js         ~/.decipher/config.json read/write
-lib/api-client.js     OpenAI / Anthropic / custom provider abstraction
-lib/template.js       {variable} interpolation for prompt templates
-lib/reporter.js       7-section structured output formatter
-prompts/              Markdown prompt templates with placeholders
-skills/               Domain knowledge injected per node
-scenarios/            Deterministic demo fixtures
+User Goal
+   → Mission Planner (understand + decompose)
+   → Execution Loop (commands, file generation, repair)
+   → Verification Layer (check results)
+   → Adapt or Complete
 ```
 
-## Testing
-
-```bash
-pnpm test                # 22 unit tests
-make doctor              # Environment check
-make verify              # Structural scenario verification
-```
+DeCIpher stops early with `NEEDS_HUMAN_REVIEW` when confidence is low, the same fix is attempted twice, or changes touch too many files.
 
 ## Tech Stack
 
