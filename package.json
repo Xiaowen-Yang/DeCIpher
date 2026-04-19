@@ -1,6 +1,6 @@
 {
   "name": "decipher-cli",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Mission-driven local execution agent for CI, Docker, and deployment tasks",
   "type": "module",
   "bin": {
@@ -44,6 +44,6 @@
     "picocolors": "^1.1.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

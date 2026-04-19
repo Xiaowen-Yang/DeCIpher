@@ -19,7 +19,7 @@ pnpm install
 ./bin/decipher setting set api-key sk-xxx
 ```
 
-Requires **Node.js 20+** and **pnpm**.
+Requires **Node.js 22+** and **pnpm**.
 
 Optional: **Docker** (for container scenarios).
 
