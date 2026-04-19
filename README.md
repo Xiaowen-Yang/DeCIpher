@@ -2,42 +2,70 @@
 
 ```
      /\_/\
-    ( •ᴥ• )   DeCIpher v0.1.0
+    ( •ᴥ• )   DeCIpher v0.1.5
 ```
 
 A mission-driven local execution agent for CI/deployment tasks. Give it a goal — it plans, executes, verifies, and adapts until the job is done.
 
 ## Install
 
-```bash
-# Clone and install
-git clone <repo-url> && cd DeCIpher
-pnpm install
+Requires **Node.js 22+**. Check your version:
 
-# Set up your AI provider
-./bin/decipher setting set provider openai
-./bin/decipher setting set api-key sk-xxx
+```bash
+node -v   # Should show v22.x.x or higher
 ```
 
-Requires **Node.js 22+** and **pnpm**.
+If you don't have Node.js or need to upgrade:
 
-Optional: **Docker** (for container scenarios).
+```bash
+# macOS / Linux (via nvm — recommended)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+nvm install 22
+nvm use 22
+
+# Or via Homebrew (macOS)
+brew install node@22
+
+# Windows — download the installer from:
+# https://nodejs.org/en/download
+# Or via winget:
+winget install OpenJS.NodeJS.LTS
+```
+
+Then install DeCIpher:
+
+```bash
+npm install -g decipher-cli
+decipher
+```
+
+That's it. On first run, DeCIpher will ask you to configure an AI provider.
+
+### Update
+
+DeCIpher checks for new versions automatically and notifies you on startup. To update:
+
+```bash
+npm update -g decipher-cli
+```
+
+Optional: **Docker** (for container missions).
 
 ## Usage
 
 ```bash
 # Start interactive mode
-./bin/decipher
+decipher
 
 # Check environment
-./bin/decipher doctor
+decipher doctor
 ```
 
 ### Interactive Mode
 
 ```
     /\_/\
-   ( •ᴥ• )  DeCIpher v0.1.0
+   ( •ᴥ• )  DeCIpher v0.1.5
 
   provider   openai
   model      gpt-4o
@@ -91,18 +119,18 @@ Type natural language to start a mission. Use slash commands to control the sess
 
 ```bash
 # OpenAI (default)
-./bin/decipher setting set provider openai
-./bin/decipher setting set api-key sk-xxx
+decipher setting set provider openai
+decipher setting set api-key sk-xxx
 
 # Anthropic
-./bin/decipher setting set provider anthropic
-./bin/decipher setting set api-key sk-ant-xxx
+decipher setting set provider anthropic
+decipher setting set api-key sk-ant-xxx
 
 # Custom OpenAI-compatible (DeepSeek, Ollama, etc.)
-./bin/decipher setting set provider custom
-./bin/decipher setting set base_url https://your-api.com/v1/chat/completions
-./bin/decipher setting set model your-model
-./bin/decipher setting set api-key your-key
+decipher setting set provider custom
+decipher setting set base_url https://your-api.com/v1/chat/completions
+decipher setting set model your-model
+decipher setting set api-key your-key
 ```
 
 Config stored at `~/.decipher/config.json`.
@@ -121,7 +149,7 @@ DeCIpher stops early with `NEEDS_HUMAN_REVIEW` when confidence is low, the same 
 
 ## Tech Stack
 
-- Node.js 18+ (ESM)
+- Node.js 22+ (ESM)
 - `node:test` (built-in test runner)
 - `picocolors` (terminal colors)
 - Native `fetch` (API calls)
