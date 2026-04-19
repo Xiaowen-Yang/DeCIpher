@@ -1,8 +1,13 @@
 #![allow(dead_code)]
-//! JSON protocol types for TUI <-> Node.js agent communication.
+//! Shared protocol types for DeCIpher TUI <-> agent communication.
 //!
 //! The Rust TUI spawns `node bin/decipher --server` and communicates via
-//! newline-delimited JSON on stdin/stdout.
+//! newline-delimited JSON on stdin/stdout. This crate defines the message
+//! types used by both sides.
+//!
+//! This is the **migration seam**: when the Node.js backend is replaced by
+//! Rust, only the transport changes (subprocess → in-process channels).
+//! The message types remain identical.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +41,7 @@ pub struct ImageData {
 
 // ── Messages FROM agent TO TUI ──────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
     #[serde(rename = "banner")]
@@ -101,13 +106,13 @@ pub enum ServerMessage {
     CommandList { commands: Vec<CommandInfo> },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ActionDetail {
     pub tool: String,
     pub reasoning: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CommandInfo {
     pub name: String,
     pub description: String,

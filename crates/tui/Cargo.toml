@@ -1,0 +1,14 @@
+[package]
+name = "decipher-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal UI for DeCIpher"
+
+[dependencies]
+decipher-protocol = { workspace = true }
+decipher-markdown = { workspace = true }
+decipher-clipboard = { workspace = true }
+crossterm = { workspace = true }
+arboard = { workspace = true }
+serde_json = { workspace = true }

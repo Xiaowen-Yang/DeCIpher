@@ -33,6 +33,7 @@ decipher-agent-docs/
 docs/
 
 # Rust build artifacts
+target/
 tui/target/
 
 # build artifacts
@@ -51,5 +52,5 @@ tui/target/
 # plugin lock files
 skills-lock.json
 
-# postinstall script (generated)
-scripts/
+# generated scripts
+scripts/postinstall.js

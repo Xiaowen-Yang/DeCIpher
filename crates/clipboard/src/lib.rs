@@ -9,7 +9,7 @@ use base64::Engine;
 use image::ImageEncoder;
 use std::io::Cursor;
 
-use crate::protocol::ImageData;
+use decipher_protocol::ImageData;
 
 /// Try to read an image from the clipboard.
 /// Returns `Some(ImageData)` with base64-encoded PNG if an image is found,

@@ -1,0 +1,11 @@
+[package]
+name = "decipher-markdown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lightweight markdown-to-ANSI renderer for DeCIpher"
+
+[dependencies]
+crossterm = { workspace = true }
+pulldown-cmark = { workspace = true }
+syntect = { workspace = true }

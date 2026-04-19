@@ -1,0 +1,22 @@
+[package]
+name = "decipher-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI entry point for DeCIpher"
+
+[[bin]]
+name = "decipher-tui"
+path = "src/main.rs"
+
+[dependencies]
+decipher-protocol = { workspace = true }
+decipher-tui = { workspace = true }
+decipher-agent-bridge = { workspace = true }
+decipher-clipboard = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
