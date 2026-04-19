@@ -1,1 +1,0 @@
-My Docker container fails immediately on startup with "permission denied" on the entrypoint script. The script exists in the image but can't be executed. Please diagnose and fix.

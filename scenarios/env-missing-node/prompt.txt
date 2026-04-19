@@ -1,1 +1,0 @@
-My project won't start because Node.js is not installed. The project requires Node.js 18 or higher. Please diagnose the environment issue and suggest how to fix it.

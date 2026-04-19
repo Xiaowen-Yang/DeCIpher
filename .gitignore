@@ -18,9 +18,13 @@ Thumbs.db
 # local agent tooling
 .claude/
 .codex
+AGENTS.md
+CLAUDE.md
 
 # reference material (read-only, not part of the product)
 references/
+scenarios/
+tests/
 
 # agent contract docs (tracked separately from product code)
 decipher-agent-docs/

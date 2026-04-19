@@ -29,9 +29,6 @@ Optional: **Docker** (for container scenarios).
 # Start interactive mode
 ./bin/decipher
 
-# Run a demo scenario
-./bin/decipher demo scenarios/docker-copy-path-bug
-
 # Check environment
 ./bin/decipher doctor
 ```
@@ -39,35 +36,38 @@ Optional: **Docker** (for container scenarios).
 ### Interactive Mode
 
 ```
-╭─────────────────────────────────────────────────────────╮
-│       /\_/\                                             │
-│      ( •ᴥ• )  DeCIpher v0.1.0                          │
-│                                                         │
-│  provider   openai                                      │
-│  model      gpt-4o                                      │
-│  directory  ~/my-project                                │
-│  approval   on-request   last: idle                     │
-│  api key    ● configured                                │
-╰─────────────────────────────────────────────────────────╯
+    /\_/\
+   ( •ᴥ• )  DeCIpher v0.1.0
 
-YOU › Fix this Docker build failure
+  provider   custom  (https://ark.cn-beijing.volces.com/api...)
+  model      glm-4-7-251222
+  directory  ~/Downloads/Personal_doc/Study/GitHub/test
+  approval   on-request  last: idle
+  api key    ● configured
+
+  Type a mission, paste a path, or /help for commands.
+  ctrl+r history  ctrl+c quit
+
+╭─
+│ YOU › Fix this Docker build failure
+╰─
   ✓ Fix this Docker build failure (14.8s)
 
 ┌ MISSION ────────────────────────────────────────────────
-│ Understood: Fix this Docker build failure
-│
-│ Plan:
-│   1. Inspect target
-│   2. Execute action
-│   3. Verify result
-└─────────────────────────────────────────────────────────
+  Understood: Fix this Docker build failure
 
-┌ CLARIFICATION NEEDED ───────────────────────────────────
-│ DeCIpher asks: Which directory, Dockerfile, or log
-│ file should DeCIpher work on?
-└─────────────────────────────────────────────────────────
+  Plan:
+    1. Inspect target
+    2. Execute action
+    3. Verify result
 
-YOU ›
+┌ CLARIFICATION NEEDED ──────────────────────────────────
+  DeCIpher asks: Which directory, Dockerfile, or log
+  file should DeCIpher work on?
+
+╭─
+│ YOU ›
+╰─
 ```
 
 Type natural language to start a mission. Use slash commands to control the session:
@@ -83,7 +83,6 @@ Type natural language to start a mission. Use slash commands to control the sess
 | `/resume` | Resume last interrupted mission |
 | `/transcript` | Show command transcript |
 | `/artifacts` | Show saved artifacts |
-| `/demo <scenario>` | Run a demo scenario |
 | `/doctor` | Check environment |
 | `/agents` | List available agents |
 | `/quit` | Exit |
@@ -107,30 +106,6 @@ Type natural language to start a mission. Use slash commands to control the sess
 ```
 
 Config stored at `~/.decipher/config.json`.
-
-## Demo Scenarios
-
-```bash
-./bin/decipher demo scenarios/<name>
-```
-
-| Scenario | Failure Type |
-|----------|-------------|
-| `docker-copy-path-bug` | COPY path doesn't exist |
-| `docker-entrypoint-permission` | Entrypoint not executable |
-| `docker-healthcheck-failure` | Health check misconfiguration |
-| `docker-multistage-wrong-artifact` | Wrong artifact in multi-stage build |
-| `docker-run-missing-env` | Missing environment variable |
-| `docker-runtime-port-mismatch-loop` | Port mismatch with auto-retry |
-| `ci-python-version-drift` | CI/project Python version mismatch |
-| `ci-missing-workflow` | Missing CI workflow file |
-| `env-missing-node` | Node.js not installed |
-| `hpl-from-scratch` | Full HPL benchmark setup |
-| `hpl-build-only` | HPL build-only mission |
-| `hpl-build-and-start` | HPL build + start |
-| `hpl-benchmark-run` | HPL benchmark execution |
-| `hpl-docker-missing-dockerfile` | Missing Dockerfile for HPL |
-| `github-docker-clone` | Clone and containerize from GitHub |
 
 ## How It Works
 
