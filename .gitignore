@@ -32,6 +32,9 @@ decipher-agent-docs/
 # design docs and task tracking (local only)
 docs/
 
+# Rust build artifacts
+tui/target/
+
 # build artifacts
 *.tgz
 *.bak
@@ -47,3 +50,6 @@ docs/
 
 # plugin lock files
 skills-lock.json
+
+# postinstall script (generated)
+scripts/

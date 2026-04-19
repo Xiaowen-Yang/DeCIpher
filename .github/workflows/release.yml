@@ -9,7 +9,64 @@ permissions:
   contents: write
 
 jobs:
+  # Build Rust TUI binaries for each platform
+  build-tui:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: decipher-tui-darwin-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: decipher-tui-darwin-x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: decipher-tui-linux-x64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: decipher-tui-linux-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: decipher-tui-win32-x64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build TUI
+        working-directory: tui
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          SRC="tui/target/${{ matrix.target }}/release/decipher-tui"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            SRC="${SRC}.exe"
+          fi
+          cp "$SRC" "${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  # Publish npm package and create GitHub release with TUI binaries
   release:
+    needs: build-tui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,7 +83,6 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      # Validate tag matches package.json version
       - name: Validate version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
@@ -39,28 +95,29 @@ jobs:
 
       - run: pnpm test
 
-      - name: Debug npmrc
-        run: |
-          echo "=== .npmrc ==="
-          cat .npmrc 2>/dev/null || echo "no project .npmrc"
-          echo "=== ~/.npmrc ==="
-          cat ~/.npmrc 2>/dev/null || echo "no home .npmrc"
-          echo "=== NODE_AUTH_TOKEN set? ==="
-          [ -n "$NODE_AUTH_TOKEN" ] && echo "yes (length: ${#NODE_AUTH_TOKEN})" || echo "no"
-          echo "=== npm whoami ==="
-          npm whoami 2>&1 || true
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
       - name: Publish to npm
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      # Create GitHub Release
+      # Download all TUI binaries
+      - uses: actions/download-artifact@v4
+        with:
+          path: tui-binaries
+
+      - name: List binaries
+        run: find tui-binaries -type f | sort
+
+      # Create GitHub Release with TUI binaries attached
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: DeCIpher ${{ env.VERSION }}
           generate_release_notes: true
+          files: |
+            tui-binaries/decipher-tui-darwin-arm64/decipher-tui-darwin-arm64
+            tui-binaries/decipher-tui-darwin-x64/decipher-tui-darwin-x64
+            tui-binaries/decipher-tui-linux-x64/decipher-tui-linux-x64
+            tui-binaries/decipher-tui-linux-arm64/decipher-tui-linux-arm64
+            tui-binaries/decipher-tui-win32-x64.exe/decipher-tui-win32-x64.exe

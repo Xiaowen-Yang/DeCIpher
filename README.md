@@ -63,6 +63,8 @@ decipher doctor
 
 ### Interactive Mode
 
+The terminal UI is built in Rust (crossterm) for smooth input handling, multi-line paste, and streaming output. It communicates with the Node.js agent backend via JSON over stdin/stdout.
+
 ```
     /\_/\
    ( •ᴥ• )  DeCIpher v0.1.5
@@ -76,10 +78,7 @@ decipher doctor
   Type a mission, paste a path, or /help for commands.
   ctrl+r history  ctrl+c quit
 
-╭─
-│ YOU › Fix this Docker build failure
-╰─
-  ✓ Fix this Docker build failure (14.8s)
+│ ❯ Fix this Docker build failure
 
 ┌ MISSION ────────────────────────────────────────────────
   Understood: Fix this Docker build failure
@@ -89,16 +88,35 @@ decipher doctor
     2. Execute action
     3. Verify result
 
-┌ CLARIFICATION NEEDED ──────────────────────────────────
-  DeCIpher asks: Which directory, Dockerfile, or log
-  file should DeCIpher work on?
+  ✓ exec_command — Clone the repository (6.4s)
+  ✓ read_file — Read Dockerfile (2.1s)
+  ✗ exec_command — Docker build failed (12.2s)
 
-╭─
-│ YOU ›
-╰─
+────────────────────────────────────────────────
+  [RESULT]
+  Outcome:     PASS (42.3s)
+  Turns:       8
+  Summary:     Fixed COPY path and rebuilt successfully.
+────────────────────────────────────────────────
 ```
 
-Type natural language to start a mission. Use slash commands to control the session:
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Submit input |
+| `Shift+Enter` | Insert newline (multi-line input) |
+| `/` | Open command palette |
+| `Ctrl+C` | Interrupt agent / quit |
+| `Ctrl+D` | Quit (on empty input) |
+| `Ctrl+A` / `Ctrl+E` | Jump to start / end of line |
+| `Ctrl+K` / `Ctrl+U` | Kill to end / start of line |
+| `Ctrl+W` | Kill word backward |
+| `Ctrl+Y` | Yank (paste killed text) |
+| `Alt+Left` / `Alt+Right` | Word-by-word cursor movement |
+| `Up` / `Down` | Input history navigation |
+
+### Slash Commands
 
 | Command | Description |
 |---------|-------------|
@@ -147,13 +165,26 @@ User Goal
 
 DeCIpher stops early with `NEEDS_HUMAN_REVIEW` when confidence is low, the same fix is attempted twice, or changes touch too many files.
 
+## Architecture
+
+```
+Rust TUI (crossterm)          Node.js Agent Backend
+┌──────────────────┐          ┌──────────────────────┐
+│ Input handling    │  JSON    │ Mission planner      │
+│ Prompt rendering  │◄────────►│ Execution loop       │
+│ Markdown output   │ stdin/   │ Tool runner          │
+│ Approval flow     │ stdout   │ Verification layer   │
+│ Streaming display │          │ LLM API abstraction  │
+└──────────────────┘          └──────────────────────┘
+```
+
 ## Tech Stack
 
-- Node.js 22+ (ESM)
-- `node:test` (built-in test runner)
-- `picocolors` (terminal colors)
-- Native `fetch` (API calls)
-- No heavy frameworks
+- **TUI**: Rust + crossterm (inline rendering, no alternate screen)
+- **Agent**: Node.js 22+ (ESM)
+- **Tests**: `node:test` (built-in)
+- **Colors**: `picocolors` (Node.js), ANSI RGB (Rust)
+- **API**: Native `fetch`, OpenAI/Anthropic/custom providers
 
 ## License
 

@@ -12,11 +12,13 @@
     "lib/",
     "prompts/",
     "skills/",
+    "scripts/postinstall.js",
     "README.md"
   ],
   "scripts": {
     "test": "node --test tests/unit/*.test.js",
-    "test:unit": "node --test tests/unit/*.test.js"
+    "test:unit": "node --test tests/unit/*.test.js",
+    "postinstall": "node scripts/postinstall.js"
   },
   "keywords": [
     "cli",
