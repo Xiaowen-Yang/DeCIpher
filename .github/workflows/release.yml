@@ -40,9 +40,8 @@ jobs:
 
       - run: pnpm test
 
-      # Publish to npm with provenance (OIDC, no hardcoded token needed)
       - name: Publish to npm
-        run: npm publish --provenance --access public
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
