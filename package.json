@@ -1,6 +1,6 @@
 {
   "name": "decipher-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Mission-driven local execution agent for CI, Docker, and deployment tasks",
   "type": "module",
   "bin": {
@@ -31,11 +31,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/oodadoudou/DeCIpher.git"
+    "url": "git+https://github.com/Xiaowen-Yang/DeCIpher.git"
   },
-  "homepage": "https://github.com/oodadoudou/DeCIpher#readme",
+  "homepage": "https://github.com/Xiaowen-Yang/DeCIpher#readme",
   "bugs": {
-    "url": "https://github.com/oodadoudou/DeCIpher/issues"
+    "url": "https://github.com/Xiaowen-Yang/DeCIpher/issues"
   },
   "publishConfig": {
     "access": "public"
@@ -44,6 +44,6 @@
     "picocolors": "^1.1.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }
