@@ -16,7 +16,8 @@
 import { join } from "node:path";
 import pc from "picocolors";
 import { startSpinner } from "../../lib/spinner.js";
-import { createEmptyWorkspace } from "./workspace.js";
+// createEmptyWorkspace is available in ./workspace.js but we always use
+// the user's directory (target.path or cwd) — never a temp workspace.
 import {
   persistSessionSnapshot,
   persistTranscript,
@@ -26,7 +27,7 @@ import {
 import { runCompletionNotification } from "../../lib/notifications.js";
 import { TOOL_REGISTRY, toolsPromptSection, isToolRisky } from "./tools.js";
 import { callAIWithMessages } from "../../lib/api-client.js";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 
 const MAX_TURNS = 20;
 const AGENT_PROMPT_PATH = new URL("../../prompts/agent.md", import.meta.url)
@@ -206,7 +207,10 @@ function renderPlanUpdate(steps) {
  * @returns {Promise<LoopResult>}
  */
 export async function runAgentLoop(mission, target, config, options = {}) {
-  const isGreenfield = target?.meta?.start_state === "empty";
+  const isGreenfield =
+    target?.meta?.start_state === "empty" ||
+    target?.type === "new_directory" ||
+    mission?.type === "greenfield";
   const missionId = mission?.id ?? target?.meta?.id ?? "adhoc";
   const planSteps = options.planSteps ?? mission?.steps ?? [];
 
@@ -227,33 +231,26 @@ export async function runAgentLoop(mission, target, config, options = {}) {
   };
 
   // ── Workspace setup ────────────────────────────────────────
-  // Work directly in the user's directory whenever possible.
-  // Only create a temp workspace for git_repo (need a clean clone dir)
-  // or when no real target path exists.
+  // ALWAYS work in the user's directory — never in /tmp.
+  // Priority: options.workspace > target.path > process.cwd()
+  // The agent clone/download operations happen INSIDE this directory.
   const sp = startSpinner("Preparing workspace");
   let workspace;
-  const isGitRepo = target?.type === "git_repo";
   try {
     if (options.workspace) {
       workspace = options.workspace;
       sp.stop(`Resuming → ${pc.dim(workspace)}`);
-    } else if (isGitRepo) {
-      // Git repos clone into a fresh temp dir
-      workspace = await createEmptyWorkspace(missionId);
-      sp.stop(`Workspace → ${pc.dim(workspace)}`);
-    } else if (isGreenfield && target?.path) {
-      // Greenfield with a real path — work directly there
-      workspace = target.path;
-      sp.stop(`Working in → ${pc.dim(workspace)}`);
-    } else if (isGreenfield) {
-      // Greenfield with no path — temp workspace
-      workspace = await createEmptyWorkspace(missionId);
-      sp.stop(`Workspace → ${pc.dim(workspace)}`);
     } else if (target?.type === "scenario") {
       workspace = join(target.path, "broken");
       sp.stop(`Working in → ${pc.dim(workspace)}`);
+    } else if (target?.path && target.type !== "git_repo") {
+      // Use the user-specified path. Create it if it doesn't exist yet.
+      await mkdir(target.path, { recursive: true });
+      workspace = target.path;
+      sp.stop(`Working in → ${pc.dim(workspace)}`);
     } else {
-      workspace = target?.path ?? process.cwd();
+      // git_repo or no explicit path — work in cwd
+      workspace = process.cwd();
       sp.stop(`Working in → ${pc.dim(workspace)}`);
     }
   } catch (err) {
@@ -545,17 +542,42 @@ export async function runAgentLoop(mission, target, config, options = {}) {
       }
     }
   } finally {
-    // Only clean up TEMP workspaces on failure (git_repo clones, no-path greenfield).
-    // Never delete the user's own directory.
-    const isTempWorkspace = isGitRepo || (isGreenfield && !target?.path);
-    if (isTempWorkspace && outcome !== "PASS") {
-      preserveWorkspace = false;
-      try {
-        const { rm } = await import("node:fs/promises");
-        await rm(workspace, { recursive: true, force: true });
-        log(pc.dim(`  [cleanup] removed failed temp workspace: ${workspace}`));
-      } catch {
-        // ignore cleanup errors
+    // Workspace is always the user's directory — never delete it.
+    // But Docker resources (containers, images) created during a failed
+    // mission must be cleaned up to avoid polluting the user's environment.
+    if (outcome !== "PASS") {
+      const containers = sessionState._dockerContainers ?? new Set();
+      const images = sessionState._dockerImages ?? new Set();
+      const composeDir = sessionState._dockerComposeDir ?? null;
+
+      if (containers.size > 0 || images.size > 0 || composeDir) {
+        log(
+          pc.bold(
+            "\n  [CLEANUP] Removing Docker resources from failed mission…",
+          ),
+        );
+        try {
+          const { cleanupDockerResources } = await import("./tools.js");
+          const cleaned = await cleanupDockerResources(
+            containers,
+            images,
+            composeDir,
+            log,
+          );
+          const total =
+            cleaned.containers.length +
+            cleaned.images.length +
+            (cleaned.compose ? 1 : 0);
+          if (total > 0) {
+            log(
+              pc.green(
+                `  [CLEANUP] Removed ${cleaned.containers.length} container(s), ${cleaned.images.length} image(s)${cleaned.compose ? ", compose stack" : ""}`,
+              ),
+            );
+          }
+        } catch (err) {
+          log(pc.yellow(`  [CLEANUP] Error during cleanup: ${err.message}`));
+        }
       }
     }
   }
@@ -568,6 +590,33 @@ export async function runAgentLoop(mission, target, config, options = {}) {
     transcriptText,
     missionId,
   ).catch(() => null);
+
+  // Also save a copy under docs/logs/ for development analysis
+  try {
+    const { fileURLToPath } = await import("node:url");
+    const { dirname: dn } = await import("node:path");
+    const projectRoot = join(dn(fileURLToPath(import.meta.url)), "../..");
+    const logsDir = join(projectRoot, "docs/logs");
+    await mkdir(logsDir, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const logName = `${ts}_${missionId}.log`;
+    const header = [
+      `# Agent Log: ${missionId}`,
+      `Date: ${new Date().toISOString()}`,
+      `Goal: ${mission?.goal ?? "(unknown)"}`,
+      `Target: ${target?.path ?? "(none)"} (${target?.type ?? "unknown"})`,
+      `Workspace: ${workspace}`,
+      `Outcome: ${outcome}`,
+      `Turns: ${completedTurns}`,
+      `Elapsed: ${((Date.now() - missionStartTime) / 1000).toFixed(1)}s`,
+      "",
+      "---",
+      "",
+    ].join("\n");
+    await writeFile(join(logsDir, logName), header + transcriptText, "utf8");
+  } catch {
+    // Non-critical — don't fail the mission for a log write error
+  }
 
   // Record preserved workspace for /artifacts discovery
   if (preserveWorkspace && workspace) {
@@ -667,6 +716,18 @@ function makeFailResult(state, iterations, lines, reason = "") {
  * Print a human-readable summary of a runAgentLoop result.
  * Signature matches printLoopResult so callers can use either interchangeably.
  */
+/**
+ * Highlight URLs in text so terminals render them as ctrl+clickable links.
+ * Uses OSC 8 hyperlink escapes supported by iTerm2, VS Code, Hyper, etc.
+ * Falls back to underlined cyan text for terminals without OSC 8 support.
+ */
+function highlightUrls(text) {
+  return text.replace(
+    /https?:\/\/[^\s,)>"']+/g,
+    (url) => `\x1b]8;;${url}\x07${pc.underline(pc.cyan(url))}\x1b]8;;\x07`,
+  );
+}
+
 export function printAgentLoopResult(result) {
   const divider = pc.dim("─".repeat(60));
   console.log(`\n${divider}`);
@@ -685,7 +746,8 @@ export function printAgentLoopResult(result) {
   console.log(`  Turns:       ${result.iterations}`);
 
   if (result.summary) {
-    console.log(`  Summary:     ${result.summary}`);
+    // Highlight URLs in summary so they are ctrl+clickable in the terminal
+    console.log(`  Summary:     ${highlightUrls(result.summary)}`);
   }
 
   if (result.workspace) {

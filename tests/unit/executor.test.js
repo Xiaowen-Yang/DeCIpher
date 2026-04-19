@@ -11,6 +11,8 @@ const {
   resolveScenarioRuntime,
 } = await import("../../agents/executor/index.js");
 
+const { TOOL_REGISTRY } = await import("../../agents/executor/tools.js");
+
 test("resolveTarget detects a scenario directory from natural-language input", async () => {
   const root = await mkdtemp(join(tmpdir(), "decipher-executor-"));
   const scenarioDir = join(root, "scenarios", "sample-scenario");
@@ -198,4 +200,54 @@ test("resolveScenarioRuntime keeps non-auto-fixable env scenarios on the structu
   });
 
   assert.equal(runtime.kind, "structural");
+});
+
+// ── Docker resource tracking ──────────────────────────────────────────────────
+
+test("exec_command tracks docker build image tags in sessionState", async () => {
+  const sessionState = {};
+  const context = { workspace: "/tmp", sessionState, log: () => {} };
+
+  await TOOL_REGISTRY.exec_command.handler(
+    { cmd: "docker build -t myapp:latest ." },
+    context,
+  );
+
+  assert.ok(sessionState._dockerImages);
+  assert.ok(sessionState._dockerImages.has("myapp:latest"));
+});
+
+test("exec_command tracks docker run --name containers in sessionState", async () => {
+  const sessionState = {};
+  const context = { workspace: "/tmp", sessionState, log: () => {} };
+
+  await TOOL_REGISTRY.exec_command.handler(
+    { cmd: "docker run --name test-container -d nginx" },
+    context,
+  );
+
+  assert.ok(sessionState._dockerContainers);
+  assert.ok(sessionState._dockerContainers.has("test-container"));
+});
+
+test("exec_command tracks docker compose up in sessionState", async () => {
+  const sessionState = {};
+  const context = { workspace: "/tmp/myproject", sessionState, log: () => {} };
+
+  await TOOL_REGISTRY.exec_command.handler(
+    { cmd: "docker compose up -d" },
+    context,
+  );
+
+  assert.equal(sessionState._dockerComposeDir, "/tmp/myproject");
+});
+
+test("exec_command does not track non-docker commands", async () => {
+  const sessionState = {};
+  const context = { workspace: "/tmp", sessionState, log: () => {} };
+
+  await TOOL_REGISTRY.exec_command.handler({ cmd: "echo hello" }, context);
+
+  assert.equal(sessionState._dockerContainers, undefined);
+  assert.equal(sessionState._dockerImages, undefined);
 });

@@ -23,8 +23,10 @@ Working directory: {workspace}
   to rewrite the entire file. Patches corrupt small files.
 - **Create ALL required files before building.** Dockerfile, run scripts, config
   files — create them all FIRST, then build once. Don't build with missing files.
-- **Work in the directory the user specified.** Files go in the workspace directory,
-  not in a subdirectory you create.
+- **ALWAYS work in the workspace directory.** All files, clones, and operations go in
+  `{workspace}` — NEVER in `/tmp`, `/var/folders`, or any other temp directory.
+  When cloning a git repo, clone it into the workspace: `git clone <url> .` or
+  `git clone <url> <name>` inside the workspace. The workspace IS the user's directory.
 - **Research before generating.** When you don't know the right package name,
   config format, or command flags, search for them inside a container first:
   `docker run --rm ubuntu:22.04 apt-cache search <keyword>`. Don't guess.
@@ -75,7 +77,7 @@ When something fails, think like a senior engineer:
 
 When the target is a GitHub/GitLab URL:
 
-1. **Clone first.** `git clone <url>` into the workspace directory.
+1. **Clone into the workspace.** `cd {workspace} && git clone <url>` — never into /tmp or temp dirs.
 2. **Read the README.** Look for: build instructions, Docker commands, dependencies,
    environment variables, and how to run the project.
 3. **Check for existing Docker config.** Look for `Dockerfile`, `docker-compose.yml`,

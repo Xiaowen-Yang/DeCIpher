@@ -169,12 +169,18 @@ export function createMissionPlan(mission) {
     };
   }
 
+  // Unknown mission type but mission object exists — fall through to
+  // a generic execute plan rather than blocking with clarification.
+  // The agent loop is capable of handling arbitrary goals.
   return {
     mission,
-    selected_subsystem: "clarification",
-    requires_clarification: true,
-    clarification_question: "What do you want DeCIpher to do exactly?",
-    steps: [],
+    selected_subsystem: "execution",
+    requires_clarification: false,
+    steps: [
+      { id: "inspect_target", label: "Inspect target and environment" },
+      { id: "execute_action", label: "Execute the requested action" },
+      { id: "verify_result", label: "Verify result" },
+    ],
   };
 }
 
@@ -188,6 +194,10 @@ function defaultActionForTarget(target) {
       return "docker_build";
     case "logfile":
       return "triage_only";
+    case "new_directory":
+      return "generate";
+    case "directory":
+      return "generate";
     default:
       return "fix";
   }

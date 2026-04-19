@@ -14,9 +14,116 @@ import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import pc from "picocolors";
 
 const exec = promisify(execCb);
 const EXEC_TIMEOUT = 120_000; // 2 min per command
+
+// ── Docker resource tracking ─────────────────────────────────────────────────
+// Track containers and images created during a mission so they can be cleaned
+// up on failure. Prevents polluting the user's Docker environment.
+
+/**
+ * Extract Docker resource names from a command string.
+ * Returns { type, name } or null.
+ */
+function parseDockerResource(cmd) {
+  const parts = (cmd ?? "").trim();
+
+  // docker build -t <name> ...
+  const buildTag = parts.match(/docker\s+build\s+.*?-t\s+(\S+)/);
+  if (buildTag) return { type: "image", name: buildTag[1] };
+
+  // docker run --name <name> ...
+  const runName = parts.match(/docker\s+run\s+.*?--name\s+(\S+)/);
+  if (runName) return { type: "container", name: runName[1] };
+
+  // docker run (without --name) — returns container ID in stdout
+  if (/docker\s+run\b/.test(parts)) return { type: "container_from_run" };
+
+  // docker compose / docker-compose up
+  if (/docker[\s-]compose\s+up\b/.test(parts)) return { type: "compose" };
+
+  return null;
+}
+
+/**
+ * After an exec_command returns, extract any container IDs from the output.
+ */
+function extractContainerIds(output) {
+  // Docker run -d prints a 64-char hex container ID
+  const ids = [];
+  for (const line of (output ?? "").split("\n")) {
+    const trimmed = line.trim();
+    if (/^[0-9a-f]{12,64}$/.test(trimmed)) {
+      ids.push(trimmed);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Clean up Docker resources created during a failed mission.
+ * @param {Set<string>} containers - container names/IDs
+ * @param {Set<string>} images - image names/tags
+ * @param {string|null} composeDir - directory where docker-compose was run
+ * @param {Function} log
+ */
+export async function cleanupDockerResources(
+  containers,
+  images,
+  composeDir,
+  log,
+) {
+  const cleaned = { containers: [], images: [], compose: false };
+
+  // 1. Stop and remove containers
+  for (const c of containers) {
+    try {
+      await exec(`docker rm -f ${c}`, { timeout: 15_000 });
+      cleaned.containers.push(c);
+      log(pc.dim(`  [cleanup] removed container: ${c}`));
+    } catch {
+      // Container may already be gone
+    }
+  }
+
+  // 2. Tear down docker-compose stack
+  if (composeDir) {
+    try {
+      await exec("docker compose down --remove-orphans -v", {
+        cwd: composeDir,
+        timeout: 30_000,
+      });
+      cleaned.compose = true;
+      log(pc.dim("  [cleanup] docker compose down"));
+    } catch {
+      try {
+        await exec("docker-compose down --remove-orphans -v", {
+          cwd: composeDir,
+          timeout: 30_000,
+        });
+        cleaned.compose = true;
+        log(pc.dim("  [cleanup] docker-compose down"));
+      } catch {
+        // compose not available or already torn down
+      }
+    }
+  }
+
+  // 3. Remove images
+  for (const img of images) {
+    try {
+      await exec(`docker rmi ${img}`, { timeout: 15_000 });
+      cleaned.images.push(img);
+      log(pc.dim(`  [cleanup] removed image: ${img}`));
+    } catch {
+      // Image may be in use or already gone
+    }
+  }
+
+  return cleaned;
+}
 
 // ── Risky command detection ────────────────────────────────────────────────────
 
@@ -71,7 +178,30 @@ export const TOOL_REGISTRY = {
     handler: async (args, context) => {
       const cmd = args.cmd ?? "";
       const workdir = args.workdir ? resolve(args.workdir) : context.workspace;
-      return safeExec(cmd, workdir);
+      const result = await safeExec(cmd, workdir);
+
+      // Track Docker resources for cleanup on failure
+      const resource = parseDockerResource(cmd);
+      if (resource && context.sessionState) {
+        const st = context.sessionState;
+        if (!st._dockerContainers) st._dockerContainers = new Set();
+        if (!st._dockerImages) st._dockerImages = new Set();
+
+        if (resource.type === "image" && resource.name) {
+          st._dockerImages.add(resource.name);
+        } else if (resource.type === "container" && resource.name) {
+          st._dockerContainers.add(resource.name);
+        } else if (resource.type === "container_from_run") {
+          // Extract container ID from stdout (docker run -d prints it)
+          for (const id of extractContainerIds(result.output)) {
+            st._dockerContainers.add(id);
+          }
+        } else if (resource.type === "compose") {
+          st._dockerComposeDir = workdir;
+        }
+      }
+
+      return result;
     },
   },
 

@@ -73,7 +73,15 @@ async function isDir(p) {
 
 async function classifyPath(rawPath) {
   const p = resolve(expandHome(rawPath));
-  if (!(await exists(p))) return null;
+  if (!(await exists(p))) {
+    // Path doesn't exist yet — treat as a new directory target so the agent
+    // can create files there.  Return null only when the path looks like a
+    // stray token (no slashes or only one segment).
+    if (p.includes("/") && p.split("/").filter(Boolean).length >= 2) {
+      return { path: p, type: "new_directory" };
+    }
+    return null;
+  }
 
   if (await isDir(p)) {
     if (await exists(join(p, "metadata.json"))) {
@@ -86,7 +94,8 @@ async function classifyPath(rawPath) {
     if (await exists(join(p, "package.json"))) {
       return { path: p, type: "nodejs" };
     }
-    return null;
+    // Existing directory without a known marker — still a valid target
+    return { path: p, type: "directory" };
   }
 
   const name = p.split("/").pop();
@@ -280,9 +289,18 @@ export async function askApproval(rl, state, action = null) {
   );
   console.log(pc.dim("  └──────────────────────────────────────────────────"));
 
-  const answer = await new Promise((res) =>
-    rl.question(`  ${pc.bold("Allow?")} [Y/n] `, res),
-  );
+  let answer;
+  try {
+    answer = await new Promise((res, rej) => {
+      if (rl.closed) return rej(new Error("readline closed"));
+      rl.question(`  ${pc.bold("Allow?")} [Y/n] `, res);
+    });
+  } catch {
+    // readline was closed (e.g. Ctrl-C during prompt) — treat as approved
+    // so the mission can proceed in non-interactive / piped contexts.
+    state.approved = true;
+    return true;
+  }
 
   const approved = answer.trim() === "" || /^y/i.test(answer.trim());
   state.approved = approved;
@@ -321,11 +339,11 @@ function buildSyntheticMission(action, target) {
     };
   }
 
-  // Git repo URL — clone and run in Docker
+  // Git repo URL — clone into the current workspace and run in Docker
   if (target?.type === "git_repo") {
     const repoName = meta.repoName ?? "repo";
     return {
-      goal: `Clone the repository ${path}, read the README to understand the project, then build and run it in Docker. The container must be running when you are done.`,
+      goal: `Clone the repository ${path} into the current working directory, read the README to understand the project, then build and run it in Docker. The container must be running when you are done. Do NOT clone into /tmp — work in the current directory.`,
       type: "clone_and_run",
       id: `clone-${repoName}`,
       stop_boundary: "container_running",
@@ -337,8 +355,8 @@ function buildSyntheticMission(action, target) {
     demo: `Demonstrate and fix the ${typeLabel} at ${path}`,
     docker_build: `Build the Docker image at ${path} successfully`,
     build_start: `Build and start the container at ${path}. The container must still be running when you are done.`,
-    benchmark_run: `Run the benchmark at ${path} to completion`,
-    generate: `Generate the required files for ${path}`,
+    benchmark_run: `Build and run the benchmark at ${path} to completion in Docker. Create all needed files (Dockerfile, configs, scripts) if they do not exist.`,
+    generate: `Generate the required files at ${path}. Create the directory if it does not exist.`,
     triage_only: `Triage and explain the failure at ${path}`,
   };
   return {

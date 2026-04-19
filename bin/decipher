@@ -434,7 +434,8 @@ async function handleInteractiveInput(input, config, rl, sessionState) {
   // Always send the user's full input to the LLM — their words are the best
   // signal for intent. Don't replace with meta.prompt or strip to just a path.
   const meta = target?.meta ?? {};
-  const isGreenfield = meta.start_state === 'empty' || meta.mission_type === 'greenfield';
+  const isGreenfield = meta.start_state === 'empty' || meta.mission_type === 'greenfield'
+    || target?.type === 'new_directory';
 
   const sp = startSpinner('Understanding mission');
   const analysis = await analyzeMission(input, target, config);
@@ -529,7 +530,7 @@ async function handleInteractiveInput(input, config, rl, sessionState) {
   }
 
   try {
-    const result = await executeTarget(target, analysis.action, config, sessionState);
+    const result = await executeTarget(target, analysis.action, config, sessionState, { rl });
     if (result?.needs_clarification) {
       printSectionHeader('CLARIFICATION NEEDED', 'command');
       console.log(`  ${BY('AI asks:')} ${W(result.needs_clarification)}`);

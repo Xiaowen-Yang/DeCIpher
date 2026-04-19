@@ -56,6 +56,16 @@ Input: "set up CI for this project" + target is a Node.js project directory
 {"understood_as":"Generate a CI workflow for this Node.js project","action":"generate","steps":["Inspect the project structure and package.json","Generate a GitHub Actions CI workflow","Verify the workflow file is valid"],"requires_clarification":false,"clarification_question":null}
 ```
 
+Input: "I want to run HPL benchmark in Docker. Create all files under /path/to/hpl-from-scratch" + target is a new directory (path does not exist yet)
+```json
+{"understood_as":"Create all files needed to run the HPL benchmark in Docker at the specified path","action":"benchmark_run","steps":["Create the target directory","Generate Dockerfile and build config for HPL","Build the Docker image","Run the HPL benchmark inside the container","Verify benchmark results"],"requires_clarification":false,"clarification_question":null}
+```
+
+Input: "create a Dockerfile for a Node.js app at /tmp/myapp" + target is a new directory
+```json
+{"understood_as":"Generate a Dockerfile for a Node.js application at /tmp/myapp","action":"generate","steps":["Create the target directory","Generate Dockerfile for Node.js","Verify the Dockerfile is valid"],"requires_clarification":false,"clarification_question":null}
+```
+
 Input: "run this" + no target resolved
 ```json
 {"understood_as":"Run something, but the target is unclear","action":"fix","steps":[],"requires_clarification":true,"clarification_question":"What should DeCIpher run? Please provide a path to a Dockerfile, scenario, or project directory."}
@@ -79,3 +89,5 @@ Respond with ONLY valid JSON. No prose, no markdown fences.
 
 If `requires_clarification` is true, set `clarification_question` to the one blocking question needed to proceed.
 Keep `steps` concise — each step is one short phrase, not a paragraph.
+
+IMPORTANT: Only set `requires_clarification` to true when the user's intent is genuinely ambiguous. If the user specifies BOTH what they want to do AND where to do it (even if the path does not exist yet), that is enough information to proceed — do NOT ask for clarification. The agent loop will create any missing directories and files.

@@ -128,7 +128,7 @@ test("buildScenarioList: returns a non-empty string with scenario IDs", async ()
   assert.ok(typeof list === "string");
   assert.ok(list.length > 0);
   // Should contain at least one known scenario
-  assert.match(list, /docker-copy-path-bug|hpl-build-only|ci-missing-workflow/);
+  assert.match(list, /env-missing-node|github-docker-clone|github-clone/);
 });
 
 // ── fallbackAnalysis ──────────────────────────────────────────────────────────
@@ -158,10 +158,29 @@ test("fallbackAnalysis: uses fix for scenario targets", () => {
   assert.equal(result.requires_clarification, false);
 });
 
-test("fallbackAnalysis: requires clarification when no target is provided", () => {
+test("fallbackAnalysis: requires clarification for vague input without target", () => {
   const result = fallbackAnalysis("do something useful", null);
 
   assert.equal(result.requires_clarification, true);
   assert.ok(result.clarification_question);
   assert.equal(result.inferred, true);
+});
+
+test("fallbackAnalysis: skips clarification when input has clear intent without target", () => {
+  const result = fallbackAnalysis(
+    "I want to run HPL benchmark in Docker on this Mac",
+    null,
+  );
+
+  assert.equal(result.requires_clarification, false);
+  assert.equal(result.clarification_question, null);
+  assert.equal(result.action, "benchmark_run");
+});
+
+test("fallbackAnalysis: uses generate action for new_directory targets", () => {
+  const target = { path: "/tmp/my-new-project", type: "new_directory" };
+  const result = fallbackAnalysis("create files here", target);
+
+  assert.equal(result.action, "generate");
+  assert.equal(result.requires_clarification, false);
 });
