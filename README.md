@@ -39,9 +39,9 @@ Optional: **Docker** (for container scenarios).
     /\_/\
    ( •ᴥ• )  DeCIpher v0.1.0
 
-  provider   custom  (https://ark.cn-beijing.volces.com/api...)
-  model      glm-4-7-251222
-  directory  ~/Downloads/Personal_doc/Study/GitHub/test
+  provider   openai
+  model      gpt-4o
+  directory  ~/my-project
   approval   on-request  last: idle
   api key    ● configured
 
