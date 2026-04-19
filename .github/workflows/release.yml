@@ -39,10 +39,21 @@ jobs:
 
       - run: pnpm test
 
-      - name: Publish to npm
+      - name: Debug npmrc
         run: |
-          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > .npmrc
-          npm publish --access public
+          echo "=== .npmrc ==="
+          cat .npmrc 2>/dev/null || echo "no project .npmrc"
+          echo "=== ~/.npmrc ==="
+          cat ~/.npmrc 2>/dev/null || echo "no home .npmrc"
+          echo "=== NODE_AUTH_TOKEN set? ==="
+          [ -n "$NODE_AUTH_TOKEN" ] && echo "yes (length: ${#NODE_AUTH_TOKEN})" || echo "no"
+          echo "=== npm whoami ==="
+          npm whoami 2>&1 || true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish to npm
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
