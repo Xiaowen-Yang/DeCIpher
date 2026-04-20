@@ -2,7 +2,7 @@
 
 pub mod app;
 pub mod render;
-pub mod streaming;
+// streaming.rs removed — adaptive chunking handled by MarkdownStreamCollector
 pub mod shimmer;
 pub mod paste_burst;
 pub mod diff_render;

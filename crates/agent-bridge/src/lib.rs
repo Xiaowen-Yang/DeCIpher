@@ -14,11 +14,15 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use std::process::Stdio;
 
+/// Backpressure buffer size for agent→TUI message channel.
+/// Prevents OOM on verbose long-running sessions.
+const CHANNEL_BUFFER: usize = 1024;
+
 /// Handle to a running agent subprocess.
 pub struct AgentBridge {
     pub child: tokio::process::Child,
     pub stdin: tokio::process::ChildStdin,
-    pub rx: mpsc::UnboundedReceiver<ServerMessage>,
+    pub rx: mpsc::Receiver<ServerMessage>,
 }
 
 impl AgentBridge {
@@ -42,16 +46,25 @@ impl AgentBridge {
         let child_stdout = child.stdout.take().expect("child stdout");
         let child_stderr = child.stderr.take().expect("child stderr");
 
-        let (agent_tx, agent_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (agent_tx, agent_rx) = mpsc::channel::<ServerMessage>(CHANNEL_BUFFER);
 
-        // Stdout reader: parse JSON messages from agent
+        // Stdout reader: parse JSON messages from agent.
+        // ONLY valid JSON protocol messages are forwarded to the TUI.
+        // Non-JSON lines (e.g., stray console.log from agent code) are
+        // silently dropped — they would corrupt the display.
         let tx1 = agent_tx.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(child_stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 match serde_json::from_str::<ServerMessage>(&line) {
-                    Ok(msg) => { let _ = tx1.send(msg); }
-                    Err(_) => { let _ = tx1.send(ServerMessage::AgentMessage { text: line }); }
+                    Ok(msg) => { let _ = tx1.send(msg).await; }
+                    Err(_) => {
+                        // Drop non-JSON lines. In server mode, all agent
+                        // output should go through send() as JSON.
+                        // Log to TUI stderr for debugging if needed.
+                        #[cfg(debug_assertions)]
+                        eprintln!("[bridge] dropped non-JSON: {}", &line[..line.len().min(120)]);
+                    }
                 }
             }
         });
@@ -60,7 +73,7 @@ impl AgentBridge {
         tokio::spawn(async move {
             let mut lines = BufReader::new(child_stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = agent_tx.send(ServerMessage::Error { message: line });
+                let _ = agent_tx.send(ServerMessage::Error { message: line }).await;
             }
         });
 

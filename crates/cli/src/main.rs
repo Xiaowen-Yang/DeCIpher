@@ -272,6 +272,12 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
                 fps.mark_drawn();
                 app.handle_server_message(msg);
                 need_redraw = true;
+
+                // Auto-approve if user pressed 'a' (always) earlier
+                if app.always_approve && app.mode == app::InputMode::ApprovalPending {
+                    let resp = app.respond_approval(true);
+                    bridge.send(&resp).await?;
+                }
             }
 
             // ── Tick — spinner animation ──────────────────────────────────────

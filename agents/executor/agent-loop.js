@@ -2,22 +2,17 @@
  * Agent-driven execution loop — the Codex-style runtime core.
  *
  * The LLM agent receives: mission goal + workspace + available tools + history.
- * It responds with a JSON tool call. The loop executes the tool, feeds the
- * result back, and repeats until the agent calls `done` or limits are hit.
+ * It responds with native tool calls (OpenAI tools / Anthropic tool_use).
+ * The loop executes the tools, feeds results back, and repeats until the
+ * agent calls `done` or limits are hit.
  *
- * This replaces the fixed-mode runner (docker_build / docker_run / etc.) as
- * the primary execution engine. Docker runners and the repair subsystem remain
- * available as utilities the agent can invoke via exec_command and the shell.
- *
- * LoopResult shape is compatible with the legacy runExecutorLoop result so
- * callers (index.js, printLoopResult) work without changes.
+ * V4: Uses native function calling instead of JSON text parsing.
+ * Tools are sent as structured JSON schemas alongside messages.
  */
 
 import { join } from "node:path";
 import pc from "picocolors";
 import { startSpinner } from "../../lib/spinner.js";
-// createEmptyWorkspace is available in ./workspace.js but we always use
-// the user's directory (target.path or cwd) — never a temp workspace.
 import {
   persistSessionSnapshot,
   persistTranscript,
@@ -25,11 +20,22 @@ import {
   compactSessionSnapshot,
 } from "../../lib/session-store.js";
 import { runCompletionNotification } from "../../lib/notifications.js";
-import { TOOL_REGISTRY, toolsPromptSection, isToolRisky } from "./tools.js";
+import { TOOL_REGISTRY } from "./tools.js";
 import {
-  callAIWithMessages,
-  callAIWithMessagesStreaming,
-} from "../../lib/api-client.js";
+  evaluatePolicy,
+  createAmendments,
+  recordApproval,
+  Decision,
+  PolicyMode,
+} from "../../lib/exec-policy.js";
+import {
+  buildToolsForProvider,
+  formatAssistantToolCallMessage,
+  formatToolResultMessage,
+  formatUserMessage,
+  formatAssistantMessage,
+} from "./tool-schemas.js";
+import { callAIWithToolsStreaming } from "../../lib/api-client.js";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 
 const MAX_TURNS = 20;
@@ -39,8 +45,8 @@ const AGENT_PROMPT_PATH = new URL("../../prompts/agent.md", import.meta.url)
 // ── System prompt builder ─────────────────────────────────────────────────────
 
 function detectHostEnvironment() {
-  const os = process.platform; // darwin, linux, win32
-  const arch = process.arch; // arm64, x64
+  const os = process.platform;
+  const arch = process.arch;
   const osLabel =
     os === "darwin"
       ? "macOS"
@@ -86,9 +92,7 @@ async function buildSystemPrompt(mission, target, workspace, planSteps) {
     .replace("{target_type}", targetType)
     .replace("{workspace}", workspace)
     .replace("{plan_steps}", stepsText)
-    .replace("{tools_section}", toolsPromptSection())
-    .replace("{environment}", detectHostEnvironment())
-    .replace("{history}", "(none yet — this is the first turn)");
+    .replace("{environment}", detectHostEnvironment());
 }
 
 function buildFallbackSystemPrompt() {
@@ -102,46 +106,20 @@ Working directory: {workspace}
 ## Plan
 {plan_steps}
 
-## Available Tools
-{tools_section}
+## Environment
+{environment}
 
-## Output Format
-Respond ONLY with a JSON object:
-\`\`\`json
-{ "reasoning": "...", "tool": "tool_name", "args": { ... } }
-\`\`\`
-
-Call done only when the user's goal is verified as satisfied.
+## Instructions
+Use the available tools to accomplish the mission. Call done only when the user's goal is verified as satisfied.
 
 ## History
 {history}`;
 }
 
-// ── Tool call parsing ─────────────────────────────────────────────────────────
-
-function parseToolCall(raw) {
-  try {
-    const cleaned = raw
-      .replace(/^```(?:json)?\s*/m, "")
-      .replace(/\s*```\s*$/m, "")
-      .trim();
-    const parsed = JSON.parse(cleaned);
-    const tool = parsed.tool;
-    if (!tool || !TOOL_REGISTRY[tool]) return null;
-    return {
-      tool,
-      args: parsed.args ?? {},
-      reasoning: String(parsed.reasoning ?? "").slice(0, 200),
-    };
-  } catch {
-    return null;
-  }
-}
-
 // ── Tool result formatting ────────────────────────────────────────────────────
 
 const OUTPUT_LIMIT = 4000;
-const OUTPUT_LIMIT_FAILURE = 8000; // More context on failure for diagnosis
+const OUTPUT_LIMIT_FAILURE = 8000;
 const FILE_LIMIT = 6000;
 
 function formatToolResult(toolName, args, result) {
@@ -149,12 +127,11 @@ function formatToolResult(toolName, args, result) {
   switch (toolName) {
     case "exec_command": {
       const fullOutput = result.output ?? "";
-      // Use a higher output limit for failed commands to preserve diagnostic info.
       const limit = result.exitCode !== 0 ? OUTPUT_LIMIT_FAILURE : OUTPUT_LIMIT;
       const truncated = fullOutput.length > limit;
       const preview = truncated
         ? fullOutput.slice(0, limit) +
-          `\n... (output truncated: ${fullOutput.length} chars total — run read_file or exec_command to see full output)`
+          `\n... (output truncated: ${fullOutput.length} chars total)`
         : fullOutput;
       return `${header}\nCommand: ${args.cmd}\nExit code: ${result.exitCode}${result.exitCode !== 0 ? " (FAILED)" : ""}\nOutput:\n${preview || "(no output)"}`;
     }
@@ -191,12 +168,12 @@ function renderPlanUpdate(steps) {
   for (const s of steps) {
     const icon =
       s.status === "completed"
-        ? pc.green("✓")
+        ? pc.green("\u2713")
         : s.status === "failed"
-          ? pc.red("✗")
+          ? pc.red("\u2717")
           : s.status === "in_progress"
-            ? pc.yellow("→")
-            : pc.dim("○");
+            ? pc.yellow("\u2192")
+            : pc.dim("\u25CB");
     console.log(`    ${icon} ${s.step}`);
   }
 }
@@ -206,7 +183,7 @@ function renderPlanUpdate(steps) {
 /**
  * Run the agent-driven execution loop.
  *
- * @param {object|null} mission   — { goal, type, id, steps, … }
+ * @param {object|null} mission   — { goal, type, id, steps, ... }
  * @param {object|null} target    — { path, type, meta }
  * @param {object}      config    — API config
  * @param {object}      options
@@ -236,28 +213,23 @@ export async function runAgentLoop(mission, target, config, options = {}) {
     }
   };
 
-  // ── Workspace setup ────────────────────────────────────────
-  // ALWAYS work in the user's directory — never in /tmp.
-  // Priority: options.workspace > target.path > process.cwd()
-  // The agent clone/download operations happen INSIDE this directory.
+  // ── Workspace setup ────────────────────────────────────
   const sp = startSpinner("Preparing workspace");
   let workspace;
   try {
     if (options.workspace) {
       workspace = options.workspace;
-      sp.stop(`Resuming → ${pc.dim(workspace)}`);
+      sp.stop(`Resuming \u2192 ${pc.dim(workspace)}`);
     } else if (target?.type === "scenario") {
       workspace = join(target.path, "broken");
-      sp.stop(`Working in → ${pc.dim(workspace)}`);
+      sp.stop(`Working in \u2192 ${pc.dim(workspace)}`);
     } else if (target?.path && target.type !== "git_repo") {
-      // Use the user-specified path. Create it if it doesn't exist yet.
       await mkdir(target.path, { recursive: true });
       workspace = target.path;
-      sp.stop(`Working in → ${pc.dim(workspace)}`);
+      sp.stop(`Working in \u2192 ${pc.dim(workspace)}`);
     } else {
-      // git_repo or no explicit path — work in cwd
       workspace = process.cwd();
-      sp.stop(`Working in → ${pc.dim(workspace)}`);
+      sp.stop(`Working in \u2192 ${pc.dim(workspace)}`);
     }
   } catch (err) {
     sp.stop();
@@ -266,6 +238,12 @@ export async function runAgentLoop(mission, target, config, options = {}) {
   }
 
   const sessionState = options.sessionContext ?? {};
+
+  // ── Policy engine setup ─────────────────────────────────
+  const policyMode =
+    options.policyMode ?? config.approval_policy_mode ?? PolicyMode.AUTO;
+  const amendments = sessionState._amendments ?? createAmendments();
+  sessionState._amendments = amendments;
 
   const context = {
     workspace,
@@ -284,45 +262,66 @@ export async function runAgentLoop(mission, target, config, options = {}) {
     planSteps,
   );
 
+  // ── Native tool calling setup ──────────────────────────────
+  const provider = config.base_url ? "openai" : (config.provider ?? "openai");
+  const tools = buildToolsForProvider(provider);
+
   // ── Conversation history ────────────────────────────────────
   const messages = [
-    {
-      role: "user",
-      content: buildInitialUserMessage(mission, target, workspace),
-    },
+    formatUserMessage(buildInitialUserMessage(mission, target, workspace)),
   ];
 
   let outcome = "FAIL";
   let finalSummary = "";
+  let doneResult = null;
   let lastPatch = null;
   let completedTurns = 0;
   let preserveWorkspace = false;
+  let consecutiveNoToolCalls = 0;
+  const MAX_NO_TOOL_CALLS = 3;
+  const totalUsage = {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+  };
   let consecutiveFailures = 0;
-  const failureHistory = new Map(); // "tool:argsHash" → count
+  const failureHistory = new Map();
   const missionStartTime = Date.now();
 
   log(pc.bold(`\n  [agent] mission: ${mission?.goal ?? "(no goal)"}`));
   log(pc.dim(`  workspace: ${workspace}`));
   log(pc.dim(`  max_turns: ${MAX_TURNS}`));
+  log(pc.dim(`  provider: ${provider} (native tool calling)`));
 
   // ── Main turn loop ─────────────────────────────────────────
   try {
     for (let turn = 1; turn <= MAX_TURNS; turn++) {
       completedTurns = turn;
-      log(pc.bold(`\n  ── Turn ${turn}/${MAX_TURNS} ──`));
+      log(pc.bold(`\n  \u2500\u2500 Turn ${turn}/${MAX_TURNS} \u2500\u2500`));
 
-      // Call LLM with streaming (deltas forwarded to TUI via onDelta callback)
+      // Send status update to TUI
+      if (options.onStatus) {
+        options.onStatus({
+          phase: "thinking",
+          turn,
+          max_turns: MAX_TURNS,
+          elapsed_ms: Date.now() - missionStartTime,
+        });
+      }
+
+      // ── Call LLM with native tool calling + streaming ─────────
       const turnSp = startSpinner(`Agent turn ${turn}`);
-      let raw;
+      let response;
       try {
-        raw = await callAIWithMessagesStreaming(
+        response = await callAIWithToolsStreaming(
           messages,
+          tools,
           config,
           systemPrompt,
           options.onDelta ?? null,
+          options.onReasoning ?? null,
         );
       } catch (err) {
-        // Only reaches here after all retries are exhausted (terminal error)
         turnSp.stop(pc.red("API error (retries exhausted)"));
         log(pc.red(`  turn ${turn} API error: ${err.message}`));
         finalSummary = `API error after retries: ${err.message}`;
@@ -330,247 +329,340 @@ export async function runAgentLoop(mission, target, config, options = {}) {
         break;
       }
 
-      // Parse tool call
-      const toolCall = parseToolCall(raw);
-      if (!toolCall) {
-        turnSp.stop(pc.yellow("no valid tool call — retrying"));
-        log(pc.yellow(`  turn ${turn}: no valid JSON tool call in response`));
-        messages.push({ role: "assistant", content: raw });
-        messages.push({
-          role: "user",
-          content:
-            "Your response was not a valid JSON tool call. " +
-            'Respond only with a JSON object: { "reasoning": "...", "tool": "...", "args": { ... } }',
-        });
-        continue;
+      // Accumulate per-turn usage
+      const { getLastUsage } = await import("../../lib/api-client.js");
+      const turnUsage = response.usage ?? getLastUsage();
+      if (turnUsage) {
+        totalUsage.prompt_tokens += turnUsage.prompt_tokens;
+        totalUsage.completion_tokens += turnUsage.completion_tokens;
+        totalUsage.total_tokens += turnUsage.total_tokens;
+        if (options.onUsage) options.onUsage(turnUsage, totalUsage);
       }
 
-      turnSp.stop(
-        `${pc.cyan(toolCall.tool)} — ${toolCall.reasoning.slice(0, 60)}`,
-      );
-      log(`  tool: ${toolCall.tool} | ${toolCall.reasoning}`);
-
-      // Notify TUI of tool selection (shows tool name + reasoning to user)
-      if (options.onToolStart) {
-        options.onToolStart(toolCall.tool, toolCall.reasoning);
-      }
-
-      messages.push({ role: "assistant", content: raw });
-
-      // ── done ────────────────────────────────────────────────
-      if (toolCall.tool === "done") {
-        outcome = toolCall.args.outcome === "FAIL" ? "FAIL" : "PASS";
-        finalSummary = toolCall.args.summary ?? "Mission complete.";
-        log(pc.bold(`  [done] ${outcome} — ${finalSummary}`));
-        if (outcome !== "PASS") preserveWorkspace = true;
-        break;
-      }
-
-      // ── Approval gate for risky operations ──────────────────
-      if (isToolRisky(toolCall.tool, toolCall.args)) {
-        const alreadyApproved = sessionState.approved ?? false;
-        if (!alreadyApproved) {
-          const rl = options.rl ?? sessionState.rl ?? null;
-          if (rl) {
-            const { askApproval } = await import("./index.js");
-            const approved = await askApproval(rl, sessionState, toolCall);
-            if (!approved) {
-              log(pc.yellow("  approval denied — stopping"));
-              outcome = "FAIL";
-              finalSummary = "Stopped: approval denied for risky operation.";
-              preserveWorkspace = true;
-              break;
-            }
-          }
-          // No rl available → auto-approve (non-interactive mode)
-        }
-      }
-
-      // ── Execute tool ─────────────────────────────────────────
-      const execSp = startSpinner(`${toolCall.tool}`);
-      const execStartMs = Date.now();
-      let toolResult;
-      try {
-        toolResult = await TOOL_REGISTRY[toolCall.tool].handler(
-          toolCall.args,
-          context,
-        );
-      } catch (err) {
-        toolResult = { success: false, error: err.message };
-      }
-
-      const resultText = formatToolResult(
-        toolCall.tool,
-        toolCall.args,
-        toolResult,
-      );
-      // Stop spinner — show elapsed time only, no redundant "ok" text
-      const execElapsedMs = Date.now() - execStartMs;
-      execSp.stop();
-      const resultOk = toolResult.success !== false;
-
-      // Notify TUI of tool completion (shows ✓/✗ + summary to user)
-      if (options.onToolResult) {
-        const summary = resultOk
-          ? (
-              toolResult.summary ?? resultText.split("\n").slice(0, 1).join("")
-            ).slice(0, 120)
-          : (toolResult.error ?? "failed").slice(0, 120);
-        options.onToolResult(toolCall.tool, resultOk, summary, execElapsedMs);
-      }
-      log(
-        pc.dim(
-          `  result: ${resultText.split("\n").slice(0, 2).join(" | ").slice(0, 120)}`,
-        ),
-      );
-
-      // ── Repair loop detection ─────────────────────────────────
-      // Track consecutive failures and same-operation repeats.
-      // On EVERY failure, inject a diagnostic nudge so the LLM
-      // follows the Debugging Protocol instead of blindly retrying.
-      if (!resultOk) {
-        consecutiveFailures++;
-        const argsKey = `${toolCall.tool}:${simpleHash(JSON.stringify(toolCall.args))}`;
-        failureHistory.set(argsKey, (failureHistory.get(argsKey) ?? 0) + 1);
-
-        if (failureHistory.get(argsKey) >= 2) {
-          // Same exact operation failed twice — inject escalation prompt
-          log(pc.yellow("  same operation failed twice — escalating strategy"));
-          messages.push({ role: "assistant", content: raw });
-          messages.push({
-            role: "user",
-            content:
-              resultText +
-              "\n\n[STRATEGY ESCALATION] The same approach has failed twice. " +
-              "STOP and think about the ROOT CAUSE. What is fundamentally wrong? " +
-              "Do NOT retry the same approach. Try a completely different strategy. " +
-              "Read the error carefully. Form a hypothesis. Test it with a minimal action.",
-          });
-          continue;
-        }
-
-        if (consecutiveFailures >= 3) {
-          log(pc.yellow("  3 consecutive failures — forcing strategy shift"));
-          messages.push({ role: "assistant", content: raw });
-          messages.push({
-            role: "user",
-            content:
-              resultText +
-              "\n\n[3 CONSECUTIVE FAILURES] Your recent approaches are not working. " +
-              "Step back and reconsider the problem from scratch. " +
-              "What assumptions are you making that might be wrong? " +
-              "Try a fundamentally different approach.",
-          });
-          consecutiveFailures = 0; // reset after escalation
-          continue;
-        }
-
-        // First failure — nudge the LLM to follow Debugging Protocol
+      // ── Handle text-only response (no tool calls) ──────────
+      if (response.type === "text" || response.toolCalls.length === 0) {
+        consecutiveNoToolCalls++;
+        turnSp.stop(pc.yellow("no tool call \u2014 retrying"));
         log(
           pc.yellow(
-            `  tool failed (${consecutiveFailures} consecutive) — nudging diagnosis`,
+            `  turn ${turn}: LLM returned text without tool calls (${consecutiveNoToolCalls}/${MAX_NO_TOOL_CALLS})`,
           ),
         );
-        messages.push({
-          role: "user",
-          content:
-            resultText +
-            "\n\n[COMMAND FAILED] Read the error output above carefully. " +
-            "Follow the Debugging Protocol: " +
-            "1) Identify the root cause from the error message. " +
-            "2) Form a hypothesis. " +
-            "3) Fix the issue with the smallest possible change, then retry. " +
-            "Do NOT retry the exact same command without changing something first.",
-        });
-        continue;
-      } else {
-        consecutiveFailures = 0; // reset on success
-      }
 
-      // Detect patch loop (same patch applied twice)
-      if (toolCall.tool === "apply_patch") {
-        const fp = toolCall.args.patch ?? "";
-        if (fp && fp === lastPatch) {
-          log(pc.yellow("  same patch twice — stopping"));
-          outcome = "FAIL";
-          finalSummary =
-            "Loop detected: same patch applied twice without progress.";
+        if (consecutiveNoToolCalls >= MAX_NO_TOOL_CALLS) {
+          log(
+            pc.red(
+              `  ${MAX_NO_TOOL_CALLS} turns without tool calls \u2014 aborting`,
+            ),
+          );
+          finalSummary = `Agent failed to produce tool calls after ${MAX_NO_TOOL_CALLS} attempts.`;
           preserveWorkspace = true;
           break;
         }
-        lastPatch = fp;
 
-        // Track patch targets for corruption detection
-        const patchTarget =
-          toolCall.args.target_file ??
-          fp.match(/^\+\+\+ b\/(.+)$/m)?.[1] ??
-          "unknown";
-        sessionState._lastPatchTarget = patchTarget;
+        if (response.content) {
+          messages.push(formatAssistantMessage(response.content));
+        }
+        messages.push(
+          formatUserMessage(
+            "You must use one of the available tools to make progress. " +
+              "Call a tool now to continue working on the mission.",
+          ),
+        );
+        continue;
       }
+      consecutiveNoToolCalls = 0;
 
-      // Detect patch corruption pattern: write_file immediately after apply_patch
-      // on the same file = the patch corrupted the file and had to be rewritten.
-      if (
-        toolCall.tool === "write_file" &&
-        sessionState._lastPatchTarget &&
-        toolCall.args.path &&
-        toolCall.args.path.includes(sessionState._lastPatchTarget)
-      ) {
-        sessionState._patchCorruptionCount =
-          (sessionState._patchCorruptionCount ?? 0) + 1;
-        if (sessionState._patchCorruptionCount >= 2) {
-          log(
-            pc.yellow(
-              "  patch corruption detected twice — injecting write_file preference",
+      // ── Push assistant's tool-calling message to history ──
+      messages.push(
+        formatAssistantToolCallMessage(
+          provider,
+          response.toolCalls,
+          response.content,
+        ),
+      );
+
+      // ── Process each tool call sequentially ────────────────
+      let doneInThisTurn = false;
+
+      for (const tc of response.toolCalls) {
+        const toolName = tc.name;
+        const toolArgs = tc.input ?? {};
+        const toolCallId = tc.id;
+
+        // Validate tool exists
+        if (!TOOL_REGISTRY[toolName]) {
+          log(pc.yellow(`  unknown tool: ${toolName} \u2014 skipping`));
+          messages.push(
+            formatToolResultMessage(
+              provider,
+              toolCallId,
+              `Error: Unknown tool "${toolName}". Available tools: ${Object.keys(TOOL_REGISTRY).join(", ")}`,
+              true,
             ),
           );
-          messages.push({ role: "assistant", content: raw });
-          messages.push({
-            role: "user",
-            content:
-              resultText +
-              "\n\n[TOOL GUIDANCE] apply_patch has corrupted this file multiple times. " +
-              "From now on, use ONLY write_file to modify this file. " +
-              "Do NOT use apply_patch on Dockerfiles, scripts, or config files.",
-          });
-          sessionState._lastPatchTarget = null;
           continue;
         }
-      }
 
-      messages.push({ role: "user", content: resultText });
+        turnSp.stop(`${pc.cyan(toolName)}`);
+        log(`  tool: ${toolName}`);
 
-      // ── Auto-compaction ─────────────────────────────────────
-      // Use LLM-driven compaction when context gets large.
-      // Falls back to simple truncation if the LLM call fails.
-      const totalChars = messages.reduce(
-        (sum, m) => sum + (m.content?.length ?? 0),
-        0,
-      );
-      if (totalChars > 60_000 && messages.length > 8) {
+        // Notify TUI of tool start
+        if (options.onToolStart) {
+          options.onToolStart(toolName, response.content ?? "", toolArgs);
+        }
+
+        // ── done ────────────────────────────────────────────────
+        if (toolName === "done") {
+          outcome =
+            toolArgs.outcome === "FAIL"
+              ? "FAIL"
+              : toolArgs.outcome === "PARTIAL"
+                ? "PARTIAL"
+                : "PASS";
+          finalSummary = toolArgs.summary ?? "Mission complete.";
+          doneResult = {
+            files_modified: toolArgs.files_modified ?? [],
+            errors_encountered: toolArgs.errors_encountered ?? [],
+            next_steps: toolArgs.next_steps ?? [],
+          };
+          log(pc.bold(`  [done] ${outcome} \u2014 ${finalSummary}`));
+          if (outcome !== "PASS") preserveWorkspace = true;
+          doneInThisTurn = true;
+          break;
+        }
+
+        // ── Policy-driven approval gate ─────────────────────────
+        const policyResult = evaluatePolicy(
+          policyMode,
+          toolName,
+          toolArgs,
+          amendments,
+          workspace,
+        );
+
+        if (policyResult.decision === Decision.DENY) {
+          log(
+            pc.red(
+              `  denied [${policyResult.toolClass}]: ${policyResult.reason}`,
+            ),
+          );
+          messages.push(
+            formatToolResultMessage(
+              provider,
+              toolCallId,
+              `Error: Action denied by policy (${policyResult.reason}). ` +
+                `Try a different approach that does not require ${policyResult.toolClass} access.`,
+              true,
+            ),
+          );
+          continue;
+        }
+
+        if (policyResult.decision === Decision.ASK) {
+          // Support both TUI callback and readline approval mechanisms
+          const approvalFn = options.askApproval ?? null;
+          const rl = options.rl ?? sessionState.rl ?? null;
+          let approved = true; // default if no approval mechanism
+
+          if (approvalFn) {
+            // TUI mode: callback-based approval
+            approved = await approvalFn({
+              tool: toolName,
+              args: toolArgs,
+              toolClass: policyResult.toolClass,
+              reason: policyResult.reason,
+            });
+          } else if (rl) {
+            // Readline mode: interactive prompt
+            const { askApproval: askApprovalRL } = await import("./index.js");
+            approved = await askApprovalRL(rl, sessionState, {
+              tool: toolName,
+              args: toolArgs,
+            });
+          }
+
+          if (!approved) {
+            log(pc.yellow("  approval denied \u2014 stopping"));
+            outcome = "FAIL";
+            finalSummary = "Stopped: approval denied for risky operation.";
+            preserveWorkspace = true;
+            doneInThisTurn = true;
+            break;
+          }
+          // Record approval for this tool class (ask-once-per-class in auto mode)
+          recordApproval(amendments, policyResult.toolClass, toolName);
+        }
+
+        // ── Execute tool ─────────────────────────────────────────
+        const execSp = startSpinner(`${toolName}`);
+        const execStartMs = Date.now();
+        let toolResult;
         try {
-          const { compactMessages } = await import("../../lib/compact.js");
+          toolResult = await TOOL_REGISTRY[toolName].handler(toolArgs, context);
+        } catch (err) {
+          toolResult = { success: false, error: err.message };
+        }
+
+        const resultText = formatToolResult(toolName, toolArgs, toolResult);
+        const execElapsedMs = Date.now() - execStartMs;
+        execSp.stop();
+        const resultOk = toolResult.success !== false;
+
+        // Notify TUI of tool completion
+        if (options.onToolResult) {
+          const summary = resultOk
+            ? (
+                toolResult.summary ??
+                resultText.split("\n").slice(0, 1).join("")
+              ).slice(0, 120)
+            : (toolResult.error ?? "failed").slice(0, 120);
+          const outputText = toolResult.output ?? "";
+          const outputLines = outputText.split("\n");
+          const outputPreview = resultOk
+            ? null
+            : outputLines.slice(-5).join("\n").slice(0, 500);
+          options.onToolResult(toolName, resultOk, summary, execElapsedMs, {
+            exit_code: toolResult.exitCode ?? null,
+            output_preview: outputPreview,
+            output_lines_total: outputLines.length,
+          });
+        }
+        log(
+          pc.dim(
+            `  result: ${resultText.split("\n").slice(0, 2).join(" | ").slice(0, 120)}`,
+          ),
+        );
+
+        // Push tool result to conversation history
+        messages.push(
+          formatToolResultMessage(provider, toolCallId, resultText, !resultOk),
+        );
+
+        // ── Repair loop detection ─────────────────────────────────
+        if (!resultOk) {
+          consecutiveFailures++;
+          const argsKey = `${toolName}:${simpleHash(JSON.stringify(toolArgs))}`;
+          failureHistory.set(argsKey, (failureHistory.get(argsKey) ?? 0) + 1);
+
+          if (failureHistory.get(argsKey) >= 2) {
+            log(
+              pc.yellow(
+                "  same operation failed twice \u2014 escalating strategy",
+              ),
+            );
+            messages.push(
+              formatUserMessage(
+                "[STRATEGY ESCALATION] The same approach has failed twice. " +
+                  "STOP and think about the ROOT CAUSE. " +
+                  "Do NOT retry the same approach. Try a completely different strategy.",
+              ),
+            );
+          } else if (consecutiveFailures >= 3) {
+            log(
+              pc.yellow(
+                "  3 consecutive failures \u2014 forcing strategy shift",
+              ),
+            );
+            messages.push(
+              formatUserMessage(
+                "[3 CONSECUTIVE FAILURES] Your recent approaches are not working. " +
+                  "Step back and reconsider the problem from scratch. " +
+                  "Try a fundamentally different approach.",
+              ),
+            );
+            consecutiveFailures = 0;
+          }
+        } else {
+          consecutiveFailures = 0;
+        }
+
+        // Detect patch loop
+        if (toolName === "apply_patch") {
+          const fp = toolArgs.patch ?? "";
+          if (fp && fp === lastPatch) {
+            log(pc.yellow("  same patch twice \u2014 stopping"));
+            outcome = "FAIL";
+            finalSummary =
+              "Loop detected: same patch applied twice without progress.";
+            preserveWorkspace = true;
+            doneInThisTurn = true;
+            break;
+          }
+          lastPatch = fp;
+
+          const patchTarget =
+            toolArgs.target_file ??
+            fp.match(/^\+\+\+ b\/(.+)$/m)?.[1] ??
+            "unknown";
+          sessionState._lastPatchTarget = patchTarget;
+        }
+
+        // Detect patch corruption pattern
+        if (
+          toolName === "write_file" &&
+          sessionState._lastPatchTarget &&
+          toolArgs.path &&
+          toolArgs.path.includes(sessionState._lastPatchTarget)
+        ) {
+          sessionState._patchCorruptionCount =
+            (sessionState._patchCorruptionCount ?? 0) + 1;
+          if (sessionState._patchCorruptionCount >= 2) {
+            log(
+              pc.yellow(
+                "  patch corruption detected twice \u2014 injecting write_file preference",
+              ),
+            );
+            messages.push(
+              formatUserMessage(
+                "[TOOL GUIDANCE] apply_patch has corrupted this file multiple times. " +
+                  "From now on, use ONLY write_file to modify this file.",
+              ),
+            );
+            sessionState._lastPatchTarget = null;
+          }
+        }
+      } // end for-each tool call
+
+      // If done was called inside the inner loop, break outer loop
+      if (doneInThisTurn) break;
+
+      // ── Token-based auto-compaction ─────────────────────────
+      const { shouldCompact, compactMessages } =
+        await import("../../lib/compact.js");
+      const lastPromptTokens = totalUsage.prompt_tokens;
+      if (
+        shouldCompact(lastPromptTokens, config.model) &&
+        messages.length > 8
+      ) {
+        try {
+          const workspaceReminder = [
+            `Workspace: ${workspace}`,
+            `Mission: ${mission?.goal ?? "(unknown)"}`,
+            `Turn: ${turn}/${MAX_TURNS}`,
+            `The system prompt and tool definitions are always available.`,
+            `Continue working toward the mission goal.`,
+          ].join("\n");
           const result = await compactMessages(messages, config, {
             keepRecent: 6,
+            workspaceReminder,
           });
           messages.length = 0;
           messages.push(...result.messages);
           log(
             pc.dim(
-              `  [compacted] LLM summary (~${Math.round(result.beforeTokens)} → ~${Math.round(result.afterTokens)} tokens)`,
+              `  [compacted] token-based (~${Math.round(result.beforeTokens)} \u2192 ~${Math.round(result.afterTokens)} est. tokens)`,
             ),
           );
         } catch {
-          // Fallback: simple truncation (keep first + last 8)
           const keepFirst = messages.slice(0, 1);
           const keepRecent = messages.slice(-8);
           const middle = messages.slice(1, -8);
           const compacted = [
             ...keepFirst,
-            {
-              role: "user",
-              content: `[Earlier turns compacted — ${middle.length} messages summarized]`,
-            },
+            formatUserMessage(
+              `[Earlier turns compacted \u2014 ${middle.length} messages summarized]`,
+            ),
             ...keepRecent,
           ];
           messages.length = 0;
@@ -602,9 +694,6 @@ export async function runAgentLoop(mission, target, config, options = {}) {
       }
     }
   } finally {
-    // Workspace is always the user's directory — never delete it.
-    // But Docker resources (containers, images) created during a failed
-    // mission must be cleaned up to avoid polluting the user's environment.
     if (outcome !== "PASS") {
       const containers = sessionState._dockerContainers ?? new Set();
       const images = sessionState._dockerImages ?? new Set();
@@ -613,7 +702,7 @@ export async function runAgentLoop(mission, target, config, options = {}) {
       if (containers.size > 0 || images.size > 0 || composeDir) {
         log(
           pc.bold(
-            "\n  [CLEANUP] Removing Docker resources from failed mission…",
+            "\n  [CLEANUP] Removing Docker resources from failed mission\u2026",
           ),
         );
         try {
@@ -645,13 +734,12 @@ export async function runAgentLoop(mission, target, config, options = {}) {
   const finalState = outcome === "PASS" ? "PASS" : "AGENT_FAIL";
   const transcriptText = lines.join("\n");
 
-  // Persist transcript as a standalone file for /transcript inspection
   const transcriptPath = await persistTranscript(
     transcriptText,
     missionId,
   ).catch(() => null);
 
-  // Also save a copy under docs/logs/ for development analysis
+  // Save log under docs/logs/ for development analysis
   try {
     const { fileURLToPath } = await import("node:url");
     const { dirname: dn } = await import("node:path");
@@ -675,10 +763,9 @@ export async function runAgentLoop(mission, target, config, options = {}) {
     ].join("\n");
     await writeFile(join(logsDir, logName), header + transcriptText, "utf8");
   } catch {
-    // Non-critical — don't fail the mission for a log write error
+    // Non-critical
   }
 
-  // Record preserved workspace for /artifacts discovery
   if (preserveWorkspace && workspace) {
     await recordPreservedWorkspace(workspace, {
       mission_id: missionId,
@@ -702,7 +789,6 @@ export async function runAgentLoop(mission, target, config, options = {}) {
     transcript_path: transcriptPath,
   };
 
-  // Compact long sessions before persisting to session.json
   const snapshot =
     completedTurns > 10 ? compactSessionSnapshot(rawSnapshot) : rawSnapshot;
 
@@ -730,6 +816,8 @@ export async function runAgentLoop(mission, target, config, options = {}) {
     transcript: transcriptText,
     transcriptPath,
     elapsedMs: Date.now() - missionStartTime,
+    totalUsage,
+    doneResult,
   };
 }
 
@@ -772,15 +860,6 @@ function makeFailResult(state, iterations, lines, reason = "") {
 
 // ── Result printer ────────────────────────────────────────────────────────────
 
-/**
- * Print a human-readable summary of a runAgentLoop result.
- * Signature matches printLoopResult so callers can use either interchangeably.
- */
-/**
- * Highlight URLs in text so terminals render them as ctrl+clickable links.
- * Uses OSC 8 hyperlink escapes supported by iTerm2, VS Code, Hyper, etc.
- * Falls back to underlined cyan text for terminals without OSC 8 support.
- */
 function highlightUrls(text) {
   return text.replace(
     /https?:\/\/[^\s,)>"']+/g,
@@ -789,7 +868,7 @@ function highlightUrls(text) {
 }
 
 export function printAgentLoopResult(result) {
-  const divider = pc.dim("─".repeat(60));
+  const divider = pc.dim("\u2500".repeat(60));
   console.log(`\n${divider}`);
   console.log(pc.bold("\n  [RESULT]"));
 
@@ -806,7 +885,6 @@ export function printAgentLoopResult(result) {
   console.log(`  Turns:       ${result.iterations}`);
 
   if (result.summary) {
-    // Highlight URLs in summary so they are ctrl+clickable in the terminal
     console.log(`  Summary:     ${highlightUrls(result.summary)}`);
   }
 

@@ -147,6 +147,36 @@ export function isRiskyCommand(cmd) {
   );
 }
 
+// ── Injection pattern detection ──────────────────────────────────────────────
+// Detect shell metacharacters that could be used for command injection
+// via prompt injection from malicious repos. These patterns are suspicious
+// when produced by an LLM that should be running simple build/test commands.
+const INJECTION_PATTERNS = [
+  /curl\s.*\|\s*(?:bash|sh|zsh)/, // curl piped to shell
+  /wget\s.*\|\s*(?:bash|sh|zsh)/, // wget piped to shell
+  /\beval\s/, // eval command
+  />\s*\/etc\//, // writing to /etc/
+  />\s*~\/\.\w+rc\b/, // writing to shell rc files
+  /\bchmod\s+[0-7]*[67][0-7]*\s/, // making files world-writable
+  /\bnc\s+-[le]/, // netcat listeners
+  /\/dev\/tcp\//, // bash tcp redirects
+  /\bbase64\s+-d\b.*\|/, // base64 decode piped to execution
+];
+
+/**
+ * Check if a command contains suspicious injection patterns.
+ * Returns a warning string if suspicious, null if clean.
+ */
+export function detectInjectionPattern(cmd) {
+  const trimmed = (cmd ?? "").trim();
+  for (const pattern of INJECTION_PATTERNS) {
+    if (pattern.test(trimmed)) {
+      return `Suspicious command pattern detected: ${pattern.source}`;
+    }
+  }
+  return null;
+}
+
 // ── Shell helper ───────────────────────────────────────────────────────────────
 
 async function safeExec(cmd, workdir, timeout = EXEC_TIMEOUT) {
@@ -222,6 +252,13 @@ export const TOOL_REGISTRY = {
     riskyByDefault: false, // evaluated per-command via isRiskyCommand
     handler: async (args, context) => {
       const cmd = args.cmd ?? "";
+      // Log injection pattern warnings (command still runs — approval gate handles blocking)
+      const injectionWarning = detectInjectionPattern(cmd);
+      if (injectionWarning) {
+        context.log?.(
+          pc.yellow(`  [SECURITY] ${injectionWarning}: ${cmd.slice(0, 80)}`),
+        );
+      }
       const workdir = args.workdir ? resolve(args.workdir) : context.workspace;
       const result = await safeExecStreaming(
         cmd,
@@ -466,15 +503,28 @@ export const TOOL_REGISTRY = {
 
   done: {
     description:
-      "Declare the mission complete. " +
-      "Only call this after you have verified the user's stated goal is satisfied. " +
-      "Set outcome to PASS if the goal was achieved, FAIL if it could not be.",
-    argsSchema: '{ summary: string, outcome: "PASS"|"FAIL" }',
+      "Declare the mission complete. ALWAYS provide a detailed summary. " +
+      "Set outcome to PASS if the goal was achieved, FAIL if it could not be, " +
+      "PARTIAL if some steps succeeded but the goal is not fully met. " +
+      "Include files_modified (list of changed file paths), " +
+      "errors_encountered (list of error descriptions if any), " +
+      "and next_steps (suggestions if FAIL/PARTIAL).",
+    argsSchema:
+      '{ summary: string, outcome: "PASS"|"FAIL"|"PARTIAL", ' +
+      "files_modified?: string[], errors_encountered?: string[], next_steps?: string[] }",
     riskyByDefault: false,
     handler: async (args) => {
       return {
         summary: args.summary ?? "Mission complete.",
-        outcome: args.outcome === "FAIL" ? "FAIL" : "PASS",
+        outcome:
+          args.outcome === "FAIL"
+            ? "FAIL"
+            : args.outcome === "PARTIAL"
+              ? "PARTIAL"
+              : "PASS",
+        files_modified: args.files_modified ?? [],
+        errors_encountered: args.errors_encountered ?? [],
+        next_steps: args.next_steps ?? [],
       };
     },
   },
@@ -500,6 +550,10 @@ export function isToolRisky(toolName, args = {}) {
   const tool = TOOL_REGISTRY[toolName];
   if (!tool) return false;
   if (tool.riskyByDefault) return true;
-  if (toolName === "exec_command") return isRiskyCommand(args.cmd ?? "");
+  if (toolName === "exec_command") {
+    const cmd = args.cmd ?? "";
+    if (isRiskyCommand(cmd)) return true;
+    if (detectInjectionPattern(cmd)) return true;
+  }
   return false;
 }

@@ -121,27 +121,13 @@ When the target is a GitHub/GitLab URL:
 - **PATH issues**: Commands not found? Check `which <cmd>` or `echo $PATH`.
 - **Version conflicts**: Check installed versions with `--version` flags before assuming compatibility.
 
-## Available Tools
+## Tool Usage
 
-{tools_section}
+Tools are provided natively through the API. Use them directly — do not wrap
+tool calls in JSON or markdown. Explain your reasoning briefly in text before
+each tool call.
 
-## Output Format
-
-At every step, respond **only** with a JSON object — no prose, no markdown outside the JSON block:
-
-```json
-{
-  "reasoning": "Brief explanation of what you are doing and why",
-  "tool": "tool_name",
-  "args": { ... }
-}
-```
-
-- One tool call per response.
-- `reasoning` should be one or two sentences max.
 - Call `done` only after you have **verified** the goal is satisfied.
-- When calling `done`, set `outcome` to `"PASS"` if the goal was achieved, `"FAIL"` if it could not be achieved after exhausting reasonable attempts.
-
-## Execution History
-
-{history}
+- Set `outcome` to `"PASS"` if the goal was achieved, `"FAIL"` if it could not
+  be achieved after exhausting reasonable attempts, `"PARTIAL"` if some steps
+  succeeded.

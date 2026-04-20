@@ -221,9 +221,6 @@ impl<'a> BottomPane<'a> {
             .map(|t| (t.elapsed().as_millis() / 80) as usize)
             .unwrap_or(self.app.spinner_frame);
         let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
-        let elapsed = self.app.spinner_started
-            .map(|t| format!("({:.1}s)", t.elapsed().as_secs_f64()))
-            .unwrap_or_default();
 
         // Use agent phase as display label when available
         let phase = &self.app.agent_phase;
@@ -244,23 +241,58 @@ impl<'a> BottomPane<'a> {
             let rat_color = crossterm_to_ratatui_color(*color);
             spans.push(Span::styled(ch.to_string(), Style::default().fg(rat_color)));
         }
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(elapsed, DIM));
 
-        // Add interrupt hint
+        // Tool display (e.g., "Executing: $ docker build .")
+        if phase == &crate::app::AgentPhase::Executing {
+            if let Some(ref detail) = self.app.agent_phase_detail {
+                let truncated: String = detail.chars().take(40).collect();
+                spans.push(Span::styled(format!(": {truncated}"), DIM));
+            }
+        }
+
+        // Turn counter (e.g., "[turn 3/20]")
+        if self.app.agent_turn > 0 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("[turn {}/{}]", self.app.agent_turn, self.app.agent_max_turns),
+                DIM,
+            ));
+        }
+
+        // Model name (from banner)
+        if let Some(ref banner) = self.app.banner {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(banner.model.clone(), DIM));
+        }
+
+        // Mission elapsed time
+        if let Some(started) = self.app.mission_started {
+            let secs = started.elapsed().as_secs();
+            let display = if secs >= 60 {
+                format!("{}m {}s", secs / 60, secs % 60)
+            } else {
+                format!("{secs}s")
+            };
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(display, DIM));
+        }
+
+        // Interrupt hint
         spans.push(Span::styled(" \u{2022} ", DIM));
         spans.push(Span::styled("esc to interrupt", DIM));
 
         lines.push(Line::from(spans));
 
-        // Phase detail line (tool name, context)
-        if let Some(ref detail) = self.app.agent_phase_detail {
-            let truncated: String = detail.chars().take(60).collect();
-            lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled("\u{2514} ", DIM),
-                Span::styled(truncated, DIM),
-            ]));
+        // Phase detail line (only for non-Executing phases — Executing shows detail inline)
+        if phase != &crate::app::AgentPhase::Executing {
+            if let Some(ref detail) = self.app.agent_phase_detail {
+                let truncated: String = detail.chars().take(60).collect();
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("\u{2514} ", DIM),
+                    Span::styled(truncated, DIM),
+                ]));
+            }
         }
     }
 
@@ -299,28 +331,52 @@ impl<'a> BottomPane<'a> {
             }
         };
 
-        // Right-side context info: prompt tokens from last API call, right-aligned.
-        // Shows current context window usage (not cumulative total).
-        // Only shown in Normal / Pager modes (not during popups or approval).
-        let right_text: String = match self.app.mode {
+        // Right-side: context budget display with usage bar.
+        // Shows prompt tokens / context window with a visual budget indicator.
+        let right_spans: Vec<Span<'static>> = match self.app.mode {
             InputMode::Normal | InputMode::Pager if self.app.context_tokens > 0 => {
-                format!("{}  ", format_tokens(self.app.context_tokens))
+                let ctx = self.app.context_tokens;
+                let cw = self.app.context_window;
+                if cw > 0 {
+                    let pct = (ctx as f64 / cw as f64 * 100.0).min(100.0);
+                    let bar_width: usize = 8;
+                    let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+                    let empty = bar_width.saturating_sub(filled);
+                    let bar_color = if pct > 80.0 {
+                        Style::default().fg(Color::Red)
+                    } else if pct > 60.0 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Green)
+                    };
+                    vec![
+                        Span::styled(
+                            format!("{}/{} ", format_tokens(ctx), format_tokens(cw)),
+                            DIM,
+                        ),
+                        Span::styled("\u{2588}".repeat(filled), bar_color),
+                        Span::styled("\u{2591}".repeat(empty), DIM),
+                        Span::styled("  ", DIM),
+                    ]
+                } else {
+                    vec![Span::styled(format!("{}  ", format_tokens(ctx)), DIM)]
+                }
             }
-            _ => String::new(),
+            _ => Vec::new(),
         };
 
-        // Compute padding so right text is right-aligned.
         let total_width = self.app.chat.width() as usize;
         let left_len = left_text.len();
-        let right_len = right_text.len();
+        let right_len: usize = right_spans.iter().map(|s| s.content.len()).sum();
 
         if right_len > 0 && left_len + right_len + 2 < total_width {
             let pad = total_width.saturating_sub(left_len + right_len);
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(left_text, DIM),
                 Span::raw(" ".repeat(pad)),
-                Span::styled(right_text, DIM),
-            ]));
+            ];
+            spans.extend(right_spans);
+            lines.push(Line::from(spans));
         } else {
             lines.push(Line::from(Span::styled(left_text, DIM)));
         }

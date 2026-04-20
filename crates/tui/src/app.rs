@@ -64,6 +64,12 @@ pub struct App {
     pub agent_phase: AgentPhase,
     /// Detail text for the status indicator (e.g., tool name, file path).
     pub agent_phase_detail: Option<String>,
+    /// Current turn number in the agent loop.
+    pub agent_turn: u32,
+    /// Maximum turns allowed.
+    pub agent_max_turns: u32,
+    /// Mission start time (for elapsed display).
+    pub mission_started: Option<std::time::Instant>,
     pub should_quit: bool,
     pub last_submitted: String,
     pub kill_buffer: String,
@@ -102,6 +108,8 @@ pub struct App {
     pub last_tokens: u64,
     /// Prompt tokens from most recent API call (= current context window usage).
     pub context_tokens: u64,
+    /// Model context window size (from token_usage messages).
+    pub context_window: u64,
     /// Terminal capabilities (detected once at startup).
     pub terminal_caps: TerminalCaps,
     /// Session log entries (JSONL recording).
@@ -146,6 +154,9 @@ impl App {
             spinner_frame: 0,
             agent_phase: AgentPhase::Idle,
             agent_phase_detail: None,
+            agent_turn: 0,
+            agent_max_turns: 20,
+            mission_started: None,
             spinner_started: None,
             should_quit: false,
             last_submitted: String::new(),
@@ -168,6 +179,7 @@ impl App {
             total_tokens: 0,
             last_tokens: 0,
             context_tokens: 0,
+            context_window: 0,
             terminal_caps: crate::terminal_detect::detect(),
             session_log: Vec::new(),
             session_logging: std::env::var("DECIPHER_TUI_RECORD_SESSION").is_ok(),
@@ -196,6 +208,8 @@ impl App {
                 self.agent_busy = true;
                 self.agent_phase = AgentPhase::Thinking;
                 self.agent_phase_detail = None;
+                self.agent_turn = 0;
+                self.mission_started = Some(std::time::Instant::now());
             }
             ServerMessage::Clarification { .. } => {
                 self.agent_busy = false;
@@ -219,12 +233,20 @@ impl App {
                 }
             }
             ServerMessage::ExecOutputDelta { .. } => {}
+            ServerMessage::AgentStatus { turn, max_turns, tool_name, .. } => {
+                self.agent_turn = turn;
+                self.agent_max_turns = max_turns;
+                if let Some(name) = tool_name {
+                    self.agent_phase_detail = Some(name);
+                }
+            }
             ServerMessage::MissionComplete { .. } => {
                 self.agent_busy = false;
                 self.spinner_label = None;
                 self.spinner_started = None;
                 self.agent_phase = AgentPhase::Idle;
                 self.agent_phase_detail = None;
+                self.mission_started = None;
             }
             ServerMessage::Error { .. } => {
                 self.agent_busy = false;
@@ -247,12 +269,14 @@ impl App {
             ServerMessage::CommandList { commands } => { self.commands = commands; }
             ServerMessage::ToolCall { .. } => {}
             ServerMessage::ToolCallResult { .. } => {}
-            ServerMessage::TokenUsage { prompt_tokens, completion_tokens, total_tokens } => {
+            ServerMessage::TokenUsage { prompt_tokens, completion_tokens, total_tokens, context_window } => {
                 self.last_tokens = total_tokens;
-                self.total_tokens += total_tokens;
-                // Track context usage (prompt tokens = tokens sent to model this turn).
+                self.total_tokens = total_tokens;
                 self.context_tokens = prompt_tokens;
-                let _ = completion_tokens; // used only for debugging
+                if let Some(cw) = context_window {
+                    self.context_window = cw;
+                }
+                let _ = completion_tokens;
             }
         }
         self.scroll_offset = 0;

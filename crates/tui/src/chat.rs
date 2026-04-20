@@ -207,7 +207,7 @@ impl ChatWidget {
                 lines
             }
 
-            ServerMessage::ToolStart { tool, reasoning } => {
+            ServerMessage::ToolStart { tool, reasoning, args } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
 
@@ -216,17 +216,21 @@ impl ChatWidget {
                 if is_exploring {
                     if let Some(ref mut cell) = self.active_cell {
                         if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
-                            exec_cell.add_call(tool.clone(), reasoning.clone());
+                            exec_cell.add_call(tool.clone(), reasoning.clone(), args.clone());
                             self.active_cell_revision += 1;
-                            // Render the new call line for scrollback
+                            // Render the new call using rich display
                             let new_call = exec_cell.calls.last().unwrap();
-                            let r: String = new_call.output.as_deref().unwrap_or("").chars().take(60).collect();
+                            let display = format_tool_display(
+                                &new_call.tool,
+                                new_call.args.as_ref(),
+                                new_call.output.as_deref().unwrap_or(""),
+                            );
                             lines.push(Line::from(vec![
                                 ratatui::text::Span::raw("  "),
                                 ratatui::text::Span::styled("\u{2847}", ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)),
                                 ratatui::text::Span::raw(" "),
                                 ratatui::text::Span::styled(
-                                    format!("{} \u{2014} {}", new_call.tool, r),
+                                    display,
                                     ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
                                 ),
                             ]));
@@ -237,36 +241,79 @@ impl ChatWidget {
 
                 // Non-exploring or no active ExecCell: flush and create new
                 self.flush_active_cell_internal();
-                let cell = ExecCell::new(tool.clone(), reasoning.clone());
+                let cell = ExecCell::new(tool.clone(), reasoning.clone(), args.clone());
                 lines.extend(cell.display_lines(w));
                 self.active_cell = Some(Box::new(cell));
                 self.active_cell_revision += 1;
                 lines
             }
 
-            ServerMessage::ToolResult { tool, success, summary, elapsed_ms } => {
+            ServerMessage::ToolResult { tool, success, summary, elapsed_ms, exit_code, output_preview, output_lines_total } => {
                 let mut lines = Vec::new();
                 if let Some(ref mut cell) = self.active_cell {
                     if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
-                        exec_cell.complete_call(tool, *success, summary.clone(), *elapsed_ms);
+                        exec_cell.complete_call(
+                            tool, *success, summary.clone(), *elapsed_ms,
+                            *exit_code, output_preview.clone(), *output_lines_total,
+                        );
+                        // Clear streaming output after tool completes
+                        exec_cell.streaming_output.clear();
                         self.active_cell_revision += 1;
 
-                        // Render the completed call for scrollback
-                        let icon = if *success {
-                            ratatui::text::Span::styled("\u{2713}", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
-                        } else {
-                            ratatui::text::Span::styled("\u{2717}", ratatui::style::Style::default().fg(ratatui::style::Color::Red))
-                        };
-                        let s = *elapsed_ms as f64 / 1000.0;
-                        lines.push(Line::from(vec![
-                            ratatui::text::Span::raw("  "),
-                            icon,
-                            ratatui::text::Span::raw(format!(" {} \u{2014} {} ", tool, summary)),
-                            ratatui::text::Span::styled(
-                                format!("({s:.1}s)"),
-                                ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
-                            ),
-                        ]));
+                        // Find the completed call for rich scrollback rendering
+                        let completed_call = exec_cell.calls.iter().rev()
+                            .find(|c| c.tool == *tool && c.success.is_some());
+                        if let Some(call) = completed_call {
+                            let display = format_tool_display(
+                                &call.tool,
+                                call.args.as_ref(),
+                                call.output.as_deref().unwrap_or(""),
+                            );
+                            let icon = if *success {
+                                ratatui::text::Span::styled("\u{2713}", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
+                            } else {
+                                ratatui::text::Span::styled("\u{2717}", ratatui::style::Style::default().fg(ratatui::style::Color::Red))
+                            };
+                            let s = *elapsed_ms as f64 / 1000.0;
+                            let exit_info = if !success {
+                                exit_code.map(|c| format!(" [exit {c}]")).unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            lines.push(Line::from(vec![
+                                ratatui::text::Span::raw("  "),
+                                icon,
+                                ratatui::text::Span::raw(format!(" {display}{exit_info} ")),
+                                ratatui::text::Span::styled(
+                                    format!("({s:.1}s)"),
+                                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                                ),
+                            ]));
+                            // Show error output preview for failed commands
+                            if !success {
+                                if let Some(ref preview) = output_preview {
+                                    let preview_lines: Vec<&str> = preview.lines().collect();
+                                    let show = preview_lines.len().min(5);
+                                    let start = preview_lines.len().saturating_sub(show);
+                                    for (i, line_text) in preview_lines[start..].iter().enumerate() {
+                                        let is_last = i == show - 1;
+                                        let pfx = if is_last { "\u{2514}" } else { "\u{2502}" };
+                                        let truncated: String = line_text.chars().take(100).collect();
+                                        lines.push(Line::from(vec![
+                                            ratatui::text::Span::raw("    "),
+                                            ratatui::text::Span::styled(
+                                                format!("{pfx} "),
+                                                ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                                            ),
+                                            ratatui::text::Span::styled(
+                                                truncated,
+                                                ratatui::style::Style::default().fg(ratatui::style::Color::Red).add_modifier(ratatui::style::Modifier::DIM),
+                                            ),
+                                        ]));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -302,11 +349,17 @@ impl ChatWidget {
                 self.push_delta(delta)
             }
 
-            ServerMessage::MissionComplete { outcome, summary, turns, elapsed_ms, .. } => {
+            ServerMessage::MissionComplete {
+                outcome, summary, turns, elapsed_ms,
+                files_modified, errors_encountered, next_steps, ..
+            } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
                 self.flush_active_cell_internal();
-                let cell = ResultCell::new(outcome.clone(), summary.clone(), *turns, *elapsed_ms);
+                let cell = ResultCell::new(
+                    outcome.clone(), summary.clone(), *turns, *elapsed_ms,
+                    files_modified.clone(), errors_encountered.clone(), next_steps.clone(),
+                );
                 lines.extend(cell.display_lines(w));
                 self.committed_cells.push(Box::new(cell));
                 lines
@@ -326,19 +379,20 @@ impl ChatWidget {
             ServerMessage::ToolCall { name, input, .. } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
-                // Coalesce into existing ExecCell if possible, else create new
+                // Try to parse input as JSON args for rich display
+                let args = serde_json::from_str::<serde_json::Value>(input).ok();
                 let is_exploring = matches!(name.as_str(), "read_file" | "list_files" | "search");
                 if is_exploring {
                     if let Some(ref mut cell) = self.active_cell {
                         if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
-                            exec_cell.add_call(name.clone(), input.chars().take(80).collect());
+                            exec_cell.add_call(name.clone(), input.chars().take(80).collect(), args);
                             self.active_cell_revision += 1;
                             return lines;
                         }
                     }
                 }
                 self.flush_active_cell_internal();
-                let cell = ExecCell::new(name.clone(), input.chars().take(80).collect());
+                let cell = ExecCell::new(name.clone(), input.chars().take(80).collect(), args);
                 lines.extend(cell.display_lines(w));
                 self.active_cell = Some(Box::new(cell));
                 self.active_cell_revision += 1;
@@ -350,18 +404,25 @@ impl ChatWidget {
                 if let Some(ref mut cell) = self.active_cell {
                     if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
                         let summary: String = output.chars().take(100).collect();
-                        exec_cell.complete_call(name, *success, summary.clone(), 0);
+                        exec_cell.complete_call(name, *success, summary.clone(), 0, None, None, None);
                         self.active_cell_revision += 1;
-                        let icon = if *success {
-                            ratatui::text::Span::styled("\u{2713}", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
-                        } else {
-                            ratatui::text::Span::styled("\u{2717}", ratatui::style::Style::default().fg(ratatui::style::Color::Red))
-                        };
-                        lines.push(Line::from(vec![
-                            ratatui::text::Span::raw("  "),
-                            icon,
-                            ratatui::text::Span::raw(format!(" {} \u{2014} {}", name, summary)),
-                        ]));
+                        let completed_call = exec_cell.calls.iter().rev()
+                            .find(|c| c.tool == *name && c.success.is_some());
+                        if let Some(call) = completed_call {
+                            let display = format_tool_display(
+                                &call.tool, call.args.as_ref(), call.output.as_deref().unwrap_or(""),
+                            );
+                            let icon = if *success {
+                                ratatui::text::Span::styled("\u{2713}", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
+                            } else {
+                                ratatui::text::Span::styled("\u{2717}", ratatui::style::Style::default().fg(ratatui::style::Color::Red))
+                            };
+                            lines.push(Line::from(vec![
+                                ratatui::text::Span::raw("  "),
+                                icon,
+                                ratatui::text::Span::raw(format!(" {display} ")),
+                            ]));
+                        }
                     }
                 }
                 let all_done = self.active_cell.as_ref().map_or(false, |c| {
@@ -392,6 +453,7 @@ impl ChatWidget {
             ServerMessage::Spinner { .. } => Vec::new(),
             ServerMessage::CommandList { .. } => Vec::new(),
             ServerMessage::TokenUsage { .. } => Vec::new(),
+            ServerMessage::AgentStatus { .. } => Vec::new(),
         }
     }
 
@@ -449,6 +511,7 @@ mod tests {
         let msg = ServerMessage::ToolStart {
             tool: "exec_command".into(),
             reasoning: "running tests".into(),
+            args: Some(serde_json::json!({"cmd": "npm test"})),
         };
         let lines = widget.handle_server_message(&msg);
         assert!(!lines.is_empty()); // renders tool start line
@@ -461,12 +524,16 @@ mod tests {
         widget.handle_server_message(&ServerMessage::ToolStart {
             tool: "git".into(),
             reasoning: "clone".into(),
+            args: None,
         });
         let lines = widget.handle_server_message(&ServerMessage::ToolResult {
             tool: "git".into(),
             success: true,
             summary: "cloned".into(),
             elapsed_ms: 2000,
+            exit_code: None,
+            output_preview: None,
+            output_lines_total: None,
         });
         assert!(!lines.is_empty());
         assert_eq!(widget.committed_cells.len(), 1);
@@ -528,6 +595,7 @@ mod tests {
         widget.handle_server_message(&ServerMessage::ToolStart {
             tool: "read_file".into(),
             reasoning: "package.json".into(),
+            args: Some(serde_json::json!({"path": "package.json"})),
         });
         assert!(widget.active_cell.is_some());
 
@@ -535,6 +603,7 @@ mod tests {
         widget.handle_server_message(&ServerMessage::ToolStart {
             tool: "read_file".into(),
             reasoning: "Dockerfile".into(),
+            args: Some(serde_json::json!({"path": "Dockerfile"})),
         });
         // Still one active cell with 2 calls
         let exec = widget.active_cell.as_ref().unwrap()

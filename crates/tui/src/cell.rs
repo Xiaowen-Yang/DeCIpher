@@ -169,6 +169,14 @@ pub struct ExecCall {
     pub elapsed_ms: Option<u64>,
     pub success: Option<bool>,
     pub call_id: Option<String>,
+    /// Parsed args for display (e.g., command string, file path).
+    pub args: Option<serde_json::Value>,
+    /// Process exit code (exec_command only).
+    pub exit_code: Option<i32>,
+    /// First few lines of output for preview.
+    pub output_preview: Option<String>,
+    /// Total output lines.
+    pub output_lines_total: Option<u32>,
 }
 
 /// Tool execution cell — may coalesce multiple read-only calls.
@@ -183,7 +191,7 @@ pub struct ExecCell {
 const EXEC_OUTPUT_PREVIEW_LINES: usize = 5;
 
 impl ExecCell {
-    pub fn new(tool: String, reasoning: String) -> Self {
+    pub fn new(tool: String, reasoning: String, args: Option<serde_json::Value>) -> Self {
         Self {
             calls: vec![ExecCall {
                 tool,
@@ -191,6 +199,10 @@ impl ExecCell {
                 elapsed_ms: None,
                 success: None,
                 call_id: None,
+                args,
+                exit_code: None,
+                output_preview: None,
+                output_lines_total: None,
             }],
             streaming_output: String::new(),
         }
@@ -208,24 +220,84 @@ impl ExecCell {
         success: bool,
         summary: String,
         elapsed_ms: u64,
+        exit_code: Option<i32>,
+        output_preview: Option<String>,
+        output_lines_total: Option<u32>,
     ) {
         // Find the last call matching this tool that isn't yet completed.
         if let Some(call) = self.calls.iter_mut().rev().find(|c| c.tool == tool && c.success.is_none()) {
             call.success = Some(success);
             call.output = Some(summary);
             call.elapsed_ms = Some(elapsed_ms);
+            call.exit_code = exit_code;
+            call.output_preview = output_preview;
+            call.output_lines_total = output_lines_total;
         }
     }
 
     /// Add another tool call (coalescing).
-    pub fn add_call(&mut self, tool: String, reasoning: String) {
+    pub fn add_call(&mut self, tool: String, reasoning: String, args: Option<serde_json::Value>) {
         self.calls.push(ExecCall {
             tool,
             output: Some(reasoning),
             elapsed_ms: None,
             success: None,
             call_id: None,
+            args,
+            exit_code: None,
+            output_preview: None,
+            output_lines_total: None,
         });
+    }
+}
+
+/// Format a tool call for display based on tool type.
+/// Returns a display string like `$ docker build .` or `Read: src/main.rs`
+pub fn format_tool_display(tool: &str, args: Option<&serde_json::Value>, reasoning: &str) -> String {
+    match tool {
+        "exec_command" => {
+            if let Some(cmd) = args.and_then(|a| a.get("cmd")).and_then(|v| v.as_str()) {
+                let truncated: String = cmd.chars().take(120).collect();
+                format!("$ {truncated}")
+            } else {
+                let r: String = reasoning.chars().take(80).collect();
+                format!("$ {r}")
+            }
+        }
+        "read_file" => {
+            if let Some(path) = args.and_then(|a| a.get("path")).and_then(|v| v.as_str()) {
+                format!("Read: {path}")
+            } else {
+                let r: String = reasoning.chars().take(80).collect();
+                format!("Read: {r}")
+            }
+        }
+        "write_file" => {
+            if let Some(path) = args.and_then(|a| a.get("path")).and_then(|v| v.as_str()) {
+                format!("Write: {path}")
+            } else {
+                let r: String = reasoning.chars().take(80).collect();
+                format!("Write: {r}")
+            }
+        }
+        "apply_patch" => {
+            if let Some(path) = args.and_then(|a| a.get("target_file")).and_then(|v| v.as_str()) {
+                format!("Patch: {path}")
+            } else {
+                "Patch: (unified diff)".to_string()
+            }
+        }
+        "update_plan" => "Update plan".to_string(),
+        "done" => "Done".to_string(),
+        _ => {
+            // kubectl_get, kubectl_logs, etc. — show as $ command
+            if let Some(cmd) = args.and_then(|a| a.get("command")).and_then(|v| v.as_str()) {
+                format!("$ {cmd}")
+            } else {
+                let r: String = reasoning.chars().take(60).collect();
+                format!("{tool} \u{2014} {r}")
+            }
+        }
     }
 }
 
@@ -236,33 +308,111 @@ impl Cell for ExecCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for call in &self.calls {
+            let display = format_tool_display(
+                &call.tool,
+                call.args.as_ref(),
+                call.output.as_deref().unwrap_or(""),
+            );
+            // Read-only tools get dimmed styling for lower noise
+            let is_read_only = matches!(
+                call.tool.as_str(),
+                "read_file" | "kubectl_get" | "kubectl_logs" | "kubectl_describe" | "kubectl_events"
+            );
+
             match call.success {
                 None => {
-                    // In-progress: show spinner icon
-                    let r: String = call.output.as_deref().unwrap_or("").chars().take(60).collect();
+                    // In-progress: show spinner icon + tool display
                     lines.push(Line::from(vec![
                         Span::raw("  "),
                         Span::styled("\u{2847}", CYAN),
                         Span::raw(" "),
-                        Span::styled(format!("{} \u{2014} {}", call.tool, r), DIM),
+                        Span::styled(display, DIM),
                     ]));
                 }
                 Some(success) => {
                     let icon = if success {
-                        Span::styled("\u{2713}", GREEN)
+                        Span::styled("\u{2713}", if is_read_only { DIM } else { GREEN })
                     } else {
                         Span::styled("\u{2717}", RED)
                     };
-                    let summary = call.output.as_deref().unwrap_or("");
                     let elapsed = call.elapsed_ms
                         .map(|ms| format!(" ({:.1}s)", ms as f64 / 1000.0))
                         .unwrap_or_default();
+                    let exit_info = if !success {
+                        call.exit_code.map(|c| format!(" [exit {}]", c)).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let text_style = if is_read_only && success { DIM } else { Style::default() };
                     lines.push(Line::from(vec![
                         Span::raw("  "),
                         icon,
-                        Span::raw(format!(" {} \u{2014} {} ", call.tool, summary)),
+                        Span::styled(format!(" {display}{exit_info} "), text_style),
                         Span::styled(elapsed, DIM),
                     ]));
+
+                    // Show output preview: error output for failures, elided summary for long successful output
+                    if let Some(ref preview) = call.output_preview {
+                        let preview_lines: Vec<&str> = preview.lines().collect();
+                        let total_lines = call.output_lines_total.unwrap_or(preview_lines.len() as u32);
+                        let style = if success {
+                            DIM // dimmed for successful output
+                        } else {
+                            Style::new().fg(Color::Red).add_modifier(Modifier::DIM)
+                        };
+
+                        if !success {
+                            // Error: show last few lines
+                            let show = preview_lines.len().min(5);
+                            let start = preview_lines.len().saturating_sub(show);
+                            for (i, line_text) in preview_lines[start..].iter().enumerate() {
+                                let is_last = i == show - 1;
+                                let prefix = if is_last { "\u{2514}" } else { "\u{2502}" };
+                                let truncated: String = line_text.chars().take(100).collect();
+                                lines.push(Line::from(vec![
+                                    Span::raw("    "),
+                                    Span::styled(format!("{prefix} "), DIM),
+                                    Span::styled(truncated, style),
+                                ]));
+                            }
+                        } else if total_lines > 8 {
+                            // Success with long output: show head(3) + ... + tail(2)
+                            let head: Vec<&str> = preview_lines.iter().take(3).copied().collect();
+                            let tail: Vec<&str> = preview_lines.iter().rev().take(2).rev().copied().collect();
+                            for line_text in &head {
+                                let truncated: String = line_text.chars().take(100).collect();
+                                lines.push(Line::from(vec![
+                                    Span::raw("    "),
+                                    Span::styled("\u{2502} ", DIM),
+                                    Span::styled(truncated, style),
+                                ]));
+                            }
+                            let hidden = total_lines.saturating_sub(5);
+                            lines.push(Line::from(vec![
+                                Span::raw("    "),
+                                Span::styled(format!("\u{2502} \u{2026} ({hidden} lines hidden)"), DIM),
+                            ]));
+                            for (i, line_text) in tail.iter().enumerate() {
+                                let is_last = i == tail.len() - 1;
+                                let prefix = if is_last { "\u{2514}" } else { "\u{2502}" };
+                                let truncated: String = line_text.chars().take(100).collect();
+                                lines.push(Line::from(vec![
+                                    Span::raw("    "),
+                                    Span::styled(format!("{prefix} "), DIM),
+                                    Span::styled(truncated, style),
+                                ]));
+                            }
+                        }
+
+                        if total_lines > 8 || !success {
+                            if total_lines > 5 && !success {
+                                lines.push(Line::from(vec![
+                                    Span::raw("    "),
+                                    Span::styled(format!("  ({total_lines} lines total)"), DIM),
+                                ]));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -346,15 +496,46 @@ impl Cell for AgentMessageCell {
 
 // ── ErrorCell ──────────────────────────────────────────────────────────────
 
-/// Error message from the agent.
+/// Error message from the agent — structured with context.
 #[derive(Debug)]
 pub struct ErrorCell {
     pub message: String,
+    /// Error category for display styling.
+    pub category: ErrorCategory,
+    /// Retry info (e.g., "2/3").
+    pub retry_info: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ErrorCategory {
+    /// API error (rate limit, auth, context overflow).
+    Api,
+    /// Tool parse failure (LLM returned invalid JSON).
+    Parse,
+    /// Command execution failure.
+    Execution,
+    /// Generic/unknown error.
+    Generic,
 }
 
 impl ErrorCell {
     pub fn new(message: String) -> Self {
-        Self { message }
+        // Auto-detect error category from message content
+        let category = if message.contains("rate limit") || message.contains("429") || message.contains("API error") {
+            ErrorCategory::Api
+        } else if message.contains("parse") || message.contains("JSON") || message.contains("tool call") {
+            ErrorCategory::Parse
+        } else if message.contains("exit") || message.contains("command") || message.contains("FAILED") {
+            ErrorCategory::Execution
+        } else {
+            ErrorCategory::Generic
+        };
+        Self { message, category, retry_info: None }
+    }
+
+    pub fn with_retry(mut self, retry: String) -> Self {
+        self.retry_info = Some(retry);
+        self
     }
 }
 
@@ -363,29 +544,78 @@ impl Cell for ErrorCell {
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        vec![Line::from(vec![
+        let mut lines = Vec::new();
+
+        // Category label
+        let cat_label = match self.category {
+            ErrorCategory::Api => "API Error",
+            ErrorCategory::Parse => "Parse Error",
+            ErrorCategory::Execution => "Execution Error",
+            ErrorCategory::Generic => "Error",
+        };
+
+        let mut header_spans = vec![
             Span::raw("  "),
-            Span::styled(format!("Error: {}", self.message), RED),
-        ])]
+            Span::styled(format!("{cat_label}: "), RED),
+        ];
+
+        // Retry info if available
+        if let Some(ref retry) = self.retry_info {
+            header_spans.push(Span::styled(format!("[retry {retry}] "), YELLOW));
+        }
+
+        // First line of error message on same line as label
+        let msg_lines: Vec<&str> = self.message.lines().collect();
+        if let Some(first) = msg_lines.first() {
+            let truncated: String = first.chars().take(100).collect();
+            header_spans.push(Span::styled(truncated, Style::new().fg(Color::Red).add_modifier(Modifier::DIM)));
+        }
+        lines.push(Line::from(header_spans));
+
+        // Additional lines indented (up to 5 lines)
+        for line_text in msg_lines.iter().skip(1).take(5) {
+            let truncated: String = line_text.chars().take(100).collect();
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(truncated, Style::new().fg(Color::Red).add_modifier(Modifier::DIM)),
+            ]));
+        }
+        if msg_lines.len() > 6 {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("... ({} more lines)", msg_lines.len() - 6), DIM),
+            ]));
+        }
+
+        lines
     }
 }
 
 // ── ResultCell ─────────────────────────────────────────────────────────────
 
-/// Mission complete result.
+/// Mission complete result — structured with files, errors, and next steps.
 #[derive(Debug)]
 pub struct ResultCell {
     pub outcome: String,
     pub summary: String,
     pub turns: u32,
     pub elapsed_ms: u64,
+    pub files_modified: Vec<String>,
+    pub errors_encountered: Vec<String>,
+    pub next_steps: Vec<String>,
 }
 
 impl ResultCell {
-    pub fn new(outcome: String, summary: String, turns: u32, elapsed_ms: u64) -> Self {
-        Self { outcome, summary, turns, elapsed_ms }
+    pub fn new(
+        outcome: String, summary: String, turns: u32, elapsed_ms: u64,
+        files_modified: Vec<String>, errors_encountered: Vec<String>, next_steps: Vec<String>,
+    ) -> Self {
+        Self { outcome, summary, turns, elapsed_ms, files_modified, errors_encountered, next_steps }
     }
 }
+
+/// Style for the PARTIAL outcome (yellow).
+const PARTIAL_STYLE: Style = Style::new().fg(Color::Rgb(232, 163, 23));
 
 impl Cell for ResultCell {
     fn as_any(&self) -> &dyn Any { self }
@@ -398,18 +628,79 @@ impl Cell for ResultCell {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("\u{2500}".repeat(w), DIM)));
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("  [RESULT]", BOLD)));
-        let outcome_span = if self.outcome == "PASS" {
-            Span::styled(format!("PASS ({secs:.1}s)"), GREEN)
-        } else {
-            Span::styled(format!("FAIL ({secs:.1}s)"), RED)
+
+        // Outcome header with color
+        let (outcome_span, header_style) = match self.outcome.as_str() {
+            "PASS" => (Span::styled(format!("PASS ({secs:.1}s)"), GREEN), GREEN),
+            "PARTIAL" => (Span::styled(format!("PARTIAL ({secs:.1}s)"), PARTIAL_STYLE), PARTIAL_STYLE),
+            _ => (Span::styled(format!("FAIL ({secs:.1}s)"), RED), RED),
         };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("[RESULT]", BOLD),
+        ]));
         lines.push(Line::from(vec![
             Span::raw("  Outcome:     "),
             outcome_span,
         ]));
         lines.push(Line::from(format!("  Turns:       {}", self.turns)));
-        lines.push(Line::from(format!("  Summary:     {}", self.summary)));
+
+        // Summary
+        if !self.summary.is_empty() {
+            lines.push(Line::from(""));
+            for line in self.summary.lines() {
+                lines.push(Line::from(format!("  {line}")));
+            }
+        }
+
+        // Files modified
+        if !self.files_modified.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("Files modified:", DIM),
+            ]));
+            for f in &self.files_modified {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("\u{2022} ", header_style),
+                    Span::styled(f.clone(), CYAN),
+                ]));
+            }
+        }
+
+        // Errors encountered
+        if !self.errors_encountered.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("Errors:", RED),
+            ]));
+            for e in &self.errors_encountered {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("\u{2022} ", RED),
+                    Span::styled(e.clone(), Style::new().fg(Color::Red).add_modifier(Modifier::DIM)),
+                ]));
+            }
+        }
+
+        // Next steps (for FAIL/PARTIAL)
+        if !self.next_steps.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("Next steps:", BOLD),
+            ]));
+            for (i, step) in self.next_steps.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(format!("{}. ", i + 1), DIM),
+                    Span::raw(step.clone()),
+                ]));
+            }
+        }
+
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("\u{2500}".repeat(w), DIM)));
         lines.push(Line::from(""));
@@ -577,18 +868,60 @@ mod tests {
 
     #[test]
     fn exec_cell_complete() {
-        let mut cell = ExecCell::new("git".into(), "clone repo".into());
-        cell.complete_call("git", true, "cloned".into(), 2100);
+        let mut cell = ExecCell::new("git".into(), "clone repo".into(), None);
+        cell.complete_call("git", true, "cloned".into(), 2100, None, None, None);
         let lines = cell.display_lines(80);
         assert_eq!(lines.len(), 1);
     }
 
     #[test]
     fn exec_cell_coalesce() {
-        let mut cell = ExecCell::new("read_file".into(), "package.json".into());
-        cell.add_call("read_file".into(), "Dockerfile".into());
+        let mut cell = ExecCell::new("read_file".into(), "package.json".into(), Some(serde_json::json!({"path": "package.json"})));
+        cell.add_call("read_file".into(), "Dockerfile".into(), Some(serde_json::json!({"path": "Dockerfile"})));
         assert_eq!(cell.calls.len(), 2);
         assert_eq!(cell.desired_height(80), 2);
+    }
+
+    #[test]
+    fn exec_cell_rich_display_command() {
+        let cell = ExecCell::new(
+            "exec_command".into(),
+            "build the project".into(),
+            Some(serde_json::json!({"cmd": "docker build ."})),
+        );
+        let lines = cell.display_lines(80);
+        assert_eq!(lines.len(), 1);
+        // The display should contain "$ docker build ."
+        let line_str: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(line_str.contains("$ docker build ."), "Expected '$ docker build .' in '{line_str}'");
+    }
+
+    #[test]
+    fn exec_cell_rich_display_read() {
+        let cell = ExecCell::new(
+            "read_file".into(),
+            "reading config".into(),
+            Some(serde_json::json!({"path": "src/main.rs"})),
+        );
+        let lines = cell.display_lines(80);
+        let line_str: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(line_str.contains("Read: src/main.rs"), "Expected 'Read: src/main.rs' in '{line_str}'");
+    }
+
+    #[test]
+    fn exec_cell_failed_with_preview() {
+        let mut cell = ExecCell::new(
+            "exec_command".into(),
+            "run tests".into(),
+            Some(serde_json::json!({"cmd": "npm test"})),
+        );
+        cell.complete_call(
+            "exec_command", false, "tests failed".into(), 5000,
+            Some(1), Some("FAIL src/app.test.js\nExpected 5 but got 3".into()), Some(42),
+        );
+        let lines = cell.display_lines(80);
+        // Should have: result line + 2 preview lines
+        assert!(lines.len() >= 3, "Expected >= 3 lines, got {}", lines.len());
     }
 
     #[test]
@@ -599,9 +932,24 @@ mod tests {
 
     #[test]
     fn result_cell_success() {
-        let cell = ResultCell::new("PASS".into(), "All tests pass".into(), 5, 12000);
+        let cell = ResultCell::new("PASS".into(), "All tests pass".into(), 5, 12000, vec![], vec![], vec![]);
         let lines = cell.display_lines(80);
-        assert!(lines.len() >= 6); // empty + rule + empty + header + outcome + turns + summary + empty + rule + empty
+        assert!(lines.len() >= 6);
+    }
+
+    #[test]
+    fn result_cell_fail_with_details() {
+        let cell = ResultCell::new(
+            "FAIL".into(),
+            "Docker build failed".into(),
+            8, 30000,
+            vec!["Dockerfile".into(), "requirements.txt".into()],
+            vec!["pip install failed (exit 1)".into()],
+            vec!["Check Python version".into(), "Update requirements.txt".into()],
+        );
+        let lines = cell.display_lines(80);
+        // Should have: header + outcome + turns + summary + files section + errors section + next steps
+        assert!(lines.len() >= 15, "Expected >= 15 lines, got {}", lines.len());
     }
 
     #[test]
