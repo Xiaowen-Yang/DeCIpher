@@ -5,6 +5,7 @@
 
 use decipher_protocol::{ClientMessage, CommandInfo, ServerMessage};
 use crate::streaming::StreamState;
+use crate::terminal_detect::TerminalCaps;
 
 /// A single entry in the chat history.
 #[derive(Debug, Clone)]
@@ -32,6 +33,8 @@ pub enum InputMode {
     CommandPopup,
     ApprovalPending,
     HistorySearch,
+    Pager,
+    FileSearch,
 }
 
 /// Top-level application state.
@@ -76,6 +79,24 @@ pub struct App {
     pub queued_message: Option<ClientMessage>,
     /// Whether to show the shortcut overlay.
     pub show_shortcuts: bool,
+    /// Pager scroll offset (for Ctrl+T transcript view).
+    pub pager_scroll: usize,
+    /// File search query (@ popup).
+    pub file_search_query: String,
+    /// File search results.
+    pub file_search_results: Vec<crate::file_search::FileResult>,
+    /// File search selection index.
+    pub file_search_index: usize,
+    /// Position of @ in input (for replacement).
+    pub file_search_at_pos: usize,
+    /// Whether to auto-approve all actions for this session.
+    pub always_approve: bool,
+    /// Cumulative token usage for this session.
+    pub total_tokens: u64,
+    /// Tokens from most recent API call.
+    pub last_tokens: u64,
+    /// Terminal capabilities (detected once at startup).
+    pub terminal_caps: TerminalCaps,
     /// Session log entries (JSONL recording).
     pub session_log: Vec<String>,
     /// Whether session logging is enabled (via DECIPHER_TUI_RECORD_SESSION env).
@@ -124,6 +145,15 @@ impl App {
             search_saved_input: String::new(),
             queued_message: None,
             show_shortcuts: false,
+            pager_scroll: 0,
+            file_search_query: String::new(),
+            file_search_results: Vec::new(),
+            file_search_index: 0,
+            file_search_at_pos: 0,
+            always_approve: false,
+            total_tokens: 0,
+            last_tokens: 0,
+            terminal_caps: crate::terminal_detect::detect(),
             session_log: Vec::new(),
             session_logging: std::env::var("DECIPHER_TUI_RECORD_SESSION").is_ok(),
         }
@@ -200,6 +230,10 @@ impl App {
             }
             ServerMessage::AgentMessageDelta { .. } => {}
             ServerMessage::CommandList { commands } => { self.commands = commands; }
+            ServerMessage::TokenUsage { total_tokens, .. } => {
+                self.last_tokens = total_tokens;
+                self.total_tokens += total_tokens;
+            }
         }
         self.scroll_offset = 0;
     }

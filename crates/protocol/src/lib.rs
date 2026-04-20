@@ -104,6 +104,13 @@ pub enum ServerMessage {
 
     #[serde(rename = "command_list")]
     CommandList { commands: Vec<CommandInfo> },
+
+    #[serde(rename = "token_usage")]
+    TokenUsage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -2,28 +2,38 @@
 //!
 //! Spawns the Node.js agent via agent-bridge, sets up the terminal,
 //! and runs the TUI event loop.
+//!
+//! Key design choices (Codex parity):
+//! - crossterm `EventStream` for truly async event reading (no blocking poll)
+//! - 32ms tick rate (~30 FPS) for smooth spinner animation
+//! - Frame rate limiter (120 FPS cap) to prevent redundant redraws
+//! - Biased select: terminal events > server messages > tick
 
 use std::io;
 use std::time::{Duration, Instant};
 
-
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste,
-        EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
+        DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste,
+        EnableFocusChange, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use futures::StreamExt;
 
 use decipher_agent_bridge::AgentBridge;
 use decipher_protocol::{ClientMessage, ServerMessage};
 use decipher_tui::app::{self, App};
 use decipher_tui::render;
 
-const TICK_RATE: Duration = Duration::from_millis(80);
+/// Tick rate: 32ms ≈ 31.25 FPS — smooth spinner animation matching Codex.
+const TICK_RATE: Duration = Duration::from_millis(32);
+
+/// Minimum interval between draws: 120 FPS cap (~8.3ms).
+const MIN_FRAME_INTERVAL: Duration = Duration::from_nanos(8_333_334);
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -61,15 +71,47 @@ async fn main() -> io::Result<()> {
     result
 }
 
+/// Simple frame rate limiter — tracks last draw time, skips if too soon.
+struct FrameRateLimiter {
+    last_draw: Option<Instant>,
+}
+
+impl FrameRateLimiter {
+    fn new() -> Self {
+        Self { last_draw: None }
+    }
+
+    /// Returns true if enough time has passed since the last draw.
+    fn should_draw(&mut self) -> bool {
+        let now = Instant::now();
+        match self.last_draw {
+            Some(last) if now.duration_since(last) < MIN_FRAME_INTERVAL => false,
+            _ => {
+                self.last_draw = Some(now);
+                true
+            }
+        }
+    }
+
+    /// Force mark a draw happened (used when we must draw regardless).
+    fn mark_drawn(&mut self) {
+        self.last_draw = Some(Instant::now());
+    }
+}
+
 async fn run_app(
     stdout: &mut io::Stdout,
     bridge: &mut AgentBridge,
 ) -> io::Result<()> {
     let mut app = App::new();
     let mut need_prompt_redraw = true;
+    let mut fps = FrameRateLimiter::new();
+
+    // Async event stream — no blocking poll, no spawn_blocking overhead.
+    let mut events = EventStream::new();
 
     loop {
-        if need_prompt_redraw {
+        if need_prompt_redraw && fps.should_draw() {
             render::draw_prompt(stdout, &mut app)?;
             need_prompt_redraw = false;
         }
@@ -77,9 +119,10 @@ async fn run_app(
         tokio::select! {
             biased;
 
-            result = poll_terminal_event() => {
-                match result? {
-                    Some(Event::Key(key)) => {
+            // Terminal events — truly async, resolves immediately on event.
+            Some(result) = events.next() => {
+                match result {
+                    Ok(Event::Key(key)) => {
                         if key.kind != KeyEventKind::Press { continue; }
                         let action = handle_key(&mut app, key);
                         match action {
@@ -87,29 +130,33 @@ async fn run_app(
                             KeyAction::Submit(msg) => {
                                 render::clear_prompt(stdout, &mut app)?;
                                 render::print_user_input(stdout, &app.last_submitted)?;
+                                fps.mark_drawn();
                                 need_prompt_redraw = true;
                                 bridge.send(&msg).await?;
                             }
                             KeyAction::None => {}
                         }
                     }
-                    Some(Event::Paste(text)) => {
+                    Ok(Event::Paste(text)) => {
                         app.input.insert_str(app.cursor, &text);
                         app.cursor += text.len();
                         need_prompt_redraw = true;
                     }
-                    Some(Event::Resize(_, _)) => { need_prompt_redraw = true; }
-                    Some(Event::FocusGained) => { app.terminal_focused = true; }
-                    Some(Event::FocusLost) => { app.terminal_focused = false; }
-                    _ => {}
+                    Ok(Event::Resize(_, _)) => { need_prompt_redraw = true; }
+                    Ok(Event::FocusGained) => { app.terminal_focused = true; }
+                    Ok(Event::FocusLost) => { app.terminal_focused = false; }
+                    Ok(_) => {}
+                    Err(_) => { break; }
                 }
             }
 
+            // Server messages from the Node.js agent.
             Some(msg) = bridge.rx.recv() => {
                 match &msg {
                     ServerMessage::AgentMessageDelta { delta } => {
                         app.stream.push(delta);
                         render::commit_delta_lines(stdout, &mut app)?;
+                        fps.mark_drawn();
                         app.handle_server_message(msg);
                     }
                     _ => {
@@ -128,15 +175,19 @@ async fn run_app(
                         }
                         render::clear_prompt(stdout, &mut app)?;
                         render::print_server_message(stdout, &msg, &mut app)?;
+                        fps.mark_drawn();
                         app.handle_server_message(msg);
                         need_prompt_redraw = true;
                     }
                 }
             }
 
+            // Tick timer — fires every 32ms for smooth animation.
             _ = tokio::time::sleep(TICK_RATE) => {
                 if app.stream.active {
-                    render::commit_delta_lines(stdout, &mut app)?;
+                    if render::commit_delta_lines(stdout, &mut app)? {
+                        fps.mark_drawn();
+                    }
                 }
                 if app.spinner_label.is_some() || app.stream.active {
                     app.spinner_frame += 1;
@@ -150,6 +201,7 @@ async fn run_app(
             if let Some(queued) = app.queued_message.take() {
                 render::clear_prompt(stdout, &mut app)?;
                 render::print_user_input(stdout, &app.last_submitted)?;
+                fps.mark_drawn();
                 need_prompt_redraw = true;
                 bridge.send(&queued).await?;
             }
@@ -210,12 +262,28 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
         return KeyAction::None;
     }
 
+    // Ctrl+Z: suspend (Unix only)
+    #[cfg(unix)]
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
+        unsafe {
+            // Send SIGTSTP to self — terminal will suspend
+            libc::raise(libc::SIGTSTP);
+        }
+        // After resume: terminal state is restored by crossterm
+        return KeyAction::Redraw;
+    }
+
     match app.mode {
         app::InputMode::ApprovalPending => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 KeyAction::Submit(app.respond_approval(true))
             }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                // Always approve for this session
+                app.always_approve = true;
+                KeyAction::Submit(app.respond_approval(true))
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 KeyAction::Submit(app.respond_approval(false))
             }
             _ => KeyAction::None,
@@ -251,6 +319,126 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                 _ => KeyAction::None,
             }
         }
+
+        app::InputMode::Pager => match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                app.mode = app::InputMode::Normal;
+                app.pager_scroll = 0;
+                KeyAction::Redraw
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.pager_scroll = app.pager_scroll.saturating_add(1);
+                KeyAction::Redraw
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.pager_scroll = app.pager_scroll.saturating_sub(1);
+                KeyAction::Redraw
+            }
+            KeyCode::Char('d') => {
+                app.pager_scroll = app.pager_scroll.saturating_add(20);
+                KeyAction::Redraw
+            }
+            KeyCode::Char('u') => {
+                app.pager_scroll = app.pager_scroll.saturating_sub(20);
+                KeyAction::Redraw
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                app.pager_scroll = 0;
+                KeyAction::Redraw
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                app.pager_scroll = usize::MAX; // will be clamped in renderer
+                KeyAction::Redraw
+            }
+            KeyCode::PageDown => {
+                let h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
+                app.pager_scroll = app.pager_scroll.saturating_add(h.saturating_sub(2));
+                KeyAction::Redraw
+            }
+            KeyCode::PageUp => {
+                let h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
+                app.pager_scroll = app.pager_scroll.saturating_sub(h.saturating_sub(2));
+                KeyAction::Redraw
+            }
+            _ => KeyAction::None,
+        },
+
+        app::InputMode::FileSearch => match key.code {
+            KeyCode::Esc => {
+                // Cancel: remove the @ and query from input
+                let end = app.file_search_at_pos + 1 + app.file_search_query.len();
+                let end = end.min(app.input.len());
+                app.input.replace_range(app.file_search_at_pos..end, "");
+                app.cursor = app.file_search_at_pos;
+                app.mode = app::InputMode::Normal;
+                app.file_search_results.clear();
+                KeyAction::Redraw
+            }
+            KeyCode::Up => {
+                if app.file_search_index > 0 { app.file_search_index -= 1; }
+                KeyAction::Redraw
+            }
+            KeyCode::Down => {
+                let max = app.file_search_results.len().saturating_sub(1);
+                if app.file_search_index < max { app.file_search_index += 1; }
+                KeyAction::Redraw
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                // Accept selection: replace @query with the file path
+                if let Some(result) = app.file_search_results.get(app.file_search_index) {
+                    let path = result.path.clone();
+                    let end = app.file_search_at_pos + 1 + app.file_search_query.len();
+                    let end = end.min(app.input.len());
+                    app.input.replace_range(app.file_search_at_pos..end, &path);
+                    app.cursor = app.file_search_at_pos + path.len();
+                } else {
+                    // No result, just keep the @query
+                    app.cursor = app.file_search_at_pos + 1 + app.file_search_query.len();
+                }
+                app.mode = app::InputMode::Normal;
+                app.file_search_results.clear();
+                KeyAction::Redraw
+            }
+            KeyCode::Backspace => {
+                if app.file_search_query.is_empty() {
+                    // Remove the @ itself
+                    if app.file_search_at_pos < app.input.len() {
+                        app.input.remove(app.file_search_at_pos);
+                        app.cursor = app.file_search_at_pos;
+                    }
+                    app.mode = app::InputMode::Normal;
+                    app.file_search_results.clear();
+                } else {
+                    app.file_search_query.pop();
+                    // Update input
+                    let end = app.file_search_at_pos + 1 + app.file_search_query.len() + 1;
+                    let end = end.min(app.input.len());
+                    let new_text = format!("@{}", app.file_search_query);
+                    app.input.replace_range(app.file_search_at_pos..end, &new_text);
+                    app.cursor = app.file_search_at_pos + new_text.len();
+                    // Re-search
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    app.file_search_results = decipher_tui::file_search::search_files(&cwd, &app.file_search_query);
+                    app.file_search_index = 0;
+                }
+                KeyAction::Redraw
+            }
+            KeyCode::Char(c) => {
+                app.file_search_query.push(c);
+                // Update input text
+                let at_end = app.file_search_at_pos + 1 + app.file_search_query.len() - 1;
+                let at_end = at_end.min(app.input.len());
+                let new_text = format!("@{}", app.file_search_query);
+                app.input.replace_range(app.file_search_at_pos..at_end, &new_text);
+                app.cursor = app.file_search_at_pos + new_text.len();
+                // Re-search
+                let cwd = std::env::current_dir().unwrap_or_default();
+                app.file_search_results = decipher_tui::file_search::search_files(&cwd, &app.file_search_query);
+                app.file_search_index = 0;
+                KeyAction::Redraw
+            }
+            _ => KeyAction::None,
+        },
 
         app::InputMode::CommandPopup => match key.code {
             KeyCode::Esc => { app.mode = app::InputMode::Normal; app.input.clear(); app.cursor = 0; KeyAction::Redraw }
@@ -288,6 +476,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                     KeyCode::Char('w') => { app.kill_word_backward(); return KeyAction::Redraw; }
                     KeyCode::Char('y') => { app.yank(); return KeyAction::Redraw; }
                     KeyCode::Char('r') => { app.enter_history_search(); return KeyAction::Redraw; }
+                    KeyCode::Char('t') => { app.mode = app::InputMode::Pager; app.pager_scroll = 0; return KeyAction::Redraw; }
+                    KeyCode::Char('x') => {
+                        // Ctrl+X: open $EDITOR with current input
+                        if let Some(result) = open_editor(&app.input) {
+                            app.input = result;
+                            app.cursor = app.input.len();
+                        }
+                        return KeyAction::Redraw;
+                    }
                     KeyCode::Char('v') => {
                         if let Some(img) = decipher_clipboard::paste_image() {
                             app.last_submitted = "[Image pasted from clipboard]".into();
@@ -338,6 +535,18 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                 KeyCode::Char('?') if app.input.is_empty() => {
                     app.show_shortcuts = !app.show_shortcuts; KeyAction::Redraw
                 }
+                KeyCode::Char('@') => {
+                    // Enter file search mode
+                    app.file_search_at_pos = app.cursor;
+                    app.input.insert(app.cursor, '@');
+                    app.cursor += 1;
+                    app.file_search_query.clear();
+                    app.file_search_index = 0;
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    app.file_search_results = decipher_tui::file_search::search_files(&cwd, "");
+                    app.mode = app::InputMode::FileSearch;
+                    KeyAction::Redraw
+                }
                 KeyCode::Tab => {
                     // Tab: submit if idle, queue if busy
                     if app.agent_busy {
@@ -364,8 +573,47 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
     }
 }
 
-async fn poll_terminal_event() -> io::Result<Option<Event>> {
-    tokio::task::spawn_blocking(move || {
-        if event::poll(TICK_RATE)? { Ok(Some(event::read()?)) } else { Ok(None) }
-    }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+/// Open $EDITOR with the given text, return the edited result.
+/// Temporarily exits raw mode so the editor can function normally.
+fn open_editor(initial_text: &str) -> Option<String> {
+    use std::fs;
+    use std::process::Command;
+
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    // Write current input to a temp file
+    let tmp_dir = std::env::temp_dir();
+    let tmp_path = tmp_dir.join("decipher-edit.tmp");
+    if fs::write(&tmp_path, initial_text).is_err() {
+        return None;
+    }
+
+    // Exit raw mode so the editor works
+    let _ = crossterm::terminal::disable_raw_mode();
+
+    // Spawn editor
+    let status = Command::new(&editor)
+        .arg(&tmp_path)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+
+    // Re-enter raw mode
+    let _ = crossterm::terminal::enable_raw_mode();
+
+    match status {
+        Ok(s) if s.success() => {
+            let result = fs::read_to_string(&tmp_path).ok()?;
+            let _ = fs::remove_file(&tmp_path);
+            let trimmed = result.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        }
+        _ => {
+            let _ = fs::remove_file(&tmp_path);
+            None
+        }
+    }
 }

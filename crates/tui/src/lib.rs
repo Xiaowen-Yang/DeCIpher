@@ -3,3 +3,11 @@
 pub mod app;
 pub mod render;
 pub mod streaming;
+pub mod shimmer;
+pub mod paste_burst;
+pub mod diff_render;
+pub mod ansi_escape;
+pub mod wrapping;
+pub mod pager;
+pub mod file_search;
+pub mod terminal_detect;

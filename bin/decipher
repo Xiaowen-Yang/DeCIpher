@@ -14,12 +14,12 @@ import {
   getHistoryPath,
   getConfigDir,
 } from '../lib/config.js';
-import {
-  appendHistoryEntry,
-  loadHistoryEntries,
-  toReadlineHistory,
-  findReverseHistoryMatches,
-} from '../lib/history.js';
+// history.js removed — Rust TUI manages input history in-memory.
+// Stubs for any remaining references in the fallback interactive mode.
+const appendHistoryEntry = () => {};
+const loadHistoryEntries = () => [];
+const toReadlineHistory = () => [];
+const findReverseHistoryMatches = () => [];
 import {
   loadSessionSnapshot,
   formatSessionSnapshot,
@@ -937,12 +937,7 @@ async function runInteractive() {
 
   console.log(buildSessionHeader(config, sessionState));
 
-  // Non-blocking update check — fire and print if available
-  import('../lib/update-check.js').then(({ checkForUpdate }) =>
-    checkForUpdate(VERSION).then(msg => {
-      if (msg) console.log(`  ${Y(msg)}\n`);
-    })
-  ).catch(() => {});
+  // update-check.js removed — Rust TUI is the primary interface.
 
   console.log(`  ${D('Type a mission, paste a path, or')} ${C('/help')} ${D('for commands.')}`)
   console.log(`  ${D('ctrl+r')} ${D('history')}  ${D('ctrl+c')} ${D('quit')}\n`);
@@ -1020,9 +1015,11 @@ async function runInteractive() {
   let processing = false;
 
   // ── Command palette popup state ──────────────────────────
-  const { createPopup, filterCommandsForPopup, filterPathsForPopup } =
-    await import('../lib/popup.js');
-  const popup = createPopup();
+  // popup.js removed — Rust TUI renders command popup natively.
+  // Stubs for fallback interactive mode.
+  const popup = { show() {}, hide() {}, isVisible() { return false; }, render() { return ''; } };
+  const filterCommandsForPopup = () => [];
+  const filterPathsForPopup = () => [];
   let popupActive = false;
   let popupItems = [];
   let popupIndex = 0;
