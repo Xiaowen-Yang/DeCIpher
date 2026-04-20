@@ -94,6 +94,18 @@ jobs:
 
       - run: pnpm test
 
+      # Update Homebrew formula sha256 now that the tag tarball is available
+      - name: Update Homebrew formula sha256
+        run: |
+          TARBALL_URL="https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          SHA256=$(curl -sL "$TARBALL_URL" | sha256sum | awk '{print $1}')
+          sed -i "s/sha256 \"[^\"]*\"/sha256 \"${SHA256}\"/" Formula/decipher-cli.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/decipher-cli.rb
+          git diff --staged --quiet || git commit -m "chore: update Homebrew formula sha256 for ${GITHUB_REF_NAME}"
+          git push origin HEAD:main || true
+
       - name: Publish to npm
         run: npm publish --access public
         env:

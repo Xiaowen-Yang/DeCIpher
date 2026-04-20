@@ -107,6 +107,84 @@ fn is_url_like(token: &str) -> bool {
         || token.contains("://")
 }
 
+// ── RowBuilder ──────────────────────────────────────────────────────────────
+
+/// Stateful row accumulator that wraps text to a target width.
+///
+/// Caches results by (text, width) — rebuilds only when the inputs change.
+/// Useful inside Cell implementations that need to re-render on resize without
+/// re-running the wrapping algorithm on every frame.
+///
+/// ```rust,ignore
+/// let mut builder = RowBuilder::new(80);
+/// builder.push("Hello world, this is a long sentence that may wrap.");
+/// let rows = builder.rows();
+/// ```
+pub struct RowBuilder {
+    target_width: usize,
+    rows: Vec<String>,
+    /// Fingerprint of the last text passed to `push()` + width.
+    cache_key: u64,
+}
+
+impl RowBuilder {
+    pub fn new(width: usize) -> Self {
+        Self {
+            target_width: width,
+            rows: Vec::new(),
+            cache_key: 0,
+        }
+    }
+
+    /// Set a new target width. Invalidates cache.
+    pub fn set_width(&mut self, width: usize) {
+        if self.target_width != width {
+            self.target_width = width;
+            self.rows.clear();
+            self.cache_key = 0;
+        }
+    }
+
+    /// Rebuild rows from `text` if the (text, width) pair changed.
+    /// Returns true if the cache was rebuilt.
+    pub fn push(&mut self, text: &str) -> bool {
+        let key = hash_text_width(text, self.target_width);
+        if key == self.cache_key && !self.rows.is_empty() {
+            return false;
+        }
+        self.rows = wrap_text(text, self.target_width);
+        self.cache_key = key;
+        true
+    }
+
+    /// The current wrapped rows.
+    pub fn rows(&self) -> &[String] {
+        &self.rows
+    }
+
+    /// Number of rows produced by the last `push()`.
+    pub fn height(&self) -> usize {
+        self.rows.len().max(1)
+    }
+}
+
+fn hash_text_width(text: &str, width: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    struct SimpleHasher(u64);
+    impl Hasher for SimpleHasher {
+        fn finish(&self) -> u64 { self.0 }
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 = self.0.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(b as u64);
+            }
+        }
+    }
+    let mut h = SimpleHasher(0xcbf29ce484222325);
+    text.hash(&mut h);
+    width.hash(&mut h);
+    h.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +212,36 @@ mod tests {
     fn test_multiline() {
         let result = wrap_text("line one\nline two", 80);
         assert_eq!(result, vec!["line one", "line two"]);
+    }
+
+    #[test]
+    fn row_builder_caches() {
+        let mut b = RowBuilder::new(20);
+        let rebuilt = b.push("hello world this is text");
+        assert!(rebuilt);
+        let rows1 = b.rows().to_vec();
+        // Push the same text again — should not rebuild
+        let rebuilt2 = b.push("hello world this is text");
+        assert!(!rebuilt2);
+        assert_eq!(b.rows(), rows1.as_slice());
+    }
+
+    #[test]
+    fn row_builder_rebuilds_on_text_change() {
+        let mut b = RowBuilder::new(20);
+        b.push("first text");
+        b.push("different text here");
+        assert!(b.rows().iter().any(|r| r.contains("different")));
+    }
+
+    #[test]
+    fn row_builder_rebuilds_on_width_change() {
+        let mut b = RowBuilder::new(80);
+        b.push("some long text that wraps differently at narrow widths");
+        let wide_rows = b.rows().len();
+        b.set_width(20);
+        b.push("some long text that wraps differently at narrow widths");
+        let narrow_rows = b.rows().len();
+        assert!(narrow_rows >= wide_rows);
     }
 }

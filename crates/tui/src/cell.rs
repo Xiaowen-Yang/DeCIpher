@@ -11,14 +11,14 @@ use ratatui::text::{Line, Span};
 
 // ── Theme constants ────────────────────────────────────────────────────────
 
-/// Shiba Inu orange (matches decipher_markdown::SHIBA).
-const SHIBA: Color = Color::Rgb(232, 163, 23);
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 const GREEN: Style = Style::new().fg(Color::Green);
 const RED: Style = Style::new().fg(Color::Red);
 const CYAN: Style = Style::new().fg(Color::Cyan);
-const YELLOW: Style = Style::new().fg(Color::Yellow);
+const BOLD_CYAN: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+const YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23));
+const BOLD_YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23)).add_modifier(Modifier::BOLD);
 
 // ── Cell trait ─────────────────────────────────────────────────────────────
 
@@ -121,39 +121,40 @@ impl Cell for MissionCell {
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-
-        // Header
+        lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled("MISSION ", Style::default().fg(SHIBA).add_modifier(Modifier::BOLD)),
-            Span::styled("─".repeat(40), DIM),
+            Span::styled("\u{250c} ", DIM),
+            Span::styled("MISSION", BOLD_CYAN),
+            Span::raw(" "),
+            Span::styled("\u{2500}".repeat(40), DIM),
         ]));
-
-        // Understood
         lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(self.understood.clone(), Style::default()),
+            Span::raw("  "),
+            Span::styled("Understood: ", BOLD_YELLOW),
+            Span::styled(self.understood.clone(), Style::default().fg(Color::White)),
         ]));
-
-        // Target
         if let Some(ref target) = self.target {
             lines.push(Line::from(vec![
-                Span::styled("  Target: ", DIM),
+                Span::raw("  "),
+                Span::styled("Target: ", DIM),
                 Span::styled(target.clone(), CYAN),
             ]));
         }
-
-        // Steps
         if !self.steps.is_empty() {
             lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("Plan:", DIM),
+            ]));
             for (i, step) in self.steps.iter().enumerate() {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {}. ", i + 1), DIM),
-                    Span::styled(step.clone(), Style::default()),
+                    Span::raw("    "),
+                    Span::styled(format!("{}. ", i + 1), DIM),
+                    Span::raw(step.clone()),
                 ]));
             }
         }
-
+        lines.push(Line::from(""));
         lines
     }
 }
@@ -224,28 +225,35 @@ impl Cell for ExecCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for call in &self.calls {
-            let icon = match call.success {
-                Some(true) => Span::styled("  \u{2713} ", GREEN),  // checkmark
-                Some(false) => Span::styled("  \u{2717} ", RED),   // x mark
-                None => Span::styled("  \u{2022} ", YELLOW),       // bullet (in progress)
-            };
-
-            let tool_span = Span::styled(call.tool.clone(), BOLD);
-
-            let detail = if let Some(ref output) = call.output {
-                let elapsed = call.elapsed_ms
-                    .map(|ms| format!(" ({:.1}s)", ms as f64 / 1000.0))
-                    .unwrap_or_default();
-                vec![
-                    icon,
-                    tool_span,
-                    Span::styled(format!(" \u{2014} {}{}", output, elapsed), DIM),
-                ]
-            } else {
-                vec![icon, tool_span]
-            };
-
-            lines.push(Line::from(detail));
+            match call.success {
+                None => {
+                    // In-progress: show spinner icon
+                    let r: String = call.output.as_deref().unwrap_or("").chars().take(60).collect();
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("\u{2847}", CYAN),
+                        Span::raw(" "),
+                        Span::styled(format!("{} \u{2014} {}", call.tool, r), DIM),
+                    ]));
+                }
+                Some(success) => {
+                    let icon = if success {
+                        Span::styled("\u{2713}", GREEN)
+                    } else {
+                        Span::styled("\u{2717}", RED)
+                    };
+                    let summary = call.output.as_deref().unwrap_or("");
+                    let elapsed = call.elapsed_ms
+                        .map(|ms| format!(" ({:.1}s)", ms as f64 / 1000.0))
+                        .unwrap_or_default();
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        icon,
+                        Span::raw(format!(" {} \u{2014} {} ", call.tool, summary)),
+                        Span::styled(elapsed, DIM),
+                    ]));
+                }
+            }
         }
         lines
     }
@@ -319,13 +327,10 @@ impl Cell for ErrorCell {
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled("ERROR ", RED.add_modifier(Modifier::BOLD)),
-            Span::styled(self.message.clone(), RED),
-        ]));
-        lines
+        vec![Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("Error: {}", self.message), RED),
+        ])]
     }
 }
 
@@ -352,25 +357,26 @@ impl Cell for ResultCell {
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let secs = self.elapsed_ms as f64 / 1000.0;
+        let w = 60;
         let mut lines = Vec::new();
-
-        // Header
-        let outcome_style = if self.outcome == "success" {
-            GREEN.add_modifier(Modifier::BOLD)
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("\u{2500}".repeat(w), DIM)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  [RESULT]", BOLD)));
+        let outcome_span = if self.outcome == "PASS" {
+            Span::styled(format!("PASS ({secs:.1}s)"), GREEN)
         } else {
-            RED.add_modifier(Modifier::BOLD)
+            Span::styled(format!("FAIL ({secs:.1}s)"), RED)
         };
         lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(self.outcome.clone(), outcome_style),
-            Span::styled(format!(" ({:.1}s, {} turns)", secs, self.turns), DIM),
+            Span::raw("  Outcome:     "),
+            outcome_span,
         ]));
-
-        // Summary
-        for line in self.summary.lines() {
-            lines.push(Line::from(format!("  {}", line)));
-        }
-
+        lines.push(Line::from(format!("  Turns:       {}", self.turns)));
+        lines.push(Line::from(format!("  Summary:     {}", self.summary)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("\u{2500}".repeat(w), DIM)));
+        lines.push(Line::from(""));
         lines
     }
 }
@@ -394,13 +400,22 @@ impl Cell for ClarificationCell {
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        lines.push(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled("? ", YELLOW.add_modifier(Modifier::BOLD)),
-            Span::styled(self.question.clone(), Style::default()),
-        ]));
-        lines
+        vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("\u{250c} ", DIM),
+                Span::styled("CLARIFICATION NEEDED", YELLOW),
+                Span::raw(" "),
+                Span::styled("\u{2500}".repeat(30), DIM),
+            ]),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled("DeCIpher asks: ", BOLD_YELLOW),
+                Span::styled(self.question.clone(), Style::default().fg(Color::White)),
+            ]),
+            Line::from(Span::styled("  Reply below and DeCIpher will continue.", DIM)),
+            Line::from(""),
+        ]
     }
 }
 
@@ -430,37 +445,60 @@ impl Cell for ApprovalCell {
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-
+        let bar = "\u{2500}".repeat(56);
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  \u{250c}\u{2500} ", DIM),
+            Span::styled("APPROVAL", BOLD_YELLOW),
+            Span::styled(format!(" {}", bar), DIM),
+        ]));
+        lines.push(Line::from(Span::styled("  \u{2502}", DIM)));
         if let Some(ref action) = self.action {
             lines.push(Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::styled("ACTION ", YELLOW.add_modifier(Modifier::BOLD)),
-                Span::styled(action.clone(), Style::default()),
+                Span::styled("  \u{2502} ", DIM),
+                Span::styled("Action: ", BOLD),
+                Span::styled(action.clone(), CYAN),
             ]));
+            lines.push(Line::from(Span::styled("  \u{2502}", DIM)));
         }
-
+        lines.push(Line::from(vec![
+            Span::styled("  \u{2502} ", DIM),
+            Span::raw("DeCIpher requests these capabilities:"),
+        ]));
         for cap in &self.capabilities {
             lines.push(Line::from(vec![
-                Span::styled("    \u{2022} ", DIM),
-                Span::styled(cap.clone(), Style::default()),
+                Span::styled("  \u{2502}   ", DIM),
+                Span::styled("\u{203a} ", YELLOW),
+                Span::raw(cap.clone()),
             ]));
         }
-
+        lines.push(Line::from(Span::styled("  \u{2502}", DIM)));
         match self.decision {
             Some(true) => {
-                lines.push(Line::from(Span::styled("  Approved", GREEN)));
+                lines.push(Line::from(vec![
+                    Span::styled("  \u{2502}  ", DIM),
+                    Span::styled("Approved", GREEN),
+                ]));
             }
             Some(false) => {
-                lines.push(Line::from(Span::styled("  Denied", RED)));
+                lines.push(Line::from(vec![
+                    Span::styled("  \u{2502}  ", DIM),
+                    Span::styled("Denied", RED),
+                ]));
             }
             None => {
-                lines.push(Line::from(Span::styled(
-                    "  Waiting for approval... [y/a/n]",
-                    DIM,
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled("  \u{2502}  ", DIM),
+                    Span::styled("y", BOLD),
+                    Span::styled(" approve  ", DIM),
+                    Span::styled("a", BOLD),
+                    Span::styled(" always  ", DIM),
+                    Span::styled("n", BOLD),
+                    Span::styled(" deny", DIM),
+                ]));
             }
         }
-
+        lines.push(Line::from(Span::styled(format!("  \u{2514}{}\u{2500}", bar), DIM)));
         lines
     }
 }
@@ -497,7 +535,8 @@ mod tests {
             vec!["Read Dockerfile".into(), "Fix COPY path".into()],
         );
         let lines = cell.display_lines(80);
-        assert!(lines.len() >= 5); // header + understood + target + blank + 2 steps
+        // empty + header + understood + target + blank + Plan: + 2 steps + empty = 9
+        assert!(lines.len() >= 7);
     }
 
     #[test]
@@ -524,15 +563,15 @@ mod tests {
 
     #[test]
     fn result_cell_success() {
-        let cell = ResultCell::new("success".into(), "All tests pass".into(), 5, 12000);
+        let cell = ResultCell::new("PASS".into(), "All tests pass".into(), 5, 12000);
         let lines = cell.display_lines(80);
-        assert!(lines.len() >= 2);
+        assert!(lines.len() >= 6); // empty + rule + empty + header + outcome + turns + summary + empty + rule + empty
     }
 
     #[test]
     fn clarification_cell() {
         let cell = ClarificationCell::new("Which branch?".into());
-        assert_eq!(cell.desired_height(80), 1);
+        assert!(cell.desired_height(80) >= 4); // empty + header + question + hint + empty
     }
 
     #[test]
@@ -541,7 +580,7 @@ mod tests {
             Some("run tests".into()),
             vec!["exec_command".into()],
         );
-        assert!(cell.desired_height(80) >= 3); // action + cap + waiting
+        assert!(cell.desired_height(80) >= 6); // empty + header + bar + action + cap + waiting + footer
         assert_eq!(cell.decision, None);
     }
 

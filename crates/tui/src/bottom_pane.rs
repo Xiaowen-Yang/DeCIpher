@@ -26,6 +26,16 @@ const RED: Style = Style::new().fg(Color::Red);
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Fixed viewport height — the terminal is created ONCE with this height and
+/// never recreated.  Recreating mid-session queries cursor position via \x1b[6n
+/// on /dev/tty, but the async EventStream is also reading /dev/tty and will
+/// consume the response first, causing a timeout crash.
+///
+/// Content shorter than this is pushed to the bottom via top-padding in
+/// `build_lines()`.  Large overlays (shortcuts: ~19 lines, input: 4 lines,
+/// commands: up to 10 + 4 = 14 lines) all fit within 25 rows.
+pub const MAX_PANE_HEIGHT: u16 = 25;
+
 /// The bottom pane widget — renders the prompt region.
 ///
 /// This is the viewport portion managed by `terminal.draw()`.
@@ -41,7 +51,8 @@ impl<'a> BottomPane<'a> {
     }
 
     /// Build all the lines for the bottom pane.
-    fn build_lines(&self) -> Vec<Line<'static>> {
+    /// Build actual content lines (variable height based on current UI state).
+    fn build_content_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
         // Command popup
@@ -54,18 +65,20 @@ impl<'a> BottomPane<'a> {
             self.build_file_search_popup(&mut lines);
         }
 
-        // Streaming delta preview (partial line not yet committed)
-        if self.app.stream.active && !self.app.stream.partial_line().is_empty() {
+        // Streaming delta preview (partial line not yet committed).
+        // Always shown during streaming to anchor the blinking cursor.
+        if self.app.chat.is_streaming() {
+            let partial = self.app.chat.partial_line();
+            // Blink cursor: on/off every 8 spinner frames (~256ms at 32ms/frame).
+            let cursor = if (self.app.spinner_frame / 8) % 2 == 0 { "\u{258c}" } else { " " };
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::raw(self.app.stream.partial_line().to_string()),
+                Span::raw(partial.to_string()),
+                Span::styled(cursor, BOLD_CYAN),
             ]));
         }
 
-        // Input line(s)
-        self.build_input_lines(&mut lines);
-
-        // Spinner
+        // Spinner (above input — agent status stays above the user panel)
         if let Some(ref label) = self.app.spinner_label {
             self.build_spinner(label, &mut lines);
         }
@@ -79,6 +92,9 @@ impl<'a> BottomPane<'a> {
             ]));
         }
 
+        // Input line(s) — pinned at the bottom
+        self.build_input_lines(&mut lines);
+
         // Footer hints
         self.build_hints(&mut lines);
 
@@ -87,6 +103,24 @@ impl<'a> BottomPane<'a> {
             self.build_shortcuts(&mut lines);
         }
 
+        lines
+    }
+
+    /// Build the full viewport lines: blank top-padding + content.
+    ///
+    /// The viewport is a fixed MAX_PANE_HEIGHT rows.  Blank padding pins
+    /// the actual content to the viewport bottom, so it always appears at
+    /// the physical bottom of the terminal without needing to recreate the
+    /// Terminal struct (which would trigger a cursor-position query that
+    /// races with the async EventStream reader).
+    fn build_lines(&self) -> Vec<Line<'static>> {
+        let content = self.build_content_lines();
+        let pad = (MAX_PANE_HEIGHT as usize).saturating_sub(content.len());
+        let mut lines = Vec::with_capacity(MAX_PANE_HEIGHT as usize);
+        for _ in 0..pad {
+            lines.push(Line::from(""));
+        }
+        lines.extend(content);
         lines
     }
 
@@ -144,21 +178,42 @@ impl<'a> BottomPane<'a> {
     }
 
     fn build_input_lines(&self, lines: &mut Vec<Line<'static>>) {
+        let w = self.app.chat.width() as usize;
+        let rule = "\u{2500}".repeat(w); // ──────...  full-width horizontal rule
+
+        // Top rule
+        lines.push(Line::from(Span::styled(rule.clone(), DIM)));
+
+        // Content lines: "  ❯ text" (no side border)
+        // [Image #N] tokens are highlighted in cyan.
         let input_lines: Vec<&str> = self.app.input.split('\n').collect();
         for (i, line) in input_lines.iter().enumerate() {
-            if i == 0 {
-                lines.push(Line::from(vec![
-                    Span::styled("\u{2502} ", DIM),
-                    Span::styled("\u{276f} ", BOLD_YELLOW),
-                    Span::styled(line.to_string(), BOLD),
-                ]));
+            let mut spans: Vec<Span<'static>> = if i == 0 {
+                vec![Span::styled("  ", DIM), Span::styled("\u{276f} ", BOLD_YELLOW)]
             } else {
-                lines.push(Line::from(vec![
-                    Span::styled("\u{2502}   ", DIM),
-                    Span::styled(line.to_string(), BOLD),
-                ]));
+                vec![Span::styled("    ", DIM)]
+            };
+            let mut rest = *line;
+            while let Some(start) = rest.find("[Image #") {
+                if start > 0 {
+                    spans.push(Span::styled(rest[..start].to_string(), BOLD));
+                }
+                if let Some(end) = rest[start..].find(']') {
+                    let token = &rest[start..start + end + 1];
+                    spans.push(Span::styled(token.to_string(), BOLD_CYAN));
+                    rest = &rest[start + end + 1..];
+                } else {
+                    break;
+                }
             }
+            if !rest.is_empty() {
+                spans.push(Span::styled(rest.to_string(), BOLD));
+            }
+            lines.push(Line::from(spans));
         }
+
+        // Bottom rule
+        lines.push(Line::from(Span::styled(rule, DIM)));
     }
 
     fn build_spinner(&self, label: &str, lines: &mut Vec<Line<'static>>) {
@@ -187,7 +242,8 @@ impl<'a> BottomPane<'a> {
     }
 
     fn build_hints(&self, lines: &mut Vec<Line<'static>>) {
-        let hints = match self.app.mode {
+        // Left-side hint text.
+        let left_text: String = match self.app.mode {
             InputMode::ApprovalPending => "  y approve  a always  n deny  Esc cancel".to_string(),
             InputMode::CommandPopup => "  \u{2191}\u{2193} navigate  Enter select  Esc cancel".to_string(),
             InputMode::HistorySearch => {
@@ -206,19 +262,45 @@ impl<'a> BottomPane<'a> {
             InputMode::FileSearch => "  \u{2191}\u{2193} navigate  Tab/Enter select  Esc cancel".to_string(),
             InputMode::Pager => "  j/k scroll  q quit".to_string(),
             InputMode::Normal => {
-                let token_info = if self.app.total_tokens > 0 {
-                    format!("  [{} tokens]", format_tokens(self.app.total_tokens))
+                // Show "ctrl+c again to quit" if Ctrl+C was pressed within the last 2s.
+                let ctrl_c_primed = self.app.last_ctrl_c
+                    .map(|t| t.elapsed() < std::time::Duration::from_secs(2))
+                    .unwrap_or(false);
+                if ctrl_c_primed && !self.app.agent_busy {
+                    "  ctrl+c again to quit".to_string()
+                } else if self.app.agent_busy {
+                    "  Ctrl+C interrupt".to_string()
                 } else {
-                    String::new()
-                };
-                if self.app.agent_busy {
-                    format!("  Ctrl+C interrupt{token_info}")
-                } else {
-                    format!("  Enter submit  / commands  Ctrl+R search  Ctrl+C quit{token_info}")
+                    "  Enter submit  / commands  Ctrl+R search  ? shortcuts".to_string()
                 }
             }
         };
-        lines.push(Line::from(Span::styled(hints, DIM)));
+
+        // Right-side context info: prompt tokens from last API call, right-aligned.
+        // Shows current context window usage (not cumulative total).
+        // Only shown in Normal / Pager modes (not during popups or approval).
+        let right_text: String = match self.app.mode {
+            InputMode::Normal | InputMode::Pager if self.app.context_tokens > 0 => {
+                format!("{}  ", format_tokens(self.app.context_tokens))
+            }
+            _ => String::new(),
+        };
+
+        // Compute padding so right text is right-aligned.
+        let total_width = self.app.chat.width() as usize;
+        let left_len = left_text.len();
+        let right_len = right_text.len();
+
+        if right_len > 0 && left_len + right_len + 2 < total_width {
+            let pad = total_width.saturating_sub(left_len + right_len);
+            lines.push(Line::from(vec![
+                Span::styled(left_text, DIM),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(right_text, DIM),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(left_text, DIM)));
+        }
     }
 
     fn build_shortcuts(&self, lines: &mut Vec<Line<'static>>) {
@@ -258,9 +340,9 @@ impl<'a> BottomPane<'a> {
         )));
     }
 
-    /// Compute the height needed for this pane.
+    /// Fixed viewport height — always MAX_PANE_HEIGHT, never changes.
     pub fn desired_height(&self) -> u16 {
-        self.build_lines().len() as u16
+        MAX_PANE_HEIGHT
     }
 
     /// Compute cursor position (x, y) within the viewport area.
@@ -269,10 +351,13 @@ impl<'a> BottomPane<'a> {
             return None; // No cursor in pager mode
         }
 
-        let lines = self.build_lines();
+        // Compute top-padding so the cursor row aligns with the padded build_lines().
+        let content = self.build_content_lines();
+        let pad = (MAX_PANE_HEIGHT as usize).saturating_sub(content.len()) as u16;
 
-        // Find the input line row — count lines before input
-        let mut input_row_start = 0u16;
+        // Find the input line row — count lines before input (within content).
+        // Start at `pad` to skip the blank top-padding rows.
+        let mut input_row_start = pad;
 
         // Count popup lines
         if self.app.mode == InputMode::CommandPopup {
@@ -285,17 +370,27 @@ impl<'a> BottomPane<'a> {
             input_row_start += max_show as u16;
             if self.app.file_search_results.len() > max_show { input_row_start += 1; }
         }
-        // Streaming preview
-        if self.app.stream.active && !self.app.stream.partial_line().is_empty() {
+        // Streaming preview (always shown during streaming for the blinking cursor)
+        if self.app.chat.is_streaming() {
             input_row_start += 1;
         }
+        // Spinner (now above input)
+        if self.app.spinner_label.is_some() {
+            input_row_start += 1;
+        }
+        // Queued message indicator (now above input)
+        if self.app.queued_message.is_some() {
+            input_row_start += 1;
+        }
+        // Top rule line
+        input_row_start += 1;
 
         // Find cursor position within input
         let (cursor_line, cursor_col) = cursor_position_in_multiline(&self.app.input, self.app.cursor);
         let y = area.y + input_row_start + cursor_line as u16;
         let x = area.x + cursor_col as u16 + 4; // 4 = "│ ❯ " prefix width
 
-        if y < area.y + lines.len() as u16 {
+        if y < area.y + MAX_PANE_HEIGHT {
             Some((x.min(area.x + area.width - 1), y))
         } else {
             None
@@ -447,207 +542,42 @@ pub fn banner_lines(
 }
 
 /// Render user input as Lines for insert_before.
+///
+/// `[Image #N]` tokens are highlighted in cyan to match Claude Code style.
 pub fn user_input_lines(text: &str) -> Vec<Line<'static>> {
-    vec![
-        Line::from(Span::styled("\u{256d}\u{2500}", DIM)),
-        Line::from(vec![
-            Span::styled("\u{2502} ", DIM),
-            Span::styled("\u{276f} ", BOLD_YELLOW),
-            Span::styled(text.to_string(), Style::default()),
-        ]),
-        Line::from(Span::styled("\u{256e}\u{2500}", DIM)),
-    ]
-}
-
-/// Render a server message as Lines for insert_before.
-pub fn server_message_lines(msg: &decipher_protocol::ServerMessage, suppress_agent: &mut bool) -> Vec<Line<'static>> {
-    use decipher_protocol::ServerMessage;
-
-    match msg {
-        ServerMessage::Banner { version, provider, model, directory, api_key_set } => {
-            banner_lines(version, provider, model, directory, *api_key_set)
-        }
-        ServerMessage::Mission { understood, target, steps, .. } => {
-            let mut lines = Vec::new();
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("\u{250c} ", DIM),
-                Span::styled("MISSION", BOLD_CYAN),
-                Span::raw(" "),
-                Span::styled("\u{2500}".repeat(40), DIM),
-            ]));
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Understood: ", BOLD_YELLOW),
-                Span::styled(understood.clone(), Style::default().fg(Color::White)),
-            ]));
-            if let Some(t) = target {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("Target: ", DIM),
-                    Span::styled(t.clone(), CYAN),
-                ]));
+    let input_lines: Vec<&str> = text.split('\n').collect();
+    let mut lines = Vec::with_capacity(input_lines.len() + 1);
+    for (i, line) in input_lines.iter().enumerate() {
+        let prefix: Vec<Span<'static>> = if i == 0 {
+            vec![Span::styled("  ", DIM), Span::styled("\u{276f} ", BOLD_YELLOW)]
+        } else {
+            vec![Span::styled("    ", DIM)]
+        };
+        let mut spans = prefix;
+        // Split on [Image #N] tokens and style them distinctly.
+        let mut rest = *line;
+        while let Some(start) = rest.find("[Image #") {
+            if start > 0 {
+                spans.push(Span::raw(rest[..start].to_string()));
             }
-            if !steps.is_empty() {
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("Plan:", DIM),
-                ]));
-                for (i, s) in steps.iter().enumerate() {
-                    lines.push(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(format!("{}. ", i + 1), DIM),
-                        Span::raw(s.clone()),
-                    ]));
-                }
-            }
-            lines.push(Line::from(""));
-            lines
-        }
-        ServerMessage::Clarification { question } => {
-            vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("\u{250c} ", DIM),
-                    Span::styled("CLARIFICATION NEEDED", YELLOW),
-                    Span::raw(" "),
-                    Span::styled("\u{2500}".repeat(30), DIM),
-                ]),
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("DeCIpher asks: ", BOLD_YELLOW),
-                    Span::styled(question.clone(), Style::default().fg(Color::White)),
-                ]),
-                Line::from(Span::styled("  Reply below and DeCIpher will continue.", DIM)),
-                Line::from(""),
-            ]
-        }
-        ServerMessage::ApprovalRequest { action, capabilities } => {
-            let mut lines = Vec::new();
-            lines.push(Line::from(""));
-            let bar = "\u{2500}".repeat(56);
-            lines.push(Line::from(vec![
-                Span::styled("  \u{250c}\u{2500} ", DIM),
-                Span::styled("APPROVAL", BOLD_YELLOW),
-                Span::styled(format!(" {}", bar), DIM),
-            ]));
-            lines.push(Line::from(Span::styled("  \u{2502}", DIM)));
-            if let Some(act) = action {
-                lines.push(Line::from(vec![
-                    Span::styled("  \u{2502} ", DIM),
-                    Span::styled("Action: ", BOLD),
-                    Span::styled(act.tool.clone(), CYAN),
-                ]));
-                if let Some(reason) = &act.reasoning {
-                    lines.push(Line::from(vec![
-                        Span::styled("  \u{2502} ", DIM),
-                        Span::styled(reason.clone(), DIM),
-                    ]));
-                }
-                lines.push(Line::from(Span::styled("  \u{2502}", DIM)));
-            }
-            lines.push(Line::from(vec![
-                Span::styled("  \u{2502} ", DIM),
-                Span::raw("DeCIpher requests these capabilities:"),
-            ]));
-            for c in capabilities {
-                lines.push(Line::from(vec![
-                    Span::styled("  \u{2502}   ", DIM),
-                    Span::styled("\u{203a} ", YELLOW),
-                    Span::raw(c.clone()),
-                ]));
-            }
-            lines.push(Line::from(Span::styled("  \u{2502}", DIM)));
-            lines.push(Line::from(vec![
-                Span::styled("  \u{2502}  ", DIM),
-                Span::raw("Scope: this session only. Nothing pushed or deployed."),
-            ]));
-            lines.push(Line::from(Span::styled("  \u{2502}", DIM)));
-            lines.push(Line::from(vec![
-                Span::styled("  \u{2502}  ", DIM),
-                Span::styled("y", BOLD),
-                Span::styled(" approve  ", DIM),
-                Span::styled("a", BOLD),
-                Span::styled(" always  ", DIM),
-                Span::styled("n", BOLD),
-                Span::styled(" deny", DIM),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled(format!("  \u{2514}{}\u{2500}", bar), DIM),
-            ]));
-            lines
-        }
-        ServerMessage::ToolStart { tool, reasoning } => {
-            let r: String = reasoning.chars().take(60).collect();
-            vec![Line::from(vec![
-                Span::raw("  "),
-                Span::styled(SPINNER_FRAMES[0], CYAN),
-                Span::raw(" "),
-                Span::styled(format!("{tool} \u{2014} {r}"), DIM),
-            ])]
-        }
-        ServerMessage::ToolResult { tool, success, summary, elapsed_ms } => {
-            let s = *elapsed_ms as f64 / 1000.0;
-            let icon = if *success {
-                Span::styled("\u{2713}", GREEN)
+            if let Some(end) = rest[start..].find(']') {
+                let token = &rest[start..start + end + 1];
+                spans.push(Span::styled(token.to_string(), BOLD_CYAN));
+                rest = &rest[start + end + 1..];
             } else {
-                Span::styled("\u{2717}", RED)
-            };
-            vec![Line::from(vec![
-                Span::raw("  "),
-                icon,
-                Span::raw(format!(" {tool} \u{2014} {summary} ")),
-                Span::styled(format!("({s:.1}s)"), DIM),
-            ])]
-        }
-        ServerMessage::AgentMessage { text } => {
-            if *suppress_agent {
-                *suppress_agent = false;
-                return Vec::new();
+                break;
             }
-            // Simple text rendering — each line indented by 2 spaces
-            text.lines()
-                .map(|line| Line::from(format!("  {}", line)))
-                .collect()
         }
-        ServerMessage::MissionComplete { outcome, summary, turns, elapsed_ms, .. } => {
-            let s = *elapsed_ms as f64 / 1000.0;
-            let w = 60;
-            let mut lines = Vec::new();
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("\u{2500}".repeat(w), DIM)));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("  [RESULT]", BOLD)));
-            let outcome_span = if outcome == "PASS" {
-                Span::styled(format!("PASS ({s:.1}s)"), GREEN)
-            } else {
-                Span::styled(format!("FAIL ({s:.1}s)"), RED)
-            };
-            lines.push(Line::from(vec![
-                Span::raw("  Outcome:     "),
-                outcome_span,
-            ]));
-            lines.push(Line::from(format!("  Turns:       {turns}")));
-            lines.push(Line::from(format!("  Summary:     {summary}")));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("\u{2500}".repeat(w), DIM)));
-            lines.push(Line::from(""));
-            lines
+        if !rest.is_empty() {
+            spans.push(Span::raw(rest.to_string()));
         }
-        ServerMessage::Error { message } => {
-            vec![Line::from(vec![
-                Span::raw("  "),
-                Span::styled(format!("Error: {message}"), RED),
-            ])]
-        }
-        // Non-visual messages
-        ServerMessage::Spinner { .. }
-        | ServerMessage::CommandList { .. }
-        | ServerMessage::AgentMessageDelta { .. }
-        | ServerMessage::TokenUsage { .. } => Vec::new(),
+        lines.push(Line::from(spans));
     }
+    lines
 }
+
+// server_message_lines() — removed in Phase 3.
+// Cell creation and scrollback rendering is now handled by ChatWidget::handle_server_message().
 
 /// Goodbye message for insert_before.
 pub fn goodbye_lines() -> Vec<Line<'static>> {

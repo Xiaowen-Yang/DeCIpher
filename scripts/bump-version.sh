@@ -28,8 +28,18 @@ npm version "$LEVEL" --no-git-tag-version
 # Read the new version
 NEW_VERSION=$(node -p "require('./package.json').version")
 
+# Update Homebrew formula version + clear sha256 placeholder (filled in by release CI)
+FORMULA="Formula/decipher-cli.rb"
+if [ -f "$FORMULA" ]; then
+  # Update the tarball URL version
+  sed -i.bak "s|/refs/tags/v[0-9]*\.[0-9]*\.[0-9]*/|/refs/tags/v${NEW_VERSION}/|g" "$FORMULA"
+  # Reset sha256 (release CI will patch it after tarball is published)
+  sed -i.bak 's/sha256 "[^"]*"/sha256 ""/' "$FORMULA"
+  rm -f "${FORMULA}.bak"
+fi
+
 # Commit and tag
-git add package.json
+git add package.json ${FORMULA:+$FORMULA}
 git commit -m "chore: bump version to $NEW_VERSION"
 git tag "v$NEW_VERSION"
 

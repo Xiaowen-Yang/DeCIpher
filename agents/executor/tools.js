@@ -292,6 +292,113 @@ export const TOOL_REGISTRY = {
     },
   },
 
+  // ── Kubernetes tools ────────────────────────────────────────────────────────
+
+  kubectl_get: {
+    description:
+      "Run `kubectl get <resource>` to inspect cluster resources. " +
+      "Use output=json for machine-readable details, wide for a human overview. " +
+      "Examples: resource=pods, resource=deployments, resource=services, resource=nodes. " +
+      "Optionally filter by namespace or label selector.",
+    argsSchema:
+      '{ resource: string, namespace?: string, output?: "json"|"yaml"|"wide"|"name", selector?: string }',
+    riskyByDefault: false,
+    handler: async (args, context) => {
+      const resource = args.resource ?? "pods";
+      const ns = args.namespace ? `-n ${args.namespace}` : "";
+      const out = args.output ? `-o ${args.output}` : "";
+      const sel = args.selector ? `-l ${args.selector}` : "";
+      const cmd = `kubectl get ${resource} ${ns} ${out} ${sel}`
+        .replace(/\s+/g, " ")
+        .trim();
+      const result = await safeExec(cmd, context.workspace);
+      return {
+        success: result.exitCode === 0,
+        output: result.output,
+        command: cmd,
+        exitCode: result.exitCode,
+      };
+    },
+  },
+
+  kubectl_logs: {
+    description:
+      "Fetch logs from a Kubernetes pod (or container within a pod). " +
+      "Use previous=true to fetch logs from a crashed container. " +
+      "Use tail to limit output to the last N lines.",
+    argsSchema:
+      "{ pod: string, namespace?: string, container?: string, previous?: boolean, tail?: number }",
+    riskyByDefault: false,
+    handler: async (args, context) => {
+      const pod = args.pod ?? "";
+      if (!pod) return { success: false, error: "pod name is required" };
+      const ns = args.namespace ? `-n ${args.namespace}` : "";
+      const container = args.container ? `-c ${args.container}` : "";
+      const prev = args.previous ? "--previous" : "";
+      const tail = args.tail ? `--tail=${args.tail}` : "--tail=200";
+      const cmd = `kubectl logs ${pod} ${ns} ${container} ${prev} ${tail}`
+        .replace(/\s+/g, " ")
+        .trim();
+      const result = await safeExec(cmd, context.workspace);
+      return {
+        success: result.exitCode === 0,
+        output: result.output,
+        command: cmd,
+        exitCode: result.exitCode,
+      };
+    },
+  },
+
+  kubectl_describe: {
+    description:
+      "Run `kubectl describe <resource> <name>` to get detailed information " +
+      "about a Kubernetes resource including events, conditions, and status. " +
+      "Essential for diagnosing CrashLoopBackOff, OOMKilled, Pending pods, etc.",
+    argsSchema: "{ resource: string, name: string, namespace?: string }",
+    riskyByDefault: false,
+    handler: async (args, context) => {
+      const resource = args.resource ?? "pod";
+      const name = args.name ?? "";
+      if (!name) return { success: false, error: "resource name is required" };
+      const ns = args.namespace ? `-n ${args.namespace}` : "";
+      const cmd = `kubectl describe ${resource} ${name} ${ns}`
+        .replace(/\s+/g, " ")
+        .trim();
+      const result = await safeExec(cmd, context.workspace);
+      return {
+        success: result.exitCode === 0,
+        output: result.output,
+        command: cmd,
+        exitCode: result.exitCode,
+      };
+    },
+  },
+
+  kubectl_events: {
+    description:
+      "List recent Kubernetes events, sorted by timestamp. " +
+      "Invaluable for diagnosing cluster issues — shows warnings, failures, " +
+      "scheduling decisions, and resource lifecycle events.",
+    argsSchema: "{ namespace?: string, field_selector?: string }",
+    riskyByDefault: false,
+    handler: async (args, context) => {
+      const ns = args.namespace ? `-n ${args.namespace}` : "--all-namespaces";
+      const fs = args.field_selector
+        ? `--field-selector=${args.field_selector}`
+        : "";
+      const cmd = `kubectl get events ${ns} ${fs} --sort-by=.lastTimestamp`
+        .replace(/\s+/g, " ")
+        .trim();
+      const result = await safeExec(cmd, context.workspace);
+      return {
+        success: result.exitCode === 0,
+        output: result.output,
+        command: cmd,
+        exitCode: result.exitCode,
+      };
+    },
+  },
+
   update_plan: {
     description:
       "Update the displayed plan with current step statuses. " +

@@ -36,6 +36,10 @@ docs/
 target/
 tui/target/
 
+# Compiled TUI binary — built via `cargo build --release`, not committed.
+# The JS shim (bin/decipher) is source and IS tracked.
+bin/decipher-tui
+
 # build artifacts
 *.tgz
 *.bak
@@ -51,6 +55,18 @@ tui/target/
 
 # plugin lock files
 skills-lock.json
+
+# package manager lock files (not committed for this project)
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# Homebrew formula (managed in a separate tap repository)
+Formula/
+
+# TUI session recordings (DECIPHER_TUI_RECORD_SESSION)
+*.session.jsonl
+session-*.jsonl
 
 # generated scripts
 scripts/postinstall.js

@@ -111,6 +111,24 @@ pub enum ServerMessage {
         completion_tokens: u64,
         total_tokens: u64,
     },
+
+    /// Native tool call from the LLM (parallel tool calling support).
+    #[serde(rename = "tool_call")]
+    ToolCall {
+        call_id: String,
+        name: String,
+        /// JSON-encoded arguments.
+        input: String,
+    },
+
+    /// Result of a native tool call execution.
+    #[serde(rename = "tool_call_result")]
+    ToolCallResult {
+        call_id: String,
+        name: String,
+        output: String,
+        success: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

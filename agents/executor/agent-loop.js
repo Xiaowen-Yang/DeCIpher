@@ -491,36 +491,46 @@ export async function runAgentLoop(mission, target, config, options = {}) {
       messages.push({ role: "user", content: resultText });
 
       // ── Auto-compaction ─────────────────────────────────────
-      // Rough estimate: ~4 chars per token. Compact when messages get large
-      // to prevent context limit errors (which killed the HPL run at turn 14).
+      // Use LLM-driven compaction when context gets large.
+      // Falls back to simple truncation if the LLM call fails.
       const totalChars = messages.reduce(
         (sum, m) => sum + (m.content?.length ?? 0),
         0,
       );
-      if (totalChars > 60_000 && messages.length > 6) {
-        // Keep: first user message, last 4 message pairs, all error messages
-        const keepFirst = messages.slice(0, 1);
-        const keepRecent = messages.slice(-8);
-        const middle = messages.slice(1, -8);
-        const summary = middle
-          .filter((m) => m.role === "user" && m.content.includes("Exit code:"))
-          .map((m) => m.content.split("\n").slice(0, 2).join(" "))
-          .join("\n");
-        const compacted = [
-          ...keepFirst,
-          {
-            role: "user",
-            content: `[Earlier turns compacted — ${middle.length} messages summarized]\n${summary || "(no errors in compacted range)"}`,
-          },
-          ...keepRecent,
-        ];
-        messages.length = 0;
-        messages.push(...compacted);
-        log(
-          pc.dim(
-            `  [compacted] ${middle.length} older messages → summary (${totalChars} → ${messages.reduce((s, m) => s + (m.content?.length ?? 0), 0)} chars)`,
-          ),
-        );
+      if (totalChars > 60_000 && messages.length > 8) {
+        try {
+          const { compactMessages } = await import("../../lib/compact.js");
+          const result = await compactMessages(messages, config, {
+            keepRecent: 6,
+          });
+          messages.length = 0;
+          messages.push(...result.messages);
+          log(
+            pc.dim(
+              `  [compacted] LLM summary (~${Math.round(result.beforeTokens)} → ~${Math.round(result.afterTokens)} tokens)`,
+            ),
+          );
+        } catch {
+          // Fallback: simple truncation (keep first + last 8)
+          const keepFirst = messages.slice(0, 1);
+          const keepRecent = messages.slice(-8);
+          const middle = messages.slice(1, -8);
+          const compacted = [
+            ...keepFirst,
+            {
+              role: "user",
+              content: `[Earlier turns compacted — ${middle.length} messages summarized]`,
+            },
+            ...keepRecent,
+          ];
+          messages.length = 0;
+          messages.push(...compacted);
+          log(
+            pc.dim(
+              `  [compacted] fallback: ${middle.length} older messages truncated`,
+            ),
+          );
+        }
       }
 
       // Periodic snapshot

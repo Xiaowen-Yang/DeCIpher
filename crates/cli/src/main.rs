@@ -9,8 +9,9 @@
 //! - 32ms tick rate (~30 FPS) for smooth spinner animation
 //! - Frame rate limiter (120 FPS cap) to prevent redundant redraws
 //! - No manual cursor tracking — structurally impossible cursor bugs
+//! - Phase 3: all server messages routed through ChatWidget for typed cells
 
-use std::io;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -40,12 +41,34 @@ const TICK_RATE: Duration = Duration::from_millis(32);
 /// Minimum interval between draws: 120 FPS cap (~8.3ms).
 const MIN_FRAME_INTERVAL: Duration = Duration::from_nanos(8_333_334);
 
-/// Default viewport height (lines reserved for the bottom pane).
-const VIEWPORT_HEIGHT: u16 = 4;
+/// Create a fresh ratatui Terminal with an inline viewport of the given height.
+///
+/// Recreating the terminal is the only way to change the inline viewport height
+/// in standard ratatui — `Viewport::Inline(n)` fixes `n` at creation time.
+/// We do this sparingly: only when the desired pane height actually changes.
+fn make_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    )
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let mut bridge = AgentBridge::spawn().await?;
+
+    // Push cursor to the terminal bottom BEFORE raw mode so that
+    // Viewport::Inline anchors at the real bottom, not wherever the
+    // shell prompt happened to leave the cursor.
+    {
+        let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        // Print `rows` newlines in cooked mode — the terminal scrolls content
+        // up and leaves the cursor on the last row.
+        print!("{}", "\n".repeat(rows as usize));
+        io::stdout().flush()?;
+    }
 
     // Raw mode + bracketed paste + focus detection. NO alternate screen.
     enable_raw_mode()?;
@@ -66,19 +89,8 @@ async fn main() -> io::Result<()> {
         )?;
     }
 
-    // Create ratatui terminal with inline viewport
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(VIEWPORT_HEIGHT),
-        },
-    )?;
-
-    let result = run_app(&mut terminal, &mut bridge).await;
-
-    // Cleanup
-    drop(terminal); // Drop terminal to release stdout
+    // Terminal is created and managed inside run_app (dynamic viewport height).
+    let result = run_app(&mut bridge).await;
 
     let mut stdout = io::stdout();
     if has_keyboard_enhancement {
@@ -118,46 +130,50 @@ impl FrameRateLimiter {
     }
 }
 
-async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    bridge: &mut AgentBridge,
-) -> io::Result<()> {
+/// Run the main event loop.
+///
+/// The terminal is owned here — not passed from main — so we can recreate it
+/// whenever the viewport height needs to change.  ratatui's Viewport::Inline(n)
+/// fixes the height at creation time; the only correct way to change it is to
+/// drop and recreate the Terminal struct (cheap: no alternate screen).
+async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
     let mut app = App::new();
     let mut need_redraw = true;
     let mut fps = FrameRateLimiter::new();
-    let mut suppress_next_agent = false;
-
     let mut events = EventStream::new();
 
+    // Bootstrap terminal with a fixed viewport height.
+    //
+    // We NEVER recreate the terminal after this point.  Recreating mid-session
+    // calls crossterm::cursor::position() (sends \x1b[6n, reads the CPR response
+    // from /dev/tty), but the async EventStream is also reading /dev/tty and
+    // will consume that response first → timeout → crash.
+    //
+    // Instead, the viewport is a fixed MAX_PANE_HEIGHT rows. BottomPane pads
+    // shorter content with blank lines at the top so the input box is always
+    // physically at the terminal bottom.
+    let viewport_height = bottom_pane::MAX_PANE_HEIGHT;
+    let mut terminal = make_terminal(viewport_height)?;
+    // Sync chat width with actual terminal width (may differ from App::new() snapshot).
+    let actual_width = terminal.size()?.width;
+    if actual_width != app.chat.width() {
+        app.chat.set_width(actual_width);
+    }
+
     loop {
-        // Draw the viewport (bottom pane) via ratatui buffer diffing
+        // ── Draw ─────────────────────────────────────────────────────────────
         if need_redraw && fps.should_draw() {
-            // In pager mode, use the old pager rendering
             if app.mode == app::InputMode::Pager {
-                // Pager needs full-screen — handled separately
                 let mut stdout = io::stdout();
                 decipher_tui::pager::render_pager(&mut stdout, &mut app)?;
             } else {
-                // Calculate needed height
-                let pane = BottomPane::new(&app);
-                let needed = pane.desired_height().max(1);
-
-                // Resize viewport if needed
-                terminal.resize(ratatui::layout::Rect::new(
-                    0, 0,
-                    terminal.size()?.width,
-                    needed,
-                ))?;
-
-                // Draw with cursor position
-                let cursor_pos = pane.cursor_position(ratatui::layout::Rect::new(
-                    0, 0, terminal.size()?.width, needed,
-                ));
-
                 terminal.draw(|frame| {
                     let area = frame.area();
                     frame.render_widget(BottomPane::new(&app), area);
-                    if let Some((x, y)) = cursor_pos {
+                    // Cursor position must be computed inside the draw closure so
+                    // it uses frame.area() — the actual terminal coordinates for
+                    // this inline viewport, not a viewport-relative (y=0) rect.
+                    if let Some((x, y)) = BottomPane::new(&app).cursor_position(area) {
                         frame.set_cursor_position((x, y));
                     }
                 })?;
@@ -168,7 +184,7 @@ async fn run_app(
         tokio::select! {
             biased;
 
-            // Terminal events
+            // ── Terminal events ───────────────────────────────────────────────
             Some(result) = events.next() => {
                 match result {
                     Ok(Event::Key(key)) => {
@@ -177,7 +193,6 @@ async fn run_app(
                         match action {
                             KeyAction::Redraw => { need_redraw = true; }
                             KeyAction::Submit(msg) => {
-                                // Push user input to scrollback
                                 let lines = bottom_pane::user_input_lines(&app.last_submitted);
                                 let height = lines.len() as u16;
                                 terminal.insert_before(height, |buf| {
@@ -195,7 +210,13 @@ async fn run_app(
                         app.cursor += text.len();
                         need_redraw = true;
                     }
-                    Ok(Event::Resize(_, _)) => { need_redraw = true; }
+                    Ok(Event::Resize(cols, rows)) => {
+                        app.chat.set_width(cols);
+                        // Pass actual terminal dimensions so last_known_area
+                        // stays correct for insert_before scroll math.
+                        terminal.resize(ratatui::layout::Rect::new(0, 0, cols, rows))?;
+                        need_redraw = true;
+                    }
                     Ok(Event::FocusGained) => { app.terminal_focused = true; }
                     Ok(Event::FocusLost) => { app.terminal_focused = false; }
                     Ok(_) => {}
@@ -203,96 +224,49 @@ async fn run_app(
                 }
             }
 
-            // Server messages from the Node.js agent
+            // ── Server messages ───────────────────────────────────────────────
             Some(msg) = bridge.rx.recv() => {
-                match &msg {
-                    ServerMessage::AgentMessageDelta { delta } => {
-                        app.stream.push(delta);
-                        // Try committing complete lines to scrollback
-                        if let Some(committed) = try_commit_stream_lines(&mut app) {
-                            let height = committed.len() as u16;
-                            if height > 0 {
-                                terminal.insert_before(height, |buf| {
-                                    for (i, line) in committed.iter().enumerate() {
-                                        let y = buf.area.y + i as u16;
-                                        if y < buf.area.y + buf.area.height {
-                                            buf.set_line(buf.area.x, y, &ratatui::text::Line::from(format!("  {}", line)), buf.area.width);
-                                        }
-                                    }
-                                })?;
-                            }
-                        }
-                        fps.mark_drawn();
-                        app.handle_server_message(msg);
-                        need_redraw = true; // redraw to show partial line in viewport
-                    }
-                    _ => {
-                        // Flush any buffered stream content before rendering new message
-                        if app.stream.active {
-                            let remaining = app.stream.drain_all();
-                            if !remaining.is_empty() {
-                                let height = remaining.len() as u16;
-                                terminal.insert_before(height, |buf| {
-                                    for (i, line) in remaining.iter().enumerate() {
-                                        let y = buf.area.y + i as u16;
-                                        if y < buf.area.y + buf.area.height {
-                                            buf.set_line(buf.area.x, y, &ratatui::text::Line::from(format!("  {}", line)), buf.area.width);
-                                        }
-                                    }
-                                })?;
-                            }
-                            suppress_next_agent = true;
-                        }
-
-                        // Set terminal title on banner
-                        if let ServerMessage::Banner { ref model, .. } = msg {
-                            let mut stdout = io::stdout();
-                            decipher_tui::render::set_terminal_title(&mut stdout, &format!("DeCIpher — {model}"))?;
-                        }
-
-                        // Desktop notification on mission complete
-                        if let ServerMessage::MissionComplete { ref outcome, ref summary, .. } = msg {
-                            if !app.terminal_focused {
-                                let mut stdout = io::stdout();
-                                let _ = decipher_tui::render::send_notification(&mut stdout, &format!("DeCIpher: {outcome} — {summary}"));
-                            }
-                        }
-
-                        // Render message to scrollback
-                        let lines = bottom_pane::server_message_lines(&msg, &mut suppress_next_agent);
-                        if !lines.is_empty() {
-                            let height = lines.len() as u16;
-                            terminal.insert_before(height, |buf| {
-                                bottom_pane::render_lines_to_buffer(buf, &lines);
-                            })?;
-                        }
-
-                        fps.mark_drawn();
-                        app.handle_server_message(msg);
-                        need_redraw = true;
+                // Banner: render above scrollback + set terminal title
+                if let ServerMessage::Banner { ref version, ref provider, ref model, ref directory, api_key_set } = msg {
+                    let mut stdout = io::stdout();
+                    decipher_tui::render::set_terminal_title(&mut stdout, &format!("DeCIpher \u{2014} {model}"))?;
+                    let banner = bottom_pane::banner_lines(version, provider, model, directory, api_key_set);
+                    if !banner.is_empty() {
+                        let h = banner.len() as u16;
+                        terminal.insert_before(h, |buf| {
+                            bottom_pane::render_lines_to_buffer(buf, &banner);
+                        })?;
                     }
                 }
+
+                // Desktop notification on mission complete when unfocused
+                if let ServerMessage::MissionComplete { ref outcome, ref summary, .. } = msg {
+                    if !app.terminal_focused {
+                        let mut stdout = io::stdout();
+                        let _ = decipher_tui::render::send_notification(
+                            &mut stdout,
+                            &format!("DeCIpher: {outcome} \u{2014} {summary}"),
+                        );
+                    }
+                }
+
+                // Route through ChatWidget → typed cells → scrollback lines
+                let scrollback_lines = app.chat.handle_server_message(&msg);
+                if !scrollback_lines.is_empty() {
+                    let h = scrollback_lines.len() as u16;
+                    terminal.insert_before(h, |buf| {
+                        bottom_pane::render_lines_to_buffer(buf, &scrollback_lines);
+                    })?;
+                }
+
+                fps.mark_drawn();
+                app.handle_server_message(msg);
+                need_redraw = true;
             }
 
-            // Tick timer — fires every 32ms for smooth animation
+            // ── Tick — spinner animation ──────────────────────────────────────
             _ = tokio::time::sleep(TICK_RATE) => {
-                if app.stream.active {
-                    if let Some(committed) = try_commit_stream_lines(&mut app) {
-                        let height = committed.len() as u16;
-                        if height > 0 {
-                            terminal.insert_before(height, |buf| {
-                                for (i, line) in committed.iter().enumerate() {
-                                    let y = buf.area.y + i as u16;
-                                    if y < buf.area.y + buf.area.height {
-                                        buf.set_line(buf.area.x, y, &ratatui::text::Line::from(format!("  {}", line)), buf.area.width);
-                                    }
-                                }
-                            })?;
-                            fps.mark_drawn();
-                        }
-                    }
-                }
-                if app.spinner_label.is_some() || app.stream.active {
+                if app.spinner_label.is_some() || app.chat.is_streaming() {
                     app.spinner_frame += 1;
                     need_redraw = true;
                 }
@@ -326,25 +300,6 @@ async fn run_app(
     Ok(())
 }
 
-/// Try to commit complete lines from the stream pipeline.
-/// Returns the committed lines if any, or None.
-fn try_commit_stream_lines(app: &mut App) -> Option<Vec<String>> {
-    use decipher_tui::streaming::DrainPlan;
-
-    let plan = app.stream.commit_tick();
-    let lines = match plan {
-        DrainPlan::None => return None,
-        DrainPlan::Single => app.stream.drain(1),
-        DrainPlan::Batch(n) => app.stream.drain(n),
-    };
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines)
-    }
-}
-
 enum KeyAction {
     None,
     Redraw,
@@ -357,7 +312,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
         if app.agent_busy {
             app.agent_busy = false;
             app.spinner_label = None;
-            app.stream.reset();
+            app.chat.finalize_active_cell_as_failed();
             return KeyAction::Submit(ClientMessage::Interrupt);
         }
         let now = Instant::now();
@@ -368,9 +323,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
             }
         }
         app.last_ctrl_c = Some(now);
-        if !app.input.is_empty() {
+        if !app.input.is_empty() || !app.pending_images.is_empty() {
             app.input.clear();
             app.cursor = 0;
+            app.pending_images.clear();
             return KeyAction::Redraw;
         }
         app.should_quit = true;
@@ -603,13 +559,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                     }
                     KeyCode::Char('v') => {
                         if let Some(img) = decipher_clipboard::paste_image() {
-                            app.last_submitted = "[Image pasted from clipboard]".into();
-                            let text = app.input.trim().to_string();
-                            app.input.clear(); app.cursor = 0;
-                            return KeyAction::Submit(ClientMessage::UserInput {
-                                text: if text.is_empty() { "Analyze this image".into() } else { text },
-                                images: vec![img],
-                            });
+                            // Insert [Image #N] token at cursor (Claude Code style).
+                            // The numbered token is visible in the input AND in the
+                            // scrollback after submit.  Actual image data is staged
+                            // in pending_images and sent with the next submission.
+                            app.session_image_count += 1;
+                            let token = format!("[Image #{}]", app.session_image_count);
+                            app.input.insert_str(app.cursor, &token);
+                            app.cursor += token.len();
+                            app.pending_images.push(img);
+                            return KeyAction::Redraw;
                         }
                         return KeyAction::None;
                     }
