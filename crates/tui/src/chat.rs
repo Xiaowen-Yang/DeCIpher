@@ -512,6 +512,7 @@ mod tests {
             tool: "exec_command".into(),
             reasoning: "running tests".into(),
             args: Some(serde_json::json!({"cmd": "npm test"})),
+            call_id: None,
         };
         let lines = widget.handle_server_message(&msg);
         assert!(!lines.is_empty()); // renders tool start line
@@ -525,6 +526,7 @@ mod tests {
             tool: "git".into(),
             reasoning: "clone".into(),
             args: None,
+            call_id: None,
         });
         let lines = widget.handle_server_message(&ServerMessage::ToolResult {
             tool: "git".into(),
@@ -534,6 +536,7 @@ mod tests {
             exit_code: None,
             output_preview: None,
             output_lines_total: None,
+            call_id: None,
         });
         assert!(!lines.is_empty());
         assert_eq!(widget.committed_cells.len(), 1);
@@ -596,6 +599,7 @@ mod tests {
             tool: "read_file".into(),
             reasoning: "package.json".into(),
             args: Some(serde_json::json!({"path": "package.json"})),
+            call_id: None,
         });
         assert!(widget.active_cell.is_some());
 
@@ -604,10 +608,95 @@ mod tests {
             tool: "read_file".into(),
             reasoning: "Dockerfile".into(),
             args: Some(serde_json::json!({"path": "Dockerfile"})),
+            call_id: None,
         });
         // Still one active cell with 2 calls
         let exec = widget.active_cell.as_ref().unwrap()
             .as_any().downcast_ref::<ExecCell>().unwrap();
         assert_eq!(exec.calls.len(), 2);
+    }
+
+    // ── Regression: protocol messages must not leak into scrollback ──────
+
+    #[test]
+    fn exec_output_delta_produces_no_scrollback() {
+        let mut widget = ChatWidget::new(80);
+        // Start a tool first (ExecOutputDelta only appends to active ExecCell)
+        widget.handle_server_message(&ServerMessage::ToolStart {
+            tool: "exec_command".into(),
+            reasoning: "clone repo".into(),
+            args: Some(serde_json::json!({"cmd": "git clone ..."})),
+            call_id: None,
+        });
+        // ExecOutputDelta must return empty — no scrollback lines
+        let lines = widget.handle_server_message(&ServerMessage::ExecOutputDelta {
+            delta: "Cloning into 'repo'...\n".into(),
+        });
+        assert!(lines.is_empty(), "ExecOutputDelta must not produce scrollback lines");
+    }
+
+    #[test]
+    fn agent_status_produces_no_scrollback() {
+        let mut widget = ChatWidget::new(80);
+        let lines = widget.handle_server_message(&ServerMessage::AgentStatus {
+            phase: "thinking".into(),
+            turn: 2,
+            max_turns: 20,
+            elapsed_ms: 33170,
+            tool_name: None,
+        });
+        assert!(lines.is_empty(), "AgentStatus must not produce scrollback lines");
+    }
+
+    #[test]
+    fn spinner_produces_no_scrollback() {
+        let mut widget = ChatWidget::new(80);
+        let lines = widget.handle_server_message(&ServerMessage::Spinner {
+            label: "Understanding mission".into(),
+            done: false,
+        });
+        assert!(lines.is_empty(), "Spinner must not produce scrollback lines");
+    }
+
+    #[test]
+    fn token_usage_produces_no_scrollback() {
+        let mut widget = ChatWidget::new(80);
+        let lines = widget.handle_server_message(&ServerMessage::TokenUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 500,
+            total_tokens: 1500,
+            context_window: Some(128000),
+        });
+        assert!(lines.is_empty(), "TokenUsage must not produce scrollback lines");
+    }
+
+    #[test]
+    fn mission_complete_renders_clean_result() {
+        let mut widget = ChatWidget::new(80);
+        let lines = widget.handle_server_message(&ServerMessage::MissionComplete {
+            outcome: "PASS".into(),
+            summary: "Successfully cloned the repository https://github.com/example/repo".into(),
+            turns: 3,
+            elapsed_ms: 44800,
+            urls: vec!["https://github.com/example/repo".into()],
+            files_modified: vec![],
+            errors_encountered: vec![],
+            next_steps: vec![],
+        });
+        // Should produce display lines (result cell)
+        assert!(!lines.is_empty());
+        // None of the lines should contain raw JSON protocol markers
+        for line in &lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(!text.contains(r#""type":"#), "Raw JSON leaked into result: {text}");
+            assert!(!text.contains("]8;;"), "OSC hyperlink leaked into result: {text}");
+            assert!(!text.starts_with("Error:"), "Error prefix in successful result: {text}");
+        }
+        // Should contain the outcome
+        let all_text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>().join("");
+        assert!(all_text.contains("PASS"), "Result should contain PASS");
+        assert!(all_text.contains("[RESULT]"), "Result should contain [RESULT]");
     }
 }

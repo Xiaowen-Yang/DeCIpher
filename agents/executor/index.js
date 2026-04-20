@@ -443,12 +443,19 @@ export async function executeTarget(
   const mission =
     sessionState.currentMission ?? buildSyntheticMission(action, target);
 
-  console.log(
-    pc.bold(
-      `\n  Agent starting on: ${pc.cyan(target.path ?? "(no target)")}\n`,
-    ),
-  );
-  console.log(pc.dim(`  Goal: ${mission.goal}`));
+  // Server-mode detection: when TUI callbacks are present, the Rust TUI owns
+  // all display rendering. Console output would leak to stderr and corrupt
+  // the TUI with spurious "Error:" prefixed lines.
+  const isServerMode = !!(options.onToolResult || options.onStatus);
+
+  if (!isServerMode) {
+    console.log(
+      pc.bold(
+        `\n  Agent starting on: ${pc.cyan(target.path ?? "(no target)")}\n`,
+      ),
+    );
+    console.log(pc.dim(`  Goal: ${mission.goal}`));
+  }
 
   const { runAgentLoop, printAgentLoopResult } =
     await import("./agent-loop.js");
@@ -461,7 +468,13 @@ export async function executeTarget(
 
   sessionState.lastRunResult = result;
   sessionState.lastVerificationResult = result.state;
-  printAgentLoopResult(result);
+
+  // In server-mode, the TUI renders the result via mission_complete protocol
+  // message (sent by server-mode.js). Don't also print to console — that
+  // would go to stderr and appear as Error cells in the TUI.
+  if (!isServerMode) {
+    printAgentLoopResult(result);
+  }
 
   // ── Acceptance checks for greenfield scenarios ────────────────────────────
   const meta = target?.meta ?? {};
@@ -473,10 +486,10 @@ export async function executeTarget(
         printAcceptanceSummary,
       } = await import("../verifier/acceptance.js");
 
-      console.log(pc.bold("\n  [ACCEPTANCE CHECKS]\n"));
+      if (!isServerMode) console.log(pc.bold("\n  [ACCEPTANCE CHECKS]\n"));
       const checks = await loadAcceptanceChecks(target.path);
       const report = await runAcceptanceChecks(checks, result.workspace);
-      printAcceptanceSummary(report);
+      if (!isServerMode) printAcceptanceSummary(report);
 
       // Override the result outcome based on acceptance
       if (report.passed && result.outcome === "PASS") {
@@ -487,7 +500,8 @@ export async function executeTarget(
         result.acceptancePassed = false;
       }
     } catch (err) {
-      console.log(pc.yellow(`  Acceptance check error: ${err.message}\n`));
+      if (!isServerMode)
+        console.log(pc.yellow(`  Acceptance check error: ${err.message}\n`));
     }
   }
 

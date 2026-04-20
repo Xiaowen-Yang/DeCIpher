@@ -39,7 +39,7 @@ impl AgentBridge {
             .spawn()
             .map_err(|e| {
                 eprintln!("Failed to start agent: {e}\nTried: node {bin_path}");
-                io::Error::new(io::ErrorKind::Other, format!("Failed to start agent: {e}"))
+                io::Error::other(format!("Failed to start agent: {e}"))
             })?;
 
         let child_stdin = child.stdin.take().expect("child stdin");
@@ -69,11 +69,21 @@ impl AgentBridge {
             }
         });
 
-        // Stderr reader: forward as error messages
+        // Stderr reader: forward only lines that look like actual errors.
+        //
+        // Lesson: "Stderr Is Not An Error Channel" — Node.js emits warnings,
+        // deprecation notices, spinner output, and display formatting to stderr.
+        // Forwarding everything as ServerMessage::Error makes normal operations
+        // appear broken in the TUI. Only forward lines containing error patterns.
         tokio::spawn(async move {
             let mut lines = BufReader::new(child_stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = agent_tx.send(ServerMessage::Error { message: line }).await;
+                if is_error_line(&line) {
+                    let _ = agent_tx.send(ServerMessage::Error { message: line }).await;
+                }
+                // Non-error stderr lines are silently dropped.
+                // The source fixes (spinner, result printer) prevent display
+                // output from reaching stderr in server-mode.
             }
         });
 
@@ -99,6 +109,72 @@ impl AgentBridge {
     }
 }
 
+/// Determine if a stderr line looks like an actual error (vs display output).
+///
+/// Node.js emits deprecation warnings, spinner output, and ANSI-formatted
+/// display text to stderr.  Only lines matching error patterns should be
+/// forwarded to the TUI as `ServerMessage::Error`.
+fn is_error_line(line: &str) -> bool {
+    // Strip ANSI escape sequences for pattern matching.
+    let stripped = strip_ansi(line);
+    let trimmed = stripped.trim();
+
+    // Empty lines or pure whitespace are never errors.
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Positive match: known error patterns.
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("error")
+        || lower.contains("fatal")
+        || lower.contains("unhandled")
+        || lower.contains("exception")
+        || lower.contains("enoent")
+        || lower.contains("eacces")
+        || lower.contains("eperm")
+        || lower.starts_with("at ")       // stack trace frame
+        || lower.starts_with("warn")
+        || lower.contains("deprecat")
+}
+
+/// Strip ANSI SGR and OSC escape sequences from a string.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    // CSI sequence: consume until letter
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if c.is_ascii_alphabetic() { break; }
+                    }
+                }
+                Some(']') => {
+                    // OSC sequence: consume until ST (\x1b\\) or BEL (\x07)
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        if c == '\x07' { chars.next(); break; }
+                        if c == '\x1b' {
+                            chars.next();
+                            if chars.peek() == Some(&'\\') { chars.next(); }
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Find the Node.js agent script path.
 fn find_agent_script() -> String {
     if let Ok(path) = std::env::var("DECIPHER_AGENT_SCRIPT") {
@@ -114,4 +190,87 @@ fn find_agent_script() -> String {
     let c = PathBuf::from("bin/decipher");
     if c.exists() { return c.canonicalize().unwrap_or(c).to_string_lossy().to_string(); }
     "bin/decipher".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── is_error_line ────────────────────────────────────────────────────
+
+    #[test]
+    fn error_line_detects_actual_errors() {
+        assert!(is_error_line("Error: connection refused"));
+        assert!(is_error_line("TypeError: Cannot read property 'x' of undefined"));
+        assert!(is_error_line("FATAL: out of memory"));
+        assert!(is_error_line("UnhandledPromiseRejectionWarning: Error"));
+        assert!(is_error_line("at Object.<anonymous> (/app/index.js:10:5)"));
+        assert!(is_error_line("ENOENT: no such file or directory"));
+        assert!(is_error_line("EACCES: permission denied"));
+        assert!(is_error_line("Warning: deprecated API"));
+    }
+
+    #[test]
+    fn error_line_rejects_display_output() {
+        // Spinner completion lines
+        assert!(!is_error_line("  \u{2713} exec_command (4.9s)"));
+        assert!(!is_error_line("  \u{2713} Working in \u{2192} /app"));
+
+        // Result rendering lines
+        assert!(!is_error_line("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"));
+        assert!(!is_error_line("  [RESULT]"));
+        assert!(!is_error_line("  Outcome:     PASS (44.8s)"));
+        assert!(!is_error_line("  Turns:       3"));
+        assert!(!is_error_line("  Summary:     Successfully cloned the repo"));
+
+        // Plan update lines
+        assert!(!is_error_line("  [PLAN]"));
+        assert!(!is_error_line("    \u{2713} Read Dockerfile"));
+
+        // Empty / whitespace
+        assert!(!is_error_line(""));
+        assert!(!is_error_line("   "));
+
+        // Raw protocol JSON (should not be shown as error)
+        assert!(!is_error_line(r#"{"type":"exec_output_delta","delta":"Cloning..."}"#));
+        assert!(!is_error_line(r#"{"type":"agent_status","phase":"thinking","turn":2}"#));
+    }
+
+    #[test]
+    fn error_line_handles_ansi_codes() {
+        // Error wrapped in ANSI color codes
+        assert!(is_error_line("\x1b[31mError: something broke\x1b[0m"));
+        // Display output wrapped in ANSI
+        assert!(!is_error_line("\x1b[32m\u{2713}\x1b[0m done (2.1s)"));
+    }
+
+    #[test]
+    fn error_line_handles_osc_sequences() {
+        // OSC 8 hyperlink around a URL in an error message
+        assert!(is_error_line("Error: failed to fetch \x1b]8;;https://example.com\x07url\x1b]8;;\x07"));
+        // OSC 8 in display output
+        assert!(!is_error_line("  Summary: cloned \x1b]8;;https://github.com/repo\x07repo\x1b]8;;\x07"));
+    }
+
+    // ── strip_ansi ─────────────────��─────────────────────────────────────
+
+    #[test]
+    fn strip_ansi_removes_csi() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi("\x1b[1;32mbold green\x1b[0m"), "bold green");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc() {
+        // BEL-terminated OSC
+        assert_eq!(strip_ansi("\x1b]8;;https://x.com\x07link\x1b]8;;\x07"), "link");
+        // ST-terminated OSC
+        assert_eq!(strip_ansi("\x1b]0;title\x1b\\rest"), "rest");
+    }
+
+    #[test]
+    fn strip_ansi_preserves_plain_text() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+        assert_eq!(strip_ansi(""), "");
+    }
 }

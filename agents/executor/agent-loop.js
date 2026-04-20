@@ -250,7 +250,7 @@ export async function runAgentLoop(mission, target, config, options = {}) {
     sessionState,
     config,
     log,
-    onPlanUpdate: renderPlanUpdate,
+    onPlanUpdate: options.onToolResult ? () => {} : renderPlanUpdate,
     onExecOutput: options.onExecOutput ?? null,
   };
 

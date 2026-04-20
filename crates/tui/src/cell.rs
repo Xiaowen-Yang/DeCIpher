@@ -876,16 +876,16 @@ mod tests {
 
     #[test]
     fn exec_cell_complete() {
-        let mut cell = ExecCell::new("git".into(), "clone repo".into(), None);
-        cell.complete_call("git", true, "cloned".into(), 2100, None, None, None);
+        let mut cell = ExecCell::new("git".into(), "clone repo".into(), None, None);
+        cell.complete_call("git", true, "cloned".into(), 2100, None, None, None, None);
         let lines = cell.display_lines(80);
         assert_eq!(lines.len(), 1);
     }
 
     #[test]
     fn exec_cell_coalesce() {
-        let mut cell = ExecCell::new("read_file".into(), "package.json".into(), Some(serde_json::json!({"path": "package.json"})));
-        cell.add_call("read_file".into(), "Dockerfile".into(), Some(serde_json::json!({"path": "Dockerfile"})));
+        let mut cell = ExecCell::new("read_file".into(), "package.json".into(), Some(serde_json::json!({"path": "package.json"})), None);
+        cell.add_call("read_file".into(), "Dockerfile".into(), Some(serde_json::json!({"path": "Dockerfile"})), None);
         assert_eq!(cell.calls.len(), 2);
         assert_eq!(cell.desired_height(80), 2);
     }
@@ -896,6 +896,7 @@ mod tests {
             "exec_command".into(),
             "build the project".into(),
             Some(serde_json::json!({"cmd": "docker build ."})),
+            None,
         );
         let lines = cell.display_lines(80);
         assert_eq!(lines.len(), 1);
@@ -910,6 +911,7 @@ mod tests {
             "read_file".into(),
             "reading config".into(),
             Some(serde_json::json!({"path": "src/main.rs"})),
+            None,
         );
         let lines = cell.display_lines(80);
         let line_str: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
@@ -922,10 +924,12 @@ mod tests {
             "exec_command".into(),
             "run tests".into(),
             Some(serde_json::json!({"cmd": "npm test"})),
+            None,
         );
         cell.complete_call(
             "exec_command", false, "tests failed".into(), 5000,
             Some(1), Some("FAIL src/app.test.js\nExpected 5 but got 3".into()), Some(42),
+            None,
         );
         let lines = cell.display_lines(80);
         // Should have: result line + 2 preview lines
