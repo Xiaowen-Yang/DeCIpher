@@ -207,7 +207,7 @@ impl ChatWidget {
                 lines
             }
 
-            ServerMessage::ToolStart { tool, reasoning, args } => {
+            ServerMessage::ToolStart { tool, reasoning, args, call_id } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
 
@@ -216,7 +216,7 @@ impl ChatWidget {
                 if is_exploring {
                     if let Some(ref mut cell) = self.active_cell {
                         if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
-                            exec_cell.add_call(tool.clone(), reasoning.clone(), args.clone());
+                            exec_cell.add_call(tool.clone(), reasoning.clone(), args.clone(), call_id.clone());
                             self.active_cell_revision += 1;
                             // Render the new call using rich display
                             let new_call = exec_cell.calls.last().unwrap();
@@ -241,20 +241,21 @@ impl ChatWidget {
 
                 // Non-exploring or no active ExecCell: flush and create new
                 self.flush_active_cell_internal();
-                let cell = ExecCell::new(tool.clone(), reasoning.clone(), args.clone());
+                let cell = ExecCell::new(tool.clone(), reasoning.clone(), args.clone(), call_id.clone());
                 lines.extend(cell.display_lines(w));
                 self.active_cell = Some(Box::new(cell));
                 self.active_cell_revision += 1;
                 lines
             }
 
-            ServerMessage::ToolResult { tool, success, summary, elapsed_ms, exit_code, output_preview, output_lines_total } => {
+            ServerMessage::ToolResult { tool, success, summary, elapsed_ms, exit_code, output_preview, output_lines_total, call_id } => {
                 let mut lines = Vec::new();
                 if let Some(ref mut cell) = self.active_cell {
                     if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
                         exec_cell.complete_call(
                             tool, *success, summary.clone(), *elapsed_ms,
                             *exit_code, output_preview.clone(), *output_lines_total,
+                            call_id.as_deref(),
                         );
                         // Clear streaming output after tool completes
                         exec_cell.streaming_output.clear();
@@ -376,35 +377,34 @@ impl ChatWidget {
             }
 
             // Native function calling — display like ToolStart/ToolResult
-            ServerMessage::ToolCall { name, input, .. } => {
+            ServerMessage::ToolCall { call_id, name, input } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
-                // Try to parse input as JSON args for rich display
                 let args = serde_json::from_str::<serde_json::Value>(input).ok();
                 let is_exploring = matches!(name.as_str(), "read_file" | "list_files" | "search");
                 if is_exploring {
                     if let Some(ref mut cell) = self.active_cell {
                         if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
-                            exec_cell.add_call(name.clone(), input.chars().take(80).collect(), args);
+                            exec_cell.add_call(name.clone(), input.chars().take(80).collect(), args, Some(call_id.clone()));
                             self.active_cell_revision += 1;
                             return lines;
                         }
                     }
                 }
                 self.flush_active_cell_internal();
-                let cell = ExecCell::new(name.clone(), input.chars().take(80).collect(), args);
+                let cell = ExecCell::new(name.clone(), input.chars().take(80).collect(), args, Some(call_id.clone()));
                 lines.extend(cell.display_lines(w));
                 self.active_cell = Some(Box::new(cell));
                 self.active_cell_revision += 1;
                 lines
             }
 
-            ServerMessage::ToolCallResult { name, output, success, .. } => {
+            ServerMessage::ToolCallResult { call_id, name, output, success } => {
                 let mut lines = Vec::new();
                 if let Some(ref mut cell) = self.active_cell {
                     if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
                         let summary: String = output.chars().take(100).collect();
-                        exec_cell.complete_call(name, *success, summary.clone(), 0, None, None, None);
+                        exec_cell.complete_call(name, *success, summary.clone(), 0, None, None, None, Some(call_id.as_str()));
                         self.active_cell_revision += 1;
                         let completed_call = exec_cell.calls.iter().rev()
                             .find(|c| c.tool == *name && c.success.is_some());

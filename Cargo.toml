@@ -6,6 +6,8 @@ members = [
     "crates/markdown",
     "crates/clipboard",
     "crates/agent-bridge",
+    "crates/mock-provider",
+    "crates/providers",
 ]
 resolver = "2"
 
@@ -21,6 +23,8 @@ decipher-tui = { path = "crates/tui" }
 decipher-markdown = { path = "crates/markdown" }
 decipher-clipboard = { path = "crates/clipboard" }
 decipher-agent-bridge = { path = "crates/agent-bridge" }
+decipher-providers = { path = "crates/providers" }
+decipher-mock-provider = { path = "crates/mock-provider" }
 
 # External
 crossterm = { version = "0.28", features = ["bracketed-paste", "event-stream"] }

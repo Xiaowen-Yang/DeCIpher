@@ -77,6 +77,9 @@ pub enum ServerMessage {
         /// Tool arguments (JSON object) — cmd for exec_command, path for read/write.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         args: Option<serde_json::Value>,
+        /// Correlation ID for multi-tool turns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
 
     #[serde(rename = "tool_result")]
@@ -94,6 +97,9 @@ pub enum ServerMessage {
         /// Total number of output lines.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_lines_total: Option<u32>,
+        /// Correlation ID for multi-tool turns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
     },
 
     #[serde(rename = "agent_message")]

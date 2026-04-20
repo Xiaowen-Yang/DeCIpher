@@ -329,13 +329,19 @@ export async function runAgentLoop(mission, target, config, options = {}) {
         break;
       }
 
-      // Accumulate per-turn usage
+      // Track per-turn usage.
+      // turnUsage.prompt_tokens = actual context size sent to the model THIS turn.
+      // totalUsage accumulates completion tokens across turns (prompt_tokens is NOT
+      // summed — the last turn's prompt_tokens IS the current context size).
       const { getLastUsage } = await import("../../lib/api-client.js");
       const turnUsage = response.usage ?? getLastUsage();
+      let lastTurnPromptTokens = 0;
       if (turnUsage) {
-        totalUsage.prompt_tokens += turnUsage.prompt_tokens;
+        lastTurnPromptTokens = turnUsage.prompt_tokens;
+        totalUsage.prompt_tokens = turnUsage.prompt_tokens; // current, not cumulative
         totalUsage.completion_tokens += turnUsage.completion_tokens;
-        totalUsage.total_tokens += turnUsage.total_tokens;
+        totalUsage.total_tokens =
+          turnUsage.prompt_tokens + totalUsage.completion_tokens;
         if (options.onUsage) options.onUsage(turnUsage, totalUsage);
       }
 
@@ -407,12 +413,7 @@ export async function runAgentLoop(mission, target, config, options = {}) {
         turnSp.stop(`${pc.cyan(toolName)}`);
         log(`  tool: ${toolName}`);
 
-        // Notify TUI of tool start
-        if (options.onToolStart) {
-          options.onToolStart(toolName, response.content ?? "", toolArgs);
-        }
-
-        // ── done ────────────────────────────────────────────────
+        // ── done — handle before onToolStart to avoid spurious TUI cell ──
         if (toolName === "done") {
           outcome =
             toolArgs.outcome === "FAIL"
@@ -430,6 +431,16 @@ export async function runAgentLoop(mission, target, config, options = {}) {
           if (outcome !== "PASS") preserveWorkspace = true;
           doneInThisTurn = true;
           break;
+        }
+
+        // Notify TUI of tool start (after done check to avoid spurious cell)
+        if (options.onToolStart) {
+          options.onToolStart(
+            toolName,
+            response.content ?? "",
+            toolArgs,
+            toolCallId,
+          );
         }
 
         // ── Policy-driven approval gate ─────────────────────────
@@ -519,13 +530,21 @@ export async function runAgentLoop(mission, target, config, options = {}) {
             : (toolResult.error ?? "failed").slice(0, 120);
           const outputText = toolResult.output ?? "";
           const outputLines = outputText.split("\n");
-          const outputPreview = resultOk
-            ? null
-            : outputLines.slice(-5).join("\n").slice(0, 500);
+          let outputPreview;
+          if (!resultOk) {
+            // Failure: send last 5 lines for error preview
+            outputPreview = outputLines.slice(-5).join("\n").slice(0, 500);
+          } else if (outputLines.length > 8) {
+            // Success with long output: send full output for head/tail elision in TUI
+            outputPreview = outputText.slice(0, 2000);
+          } else {
+            outputPreview = null;
+          }
           options.onToolResult(toolName, resultOk, summary, execElapsedMs, {
             exit_code: toolResult.exitCode ?? null,
             output_preview: outputPreview,
             output_lines_total: outputLines.length,
+            call_id: toolCallId,
           });
         }
         log(
@@ -630,9 +649,9 @@ export async function runAgentLoop(mission, target, config, options = {}) {
       // ── Token-based auto-compaction ─────────────────────────
       const { shouldCompact, compactMessages } =
         await import("../../lib/compact.js");
-      const lastPromptTokens = totalUsage.prompt_tokens;
+      // lastTurnPromptTokens = actual context size from the most recent API call.
       if (
-        shouldCompact(lastPromptTokens, config.model) &&
+        shouldCompact(lastTurnPromptTokens, config.model) &&
         messages.length > 8
       ) {
         try {

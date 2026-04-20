@@ -191,14 +191,14 @@ pub struct ExecCell {
 const EXEC_OUTPUT_PREVIEW_LINES: usize = 5;
 
 impl ExecCell {
-    pub fn new(tool: String, reasoning: String, args: Option<serde_json::Value>) -> Self {
+    pub fn new(tool: String, reasoning: String, args: Option<serde_json::Value>, call_id: Option<String>) -> Self {
         Self {
             calls: vec![ExecCall {
                 tool,
                 output: Some(reasoning),
                 elapsed_ms: None,
                 success: None,
-                call_id: None,
+                call_id,
                 args,
                 exit_code: None,
                 output_preview: None,
@@ -213,7 +213,8 @@ impl ExecCell {
         self.streaming_output.push_str(delta);
     }
 
-    /// Mark a call as completed (by index or call_id).
+    /// Mark a call as completed. Matches by call_id when available,
+    /// falls back to last-same-name for backward compatibility.
     pub fn complete_call(
         &mut self,
         tool: &str,
@@ -223,9 +224,16 @@ impl ExecCell {
         exit_code: Option<i32>,
         output_preview: Option<String>,
         output_lines_total: Option<u32>,
+        call_id: Option<&str>,
     ) {
-        // Find the last call matching this tool that isn't yet completed.
-        if let Some(call) = self.calls.iter_mut().rev().find(|c| c.tool == tool && c.success.is_none()) {
+        let target = if let Some(cid) = call_id {
+            // Prefer exact call_id match
+            self.calls.iter_mut().find(|c| c.call_id.as_deref() == Some(cid) && c.success.is_none())
+        } else {
+            // Fallback: last call matching tool name
+            self.calls.iter_mut().rev().find(|c| c.tool == tool && c.success.is_none())
+        };
+        if let Some(call) = target {
             call.success = Some(success);
             call.output = Some(summary);
             call.elapsed_ms = Some(elapsed_ms);
@@ -236,13 +244,13 @@ impl ExecCell {
     }
 
     /// Add another tool call (coalescing).
-    pub fn add_call(&mut self, tool: String, reasoning: String, args: Option<serde_json::Value>) {
+    pub fn add_call(&mut self, tool: String, reasoning: String, args: Option<serde_json::Value>, call_id: Option<String>) {
         self.calls.push(ExecCall {
             tool,
             output: Some(reasoning),
             elapsed_ms: None,
             success: None,
-            call_id: None,
+            call_id,
             args,
             exit_code: None,
             output_preview: None,
