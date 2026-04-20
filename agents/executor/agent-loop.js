@@ -26,7 +26,10 @@ import {
 } from "../../lib/session-store.js";
 import { runCompletionNotification } from "../../lib/notifications.js";
 import { TOOL_REGISTRY, toolsPromptSection, isToolRisky } from "./tools.js";
-import { callAIWithMessages } from "../../lib/api-client.js";
+import {
+  callAIWithMessages,
+  callAIWithMessagesStreaming,
+} from "../../lib/api-client.js";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 
 const MAX_TURNS = 20;
@@ -138,6 +141,7 @@ function parseToolCall(raw) {
 // ── Tool result formatting ────────────────────────────────────────────────────
 
 const OUTPUT_LIMIT = 4000;
+const OUTPUT_LIMIT_FAILURE = 8000; // More context on failure for diagnosis
 const FILE_LIMIT = 6000;
 
 function formatToolResult(toolName, args, result) {
@@ -145,9 +149,11 @@ function formatToolResult(toolName, args, result) {
   switch (toolName) {
     case "exec_command": {
       const fullOutput = result.output ?? "";
-      const truncated = fullOutput.length > OUTPUT_LIMIT;
+      // Use a higher output limit for failed commands to preserve diagnostic info.
+      const limit = result.exitCode !== 0 ? OUTPUT_LIMIT_FAILURE : OUTPUT_LIMIT;
+      const truncated = fullOutput.length > limit;
       const preview = truncated
-        ? fullOutput.slice(0, OUTPUT_LIMIT) +
+        ? fullOutput.slice(0, limit) +
           `\n... (output truncated: ${fullOutput.length} chars total — run read_file or exec_command to see full output)`
         : fullOutput;
       return `${header}\nCommand: ${args.cmd}\nExit code: ${result.exitCode}${result.exitCode !== 0 ? " (FAILED)" : ""}\nOutput:\n${preview || "(no output)"}`;
@@ -267,6 +273,7 @@ export async function runAgentLoop(mission, target, config, options = {}) {
     config,
     log,
     onPlanUpdate: renderPlanUpdate,
+    onExecOutput: options.onExecOutput ?? null,
   };
 
   // ── Build system prompt (async, template-based) ────────────
@@ -304,11 +311,16 @@ export async function runAgentLoop(mission, target, config, options = {}) {
       completedTurns = turn;
       log(pc.bold(`\n  ── Turn ${turn}/${MAX_TURNS} ──`));
 
-      // Call LLM (withRetry handles transient errors automatically)
+      // Call LLM with streaming (deltas forwarded to TUI via onDelta callback)
       const turnSp = startSpinner(`Agent turn ${turn}`);
       let raw;
       try {
-        raw = await callAIWithMessages(messages, config, systemPrompt);
+        raw = await callAIWithMessagesStreaming(
+          messages,
+          config,
+          systemPrompt,
+          options.onDelta ?? null,
+        );
       } catch (err) {
         // Only reaches here after all retries are exhausted (terminal error)
         turnSp.stop(pc.red("API error (retries exhausted)"));
@@ -337,6 +349,11 @@ export async function runAgentLoop(mission, target, config, options = {}) {
         `${pc.cyan(toolCall.tool)} — ${toolCall.reasoning.slice(0, 60)}`,
       );
       log(`  tool: ${toolCall.tool} | ${toolCall.reasoning}`);
+
+      // Notify TUI of tool selection (shows tool name + reasoning to user)
+      if (options.onToolStart) {
+        options.onToolStart(toolCall.tool, toolCall.reasoning);
+      }
 
       messages.push({ role: "assistant", content: raw });
 
@@ -371,6 +388,7 @@ export async function runAgentLoop(mission, target, config, options = {}) {
 
       // ── Execute tool ─────────────────────────────────────────
       const execSp = startSpinner(`${toolCall.tool}`);
+      const execStartMs = Date.now();
       let toolResult;
       try {
         toolResult = await TOOL_REGISTRY[toolCall.tool].handler(
@@ -387,8 +405,19 @@ export async function runAgentLoop(mission, target, config, options = {}) {
         toolResult,
       );
       // Stop spinner — show elapsed time only, no redundant "ok" text
+      const execElapsedMs = Date.now() - execStartMs;
       execSp.stop();
       const resultOk = toolResult.success !== false;
+
+      // Notify TUI of tool completion (shows ✓/✗ + summary to user)
+      if (options.onToolResult) {
+        const summary = resultOk
+          ? (
+              toolResult.summary ?? resultText.split("\n").slice(0, 1).join("")
+            ).slice(0, 120)
+          : (toolResult.error ?? "failed").slice(0, 120);
+        options.onToolResult(toolCall.tool, resultOk, summary, execElapsedMs);
+      }
       log(
         pc.dim(
           `  result: ${resultText.split("\n").slice(0, 2).join(" | ").slice(0, 120)}`,
@@ -396,7 +425,9 @@ export async function runAgentLoop(mission, target, config, options = {}) {
       );
 
       // ── Repair loop detection ─────────────────────────────────
-      // Track consecutive failures and same-operation repeats
+      // Track consecutive failures and same-operation repeats.
+      // On EVERY failure, inject a diagnostic nudge so the LLM
+      // follows the Debugging Protocol instead of blindly retrying.
       if (!resultOk) {
         consecutiveFailures++;
         const argsKey = `${toolCall.tool}:${simpleHash(JSON.stringify(toolCall.args))}`;
@@ -433,6 +464,25 @@ export async function runAgentLoop(mission, target, config, options = {}) {
           consecutiveFailures = 0; // reset after escalation
           continue;
         }
+
+        // First failure — nudge the LLM to follow Debugging Protocol
+        log(
+          pc.yellow(
+            `  tool failed (${consecutiveFailures} consecutive) — nudging diagnosis`,
+          ),
+        );
+        messages.push({
+          role: "user",
+          content:
+            resultText +
+            "\n\n[COMMAND FAILED] Read the error output above carefully. " +
+            "Follow the Debugging Protocol: " +
+            "1) Identify the root cause from the error message. " +
+            "2) Form a hypothesis. " +
+            "3) Fix the issue with the smallest possible change, then retry. " +
+            "Do NOT retry the exact same command without changing something first.",
+        });
+        continue;
       } else {
         consecutiveFailures = 0; // reset on success
       }

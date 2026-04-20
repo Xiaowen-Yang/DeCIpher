@@ -112,6 +112,10 @@ pub enum ServerMessage {
         total_tokens: u64,
     },
 
+    /// Streaming output from a running exec_command (stdout/stderr chunks).
+    #[serde(rename = "exec_output_delta")]
+    ExecOutputDelta { delta: String },
+
     /// Native tool call from the LLM (parallel tool calling support).
     #[serde(rename = "tool_call")]
     ToolCall {

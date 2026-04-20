@@ -175,7 +175,12 @@ pub struct ExecCall {
 #[derive(Debug)]
 pub struct ExecCell {
     pub calls: Vec<ExecCall>,
+    /// Accumulated streaming output from exec_command (real-time).
+    pub streaming_output: String,
 }
+
+/// Max lines of streaming output to show in the cell.
+const EXEC_OUTPUT_PREVIEW_LINES: usize = 5;
 
 impl ExecCell {
     pub fn new(tool: String, reasoning: String) -> Self {
@@ -187,7 +192,13 @@ impl ExecCell {
                 success: None,
                 call_id: None,
             }],
+            streaming_output: String::new(),
         }
+    }
+
+    /// Append streaming output from exec_command.
+    pub fn append_output(&mut self, delta: &str) {
+        self.streaming_output.push_str(delta);
     }
 
     /// Mark a call as completed (by index or call_id).
@@ -253,6 +264,31 @@ impl Cell for ExecCell {
                         Span::styled(elapsed, DIM),
                     ]));
                 }
+            }
+        }
+        // Show streaming output preview (last N lines, dimmed, with tree prefix)
+        if !self.streaming_output.is_empty() {
+            let output_lines: Vec<&str> = self.streaming_output.lines().collect();
+            let total = output_lines.len();
+            let start = total.saturating_sub(EXEC_OUTPUT_PREVIEW_LINES);
+            if start > 0 {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        format!("\u{2502} \u{2026} +{} lines", start),
+                        DIM,
+                    ),
+                ]));
+            }
+            for (i, line_text) in output_lines[start..].iter().enumerate() {
+                let is_last = i == output_lines[start..].len() - 1;
+                let prefix = if is_last { "\u{2514} " } else { "\u{2502} " };
+                let truncated: String = line_text.chars().take(100).collect();
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(prefix, DIM),
+                    Span::styled(truncated, DIM),
+                ]));
             }
         }
         lines

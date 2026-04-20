@@ -158,6 +158,20 @@ impl ChatWidget {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
                 self.flush_active_cell_internal();
+                // Green ✓ line to signal mission understanding completed
+                lines.push(Line::from(vec![
+                    ratatui::text::Span::raw("  "),
+                    ratatui::text::Span::styled(
+                        "\u{2713}",
+                        ratatui::style::Style::default().fg(ratatui::style::Color::Green),
+                    ),
+                    ratatui::text::Span::styled(
+                        " Mission understood",
+                        ratatui::style::Style::default()
+                            .fg(ratatui::style::Color::Green)
+                            .add_modifier(ratatui::style::Modifier::DIM),
+                    ),
+                ]));
                 let cell = MissionCell::new(understood.clone(), target.clone(), steps.clone());
                 lines.extend(cell.display_lines(w));
                 self.committed_cells.push(Box::new(cell));
@@ -357,6 +371,21 @@ impl ChatWidget {
                 });
                 if all_done { self.flush_active_cell_internal(); }
                 lines
+            }
+
+            // Exec output delta — show last few lines in scrollback as dimmed output
+            ServerMessage::ExecOutputDelta { delta } => {
+                // Append output to active ExecCell if one exists
+                if let Some(ref mut cell) = self.active_cell {
+                    if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
+                        exec_cell.append_output(delta);
+                        self.active_cell_revision += 1;
+                    }
+                }
+                // Don't emit scrollback lines for every chunk — the output
+                // will be visible in the final tool_result summary.
+                // Only bump revision so the viewport redraws with streaming preview.
+                Vec::new()
             }
 
             // Non-visual messages — no cells, no scrollback

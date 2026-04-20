@@ -222,11 +222,19 @@ impl<'a> BottomPane<'a> {
             .unwrap_or(self.app.spinner_frame);
         let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
         let elapsed = self.app.spinner_started
-            .map(|t| format!(" ({:.1}s)", t.elapsed().as_secs_f64()))
+            .map(|t| format!("({:.1}s)", t.elapsed().as_secs_f64()))
             .unwrap_or_default();
 
+        // Use agent phase as display label when available
+        let phase = &self.app.agent_phase;
+        let display_label = if phase != &crate::app::AgentPhase::Idle {
+            phase.label()
+        } else {
+            label
+        };
+
         // Build shimmer spans (convert crossterm Color → ratatui Color)
-        let shimmer_chars = shimmer::shimmer_chars(label);
+        let shimmer_chars = shimmer::shimmer_chars(display_label);
         let mut spans = vec![
             Span::raw("  "),
             Span::styled(frame.to_string(), CYAN),
@@ -236,9 +244,24 @@ impl<'a> BottomPane<'a> {
             let rat_color = crossterm_to_ratatui_color(*color);
             spans.push(Span::styled(ch.to_string(), Style::default().fg(rat_color)));
         }
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(elapsed, DIM));
 
+        // Add interrupt hint
+        spans.push(Span::styled(" \u{2022} ", DIM));
+        spans.push(Span::styled("esc to interrupt", DIM));
+
         lines.push(Line::from(spans));
+
+        // Phase detail line (tool name, context)
+        if let Some(ref detail) = self.app.agent_phase_detail {
+            let truncated: String = detail.chars().take(60).collect();
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("\u{2514} ", DIM),
+                Span::styled(truncated, DIM),
+            ]));
+        }
     }
 
     fn build_hints(&self, lines: &mut Vec<Line<'static>>) {
@@ -585,6 +608,12 @@ pub fn goodbye_lines() -> Vec<Line<'static>> {
 }
 
 /// Render Lines into a Buffer (for insert_before).
+///
+/// Unlike `buf.set_line()` which pads every line with styled spaces to the
+/// full buffer width (locking lines to a fixed width in terminal scrollback),
+/// this writes only actual content characters. Remaining cells stay at the
+/// default (unstyled space), which ratatui's diff engine skips when rendering.
+/// This allows the terminal emulator to re-wrap content naturally on resize.
 pub fn render_lines_to_buffer(buf: &mut Buffer, lines: &[Line<'_>]) {
     let area = buf.area;
     for (i, line) in lines.iter().enumerate() {
@@ -592,6 +621,22 @@ pub fn render_lines_to_buffer(buf: &mut Buffer, lines: &[Line<'_>]) {
         if y >= area.y + area.height {
             break;
         }
-        buf.set_line(area.x, y, line, area.width);
+        // Write only the actual span content — no trailing space padding.
+        // This lets the terminal emulator re-wrap text on resize.
+        let mut x = area.x;
+        for span in &line.spans {
+            for ch in span.content.chars() {
+                if x >= area.x + area.width {
+                    break;
+                }
+                let cell = &mut buf[(x, y)];
+                cell.set_char(ch);
+                cell.set_style(span.style);
+                x += 1;
+            }
+        }
+        // Remaining cells stay at buffer default (empty space, no style).
+        // ratatui's diff engine won't write these to the terminal, so
+        // the terminal emulator sees only the actual text width.
     }
 }

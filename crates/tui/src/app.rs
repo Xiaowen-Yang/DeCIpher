@@ -8,6 +8,28 @@ use crate::cell::AgentMessageCell;
 use crate::chat::ChatWidget;
 use crate::terminal_detect::TerminalCaps;
 
+/// Agent processing phase — shown in the status indicator.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentPhase {
+    Idle,
+    Planning,
+    Thinking,
+    Executing,
+    Verifying,
+}
+
+impl AgentPhase {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Idle => "",
+            Self::Planning => "Planning",
+            Self::Thinking => "Thinking",
+            Self::Executing => "Executing",
+            Self::Verifying => "Verifying",
+        }
+    }
+}
+
 /// Current input mode of the TUI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputMode {
@@ -38,6 +60,10 @@ pub struct App {
     pub spinner_label: Option<String>,
     pub spinner_frame: usize,
     pub spinner_started: Option<std::time::Instant>,
+    /// Current agent phase for status indicator display.
+    pub agent_phase: AgentPhase,
+    /// Detail text for the status indicator (e.g., tool name, file path).
+    pub agent_phase_detail: Option<String>,
     pub should_quit: bool,
     pub last_submitted: String,
     pub kill_buffer: String,
@@ -118,6 +144,8 @@ impl App {
             agent_busy: false,
             spinner_label: None,
             spinner_frame: 0,
+            agent_phase: AgentPhase::Idle,
+            agent_phase_detail: None,
             spinner_started: None,
             should_quit: false,
             last_submitted: String::new(),
@@ -166,25 +194,44 @@ impl App {
             }
             ServerMessage::Mission { .. } => {
                 self.agent_busy = true;
+                self.agent_phase = AgentPhase::Thinking;
+                self.agent_phase_detail = None;
             }
             ServerMessage::Clarification { .. } => {
                 self.agent_busy = false;
+                self.agent_phase = AgentPhase::Idle;
             }
             ServerMessage::ApprovalRequest { .. } => {
                 self.mode = InputMode::ApprovalPending;
             }
-            ServerMessage::ToolStart { .. } => {}
-            ServerMessage::ToolResult { .. } => {}
+            ServerMessage::ToolStart { ref tool, .. } => {
+                self.agent_phase = AgentPhase::Executing;
+                self.agent_phase_detail = Some(tool.clone());
+            }
+            ServerMessage::ToolResult { .. } => {
+                self.agent_phase = AgentPhase::Thinking;
+                self.agent_phase_detail = None;
+            }
             ServerMessage::AgentMessage { .. } => {}
+            ServerMessage::AgentMessageDelta { .. } => {
+                if self.agent_phase != AgentPhase::Executing {
+                    self.agent_phase = AgentPhase::Thinking;
+                }
+            }
+            ServerMessage::ExecOutputDelta { .. } => {}
             ServerMessage::MissionComplete { .. } => {
                 self.agent_busy = false;
                 self.spinner_label = None;
                 self.spinner_started = None;
+                self.agent_phase = AgentPhase::Idle;
+                self.agent_phase_detail = None;
             }
             ServerMessage::Error { .. } => {
                 self.agent_busy = false;
                 self.spinner_label = None;
                 self.spinner_started = None;
+                self.agent_phase = AgentPhase::Idle;
+                self.agent_phase_detail = None;
             }
             ServerMessage::Spinner { label, done } => {
                 if done {
@@ -197,7 +244,6 @@ impl App {
                     self.spinner_label = Some(label);
                 }
             }
-            ServerMessage::AgentMessageDelta { .. } => {}
             ServerMessage::CommandList { commands } => { self.commands = commands; }
             ServerMessage::ToolCall { .. } => {}
             ServerMessage::ToolCallResult { .. } => {}

@@ -212,9 +212,19 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
                     }
                     Ok(Event::Resize(cols, rows)) => {
                         app.chat.set_width(cols);
-                        // Pass actual terminal dimensions so last_known_area
-                        // stays correct for insert_before scroll math.
-                        terminal.resize(ratatui::layout::Rect::new(0, 0, cols, rows))?;
+                        // For Viewport::Inline(viewport_height), the viewport
+                        // occupies the bottom viewport_height rows of the
+                        // terminal. We must resize to that rect — NOT the full
+                        // terminal (0, 0, cols, rows) which would make ratatui
+                        // think it owns the entire screen, breaking
+                        // insert_before() scroll math and losing scrollback.
+                        let vp_h = viewport_height.min(rows);
+                        terminal.resize(ratatui::layout::Rect::new(
+                            0,
+                            rows.saturating_sub(vp_h),
+                            cols,
+                            vp_h,
+                        ))?;
                         need_redraw = true;
                     }
                     Ok(Event::FocusGained) => { app.terminal_focused = true; }

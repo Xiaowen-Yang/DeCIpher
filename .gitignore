@@ -68,6 +68,4 @@ Formula/
 *.session.jsonl
 session-*.jsonl
 
-# generated scripts
-scripts/postinstall.js
 tmp/

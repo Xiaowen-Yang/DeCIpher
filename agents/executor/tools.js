@@ -10,7 +10,7 @@
  *     log: function, onPlanUpdate: function }
  */
 
-import { exec as execCb } from "node:child_process";
+import { exec as execCb, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -166,6 +166,51 @@ async function safeExec(cmd, workdir, timeout = EXEC_TIMEOUT) {
   }
 }
 
+/**
+ * Execute a shell command with real-time output streaming.
+ * Calls `onOutput(chunk)` for each piece of stdout/stderr.
+ * Falls back to safeExec if no onOutput callback provided.
+ */
+async function safeExecStreaming(
+  cmd,
+  workdir,
+  onOutput,
+  timeout = EXEC_TIMEOUT,
+) {
+  if (!onOutput) return safeExec(cmd, workdir, timeout);
+
+  return new Promise((resolve) => {
+    const child = spawn("sh", ["-c", cmd], {
+      cwd: workdir,
+      timeout,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let output = "";
+
+    child.stdout.on("data", (chunk) => {
+      const text = chunk.toString();
+      output += text;
+      onOutput(text);
+    });
+
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      output += text;
+      onOutput(text);
+    });
+
+    child.on("error", (err) => {
+      output += `\n${err.message}`;
+      resolve({ exitCode: 1, output: output.trim() });
+    });
+
+    child.on("close", (code) => {
+      resolve({ exitCode: code ?? 0, output: output.trim() });
+    });
+  });
+}
+
 // ── Tool registry ──────────────────────────────────────────────────────────────
 
 export const TOOL_REGISTRY = {
@@ -178,7 +223,11 @@ export const TOOL_REGISTRY = {
     handler: async (args, context) => {
       const cmd = args.cmd ?? "";
       const workdir = args.workdir ? resolve(args.workdir) : context.workspace;
-      const result = await safeExec(cmd, workdir);
+      const result = await safeExecStreaming(
+        cmd,
+        workdir,
+        context.onExecOutput ?? null,
+      );
 
       // Track Docker resources for cleanup on failure
       const resource = parseDockerResource(cmd);
