@@ -57,16 +57,10 @@ pub struct App {
     pub spinner_started: Option<std::time::Instant>,
     pub should_quit: bool,
     pub last_submitted: String,
-    pub owned_lines_above: u16,
     pub kill_buffer: String,
     pub last_ctrl_c: Option<std::time::Instant>,
     /// Streaming pipeline state (newline-gated buffering + adaptive chunking).
     pub stream: StreamState,
-    /// Suppress rendering of the next AgentMessage (already streamed via deltas).
-    pub suppress_next_agent_message: bool,
-    /// Lines from cursor position to the top of the prompt region.
-    /// Used by clear_prompt to know how far up to move.
-    pub cursor_line_in_prompt: u16,
     /// Whether the terminal window is currently focused.
     pub terminal_focused: bool,
     /// Ctrl+R history search query.
@@ -133,12 +127,9 @@ impl App {
             spinner_started: None,
             should_quit: false,
             last_submitted: String::new(),
-            owned_lines_above: 0,
             kill_buffer: String::new(),
             last_ctrl_c: None,
             stream: StreamState::new(),
-            suppress_next_agent_message: false,
-            cursor_line_in_prompt: 0,
             terminal_focused: true,
             search_query: String::new(),
             search_match_index: None,

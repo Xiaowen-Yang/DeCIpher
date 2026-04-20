@@ -54,3 +54,4 @@ skills-lock.json
 
 # generated scripts
 scripts/postinstall.js
+tmp/

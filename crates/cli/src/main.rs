@@ -1,13 +1,14 @@
 //! DeCIpher CLI — entry point.
 //!
-//! Spawns the Node.js agent via agent-bridge, sets up the terminal,
-//! and runs the TUI event loop.
+//! Spawns the Node.js agent via agent-bridge, sets up the ratatui terminal
+//! with inline viewport, and runs the TUI event loop.
 //!
-//! Key design choices (Codex parity):
-//! - crossterm `EventStream` for truly async event reading (no blocking poll)
+//! Key design choices (Codex/Claude Code parity):
+//! - ratatui inline viewport: buffer-diffed viewport at bottom, permanent scrollback above
+//! - crossterm `EventStream` for truly async event reading
 //! - 32ms tick rate (~30 FPS) for smooth spinner animation
 //! - Frame rate limiter (120 FPS cap) to prevent redundant redraws
-//! - Biased select: terminal events > server messages > tick
+//! - No manual cursor tracking — structurally impossible cursor bugs
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -23,17 +24,24 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
+use ratatui::{
+    backend::CrosstermBackend,
+    Terminal, TerminalOptions, Viewport,
+};
 
 use decipher_agent_bridge::AgentBridge;
 use decipher_protocol::{ClientMessage, ServerMessage};
 use decipher_tui::app::{self, App};
-use decipher_tui::render;
+use decipher_tui::bottom_pane::{self, BottomPane};
 
 /// Tick rate: 32ms ≈ 31.25 FPS — smooth spinner animation matching Codex.
 const TICK_RATE: Duration = Duration::from_millis(32);
 
 /// Minimum interval between draws: 120 FPS cap (~8.3ms).
 const MIN_FRAME_INTERVAL: Duration = Duration::from_nanos(8_333_334);
+
+/// Default viewport height (lines reserved for the bottom pane).
+const VIEWPORT_HEIGHT: u16 = 4;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -58,8 +66,21 @@ async fn main() -> io::Result<()> {
         )?;
     }
 
-    let result = run_app(&mut stdout, &mut bridge).await;
+    // Create ratatui terminal with inline viewport
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(VIEWPORT_HEIGHT),
+        },
+    )?;
 
+    let result = run_app(&mut terminal, &mut bridge).await;
+
+    // Cleanup
+    drop(terminal); // Drop terminal to release stdout
+
+    let mut stdout = io::stdout();
     if has_keyboard_enhancement {
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     }
@@ -81,7 +102,6 @@ impl FrameRateLimiter {
         Self { last_draw: None }
     }
 
-    /// Returns true if enough time has passed since the last draw.
     fn should_draw(&mut self) -> bool {
         let now = Instant::now();
         match self.last_draw {
@@ -93,45 +113,78 @@ impl FrameRateLimiter {
         }
     }
 
-    /// Force mark a draw happened (used when we must draw regardless).
     fn mark_drawn(&mut self) {
         self.last_draw = Some(Instant::now());
     }
 }
 
 async fn run_app(
-    stdout: &mut io::Stdout,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     bridge: &mut AgentBridge,
 ) -> io::Result<()> {
     let mut app = App::new();
-    let mut need_prompt_redraw = true;
+    let mut need_redraw = true;
     let mut fps = FrameRateLimiter::new();
+    let mut suppress_next_agent = false;
 
-    // Async event stream — no blocking poll, no spawn_blocking overhead.
     let mut events = EventStream::new();
 
     loop {
-        if need_prompt_redraw && fps.should_draw() {
-            render::draw_prompt(stdout, &mut app)?;
-            need_prompt_redraw = false;
+        // Draw the viewport (bottom pane) via ratatui buffer diffing
+        if need_redraw && fps.should_draw() {
+            // In pager mode, use the old pager rendering
+            if app.mode == app::InputMode::Pager {
+                // Pager needs full-screen — handled separately
+                let mut stdout = io::stdout();
+                decipher_tui::pager::render_pager(&mut stdout, &mut app)?;
+            } else {
+                // Calculate needed height
+                let pane = BottomPane::new(&app);
+                let needed = pane.desired_height().max(1);
+
+                // Resize viewport if needed
+                terminal.resize(ratatui::layout::Rect::new(
+                    0, 0,
+                    terminal.size()?.width,
+                    needed,
+                ))?;
+
+                // Draw with cursor position
+                let cursor_pos = pane.cursor_position(ratatui::layout::Rect::new(
+                    0, 0, terminal.size()?.width, needed,
+                ));
+
+                terminal.draw(|frame| {
+                    let area = frame.area();
+                    frame.render_widget(BottomPane::new(&app), area);
+                    if let Some((x, y)) = cursor_pos {
+                        frame.set_cursor_position((x, y));
+                    }
+                })?;
+            }
+            need_redraw = false;
         }
 
         tokio::select! {
             biased;
 
-            // Terminal events — truly async, resolves immediately on event.
+            // Terminal events
             Some(result) = events.next() => {
                 match result {
                     Ok(Event::Key(key)) => {
                         if key.kind != KeyEventKind::Press { continue; }
                         let action = handle_key(&mut app, key);
                         match action {
-                            KeyAction::Redraw => { need_prompt_redraw = true; }
+                            KeyAction::Redraw => { need_redraw = true; }
                             KeyAction::Submit(msg) => {
-                                render::clear_prompt(stdout, &mut app)?;
-                                render::print_user_input(stdout, &app.last_submitted)?;
+                                // Push user input to scrollback
+                                let lines = bottom_pane::user_input_lines(&app.last_submitted);
+                                let height = lines.len() as u16;
+                                terminal.insert_before(height, |buf| {
+                                    bottom_pane::render_lines_to_buffer(buf, &lines);
+                                })?;
                                 fps.mark_drawn();
-                                need_prompt_redraw = true;
+                                need_redraw = true;
                                 bridge.send(&msg).await?;
                             }
                             KeyAction::None => {}
@@ -140,9 +193,9 @@ async fn run_app(
                     Ok(Event::Paste(text)) => {
                         app.input.insert_str(app.cursor, &text);
                         app.cursor += text.len();
-                        need_prompt_redraw = true;
+                        need_redraw = true;
                     }
-                    Ok(Event::Resize(_, _)) => { need_prompt_redraw = true; }
+                    Ok(Event::Resize(_, _)) => { need_redraw = true; }
                     Ok(Event::FocusGained) => { app.terminal_focused = true; }
                     Ok(Event::FocusLost) => { app.terminal_focused = false; }
                     Ok(_) => {}
@@ -150,48 +203,98 @@ async fn run_app(
                 }
             }
 
-            // Server messages from the Node.js agent.
+            // Server messages from the Node.js agent
             Some(msg) = bridge.rx.recv() => {
                 match &msg {
                     ServerMessage::AgentMessageDelta { delta } => {
                         app.stream.push(delta);
-                        render::commit_delta_lines(stdout, &mut app)?;
-                        fps.mark_drawn();
-                        app.handle_server_message(msg);
-                    }
-                    _ => {
-                        if app.stream.active {
-                            render::flush_delta_buffer(stdout, &mut app)?;
-                        }
-                        // Set terminal title when we receive the banner
-                        if let ServerMessage::Banner { ref model, .. } = msg {
-                            render::set_terminal_title(stdout, &format!("DeCIpher — {model}"))?;
-                        }
-                        // Send notification on mission complete when terminal unfocused
-                        if let ServerMessage::MissionComplete { ref outcome, ref summary, .. } = msg {
-                            if !app.terminal_focused {
-                                let _ = render::send_notification(stdout, &format!("DeCIpher: {outcome} — {summary}"));
+                        // Try committing complete lines to scrollback
+                        if let Some(committed) = try_commit_stream_lines(&mut app) {
+                            let height = committed.len() as u16;
+                            if height > 0 {
+                                terminal.insert_before(height, |buf| {
+                                    for (i, line) in committed.iter().enumerate() {
+                                        let y = buf.area.y + i as u16;
+                                        if y < buf.area.y + buf.area.height {
+                                            buf.set_line(buf.area.x, y, &ratatui::text::Line::from(format!("  {}", line)), buf.area.width);
+                                        }
+                                    }
+                                })?;
                             }
                         }
-                        render::clear_prompt(stdout, &mut app)?;
-                        render::print_server_message(stdout, &msg, &mut app)?;
                         fps.mark_drawn();
                         app.handle_server_message(msg);
-                        need_prompt_redraw = true;
+                        need_redraw = true; // redraw to show partial line in viewport
+                    }
+                    _ => {
+                        // Flush any buffered stream content before rendering new message
+                        if app.stream.active {
+                            let remaining = app.stream.drain_all();
+                            if !remaining.is_empty() {
+                                let height = remaining.len() as u16;
+                                terminal.insert_before(height, |buf| {
+                                    for (i, line) in remaining.iter().enumerate() {
+                                        let y = buf.area.y + i as u16;
+                                        if y < buf.area.y + buf.area.height {
+                                            buf.set_line(buf.area.x, y, &ratatui::text::Line::from(format!("  {}", line)), buf.area.width);
+                                        }
+                                    }
+                                })?;
+                            }
+                            suppress_next_agent = true;
+                        }
+
+                        // Set terminal title on banner
+                        if let ServerMessage::Banner { ref model, .. } = msg {
+                            let mut stdout = io::stdout();
+                            decipher_tui::render::set_terminal_title(&mut stdout, &format!("DeCIpher — {model}"))?;
+                        }
+
+                        // Desktop notification on mission complete
+                        if let ServerMessage::MissionComplete { ref outcome, ref summary, .. } = msg {
+                            if !app.terminal_focused {
+                                let mut stdout = io::stdout();
+                                let _ = decipher_tui::render::send_notification(&mut stdout, &format!("DeCIpher: {outcome} — {summary}"));
+                            }
+                        }
+
+                        // Render message to scrollback
+                        let lines = bottom_pane::server_message_lines(&msg, &mut suppress_next_agent);
+                        if !lines.is_empty() {
+                            let height = lines.len() as u16;
+                            terminal.insert_before(height, |buf| {
+                                bottom_pane::render_lines_to_buffer(buf, &lines);
+                            })?;
+                        }
+
+                        fps.mark_drawn();
+                        app.handle_server_message(msg);
+                        need_redraw = true;
                     }
                 }
             }
 
-            // Tick timer — fires every 32ms for smooth animation.
+            // Tick timer — fires every 32ms for smooth animation
             _ = tokio::time::sleep(TICK_RATE) => {
                 if app.stream.active {
-                    if render::commit_delta_lines(stdout, &mut app)? {
-                        fps.mark_drawn();
+                    if let Some(committed) = try_commit_stream_lines(&mut app) {
+                        let height = committed.len() as u16;
+                        if height > 0 {
+                            terminal.insert_before(height, |buf| {
+                                for (i, line) in committed.iter().enumerate() {
+                                    let y = buf.area.y + i as u16;
+                                    if y < buf.area.y + buf.area.height {
+                                        buf.set_line(buf.area.x, y, &ratatui::text::Line::from(format!("  {}", line)), buf.area.width);
+                                    }
+                                }
+                            })?;
+                            fps.mark_drawn();
+                        }
                     }
                 }
                 if app.spinner_label.is_some() || app.stream.active {
                     app.spinner_frame += 1;
-                    need_prompt_redraw = true;
+                    need_redraw = true;
                 }
             }
         }
@@ -199,22 +302,47 @@ async fn run_app(
         // Dispatch queued message when agent becomes idle
         if !app.agent_busy {
             if let Some(queued) = app.queued_message.take() {
-                render::clear_prompt(stdout, &mut app)?;
-                render::print_user_input(stdout, &app.last_submitted)?;
+                let lines = bottom_pane::user_input_lines(&app.last_submitted);
+                let height = lines.len() as u16;
+                terminal.insert_before(height, |buf| {
+                    bottom_pane::render_lines_to_buffer(buf, &lines);
+                })?;
                 fps.mark_drawn();
-                need_prompt_redraw = true;
+                need_redraw = true;
                 bridge.send(&queued).await?;
             }
         }
 
         if app.should_quit {
-            render::clear_prompt(stdout, &mut app)?;
-            render::print_goodbye(stdout)?;
+            let lines = bottom_pane::goodbye_lines();
+            let height = lines.len() as u16;
+            terminal.insert_before(height, |buf| {
+                bottom_pane::render_lines_to_buffer(buf, &lines);
+            })?;
             break;
         }
     }
 
     Ok(())
+}
+
+/// Try to commit complete lines from the stream pipeline.
+/// Returns the committed lines if any, or None.
+fn try_commit_stream_lines(app: &mut App) -> Option<Vec<String>> {
+    use decipher_tui::streaming::DrainPlan;
+
+    let plan = app.stream.commit_tick();
+    let lines = match plan {
+        DrainPlan::None => return None,
+        DrainPlan::Single => app.stream.drain(1),
+        DrainPlan::Batch(n) => app.stream.drain(n),
+    };
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines)
+    }
 }
 
 enum KeyAction {
@@ -266,10 +394,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
     #[cfg(unix)]
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
         unsafe {
-            // Send SIGTSTP to self — terminal will suspend
             libc::raise(libc::SIGTSTP);
         }
-        // After resume: terminal state is restored by crossterm
         return KeyAction::Redraw;
     }
 
@@ -279,7 +405,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                 KeyAction::Submit(app.respond_approval(true))
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                // Always approve for this session
                 app.always_approve = true;
                 KeyAction::Submit(app.respond_approval(true))
             }
@@ -312,7 +437,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                 }
                 KeyCode::Char(c) => {
                     app.search_query.push(c);
-                    app.search_match_index = None; // reset to search from end
+                    app.search_match_index = None;
                     app.search_history_older();
                     KeyAction::Redraw
                 }
@@ -347,7 +472,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                 KeyAction::Redraw
             }
             KeyCode::Char('G') | KeyCode::End => {
-                app.pager_scroll = usize::MAX; // will be clamped in renderer
+                app.pager_scroll = usize::MAX;
                 KeyAction::Redraw
             }
             KeyCode::PageDown => {
@@ -365,7 +490,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
 
         app::InputMode::FileSearch => match key.code {
             KeyCode::Esc => {
-                // Cancel: remove the @ and query from input
                 let end = app.file_search_at_pos + 1 + app.file_search_query.len();
                 let end = end.min(app.input.len());
                 app.input.replace_range(app.file_search_at_pos..end, "");
@@ -384,7 +508,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                 KeyAction::Redraw
             }
             KeyCode::Enter | KeyCode::Tab => {
-                // Accept selection: replace @query with the file path
                 if let Some(result) = app.file_search_results.get(app.file_search_index) {
                     let path = result.path.clone();
                     let end = app.file_search_at_pos + 1 + app.file_search_query.len();
@@ -392,7 +515,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                     app.input.replace_range(app.file_search_at_pos..end, &path);
                     app.cursor = app.file_search_at_pos + path.len();
                 } else {
-                    // No result, just keep the @query
                     app.cursor = app.file_search_at_pos + 1 + app.file_search_query.len();
                 }
                 app.mode = app::InputMode::Normal;
@@ -401,7 +523,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
             }
             KeyCode::Backspace => {
                 if app.file_search_query.is_empty() {
-                    // Remove the @ itself
                     if app.file_search_at_pos < app.input.len() {
                         app.input.remove(app.file_search_at_pos);
                         app.cursor = app.file_search_at_pos;
@@ -410,13 +531,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                     app.file_search_results.clear();
                 } else {
                     app.file_search_query.pop();
-                    // Update input
                     let end = app.file_search_at_pos + 1 + app.file_search_query.len() + 1;
                     let end = end.min(app.input.len());
                     let new_text = format!("@{}", app.file_search_query);
                     app.input.replace_range(app.file_search_at_pos..end, &new_text);
                     app.cursor = app.file_search_at_pos + new_text.len();
-                    // Re-search
                     let cwd = std::env::current_dir().unwrap_or_default();
                     app.file_search_results = decipher_tui::file_search::search_files(&cwd, &app.file_search_query);
                     app.file_search_index = 0;
@@ -425,13 +544,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
             }
             KeyCode::Char(c) => {
                 app.file_search_query.push(c);
-                // Update input text
                 let at_end = app.file_search_at_pos + 1 + app.file_search_query.len() - 1;
                 let at_end = at_end.min(app.input.len());
                 let new_text = format!("@{}", app.file_search_query);
                 app.input.replace_range(app.file_search_at_pos..at_end, &new_text);
                 app.cursor = app.file_search_at_pos + new_text.len();
-                // Re-search
                 let cwd = std::env::current_dir().unwrap_or_default();
                 app.file_search_results = decipher_tui::file_search::search_files(&cwd, &app.file_search_query);
                 app.file_search_index = 0;
@@ -478,7 +595,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                     KeyCode::Char('r') => { app.enter_history_search(); return KeyAction::Redraw; }
                     KeyCode::Char('t') => { app.mode = app::InputMode::Pager; app.pager_scroll = 0; return KeyAction::Redraw; }
                     KeyCode::Char('x') => {
-                        // Ctrl+X: open $EDITOR with current input
                         if let Some(result) = open_editor(&app.input) {
                             app.input = result;
                             app.cursor = app.input.len();
@@ -501,7 +617,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                 }
             }
 
-            // Alt+ keybindings (word navigation, deletion)
+            // Alt+ keybindings
             if key.modifiers.contains(KeyModifiers::ALT) {
                 match key.code {
                     KeyCode::Left | KeyCode::Char('b') => { app.word_left(); return KeyAction::Redraw; }
@@ -536,7 +652,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                     app.show_shortcuts = !app.show_shortcuts; KeyAction::Redraw
                 }
                 KeyCode::Char('@') => {
-                    // Enter file search mode
                     app.file_search_at_pos = app.cursor;
                     app.input.insert(app.cursor, '@');
                     app.cursor += 1;
@@ -548,7 +663,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                     KeyAction::Redraw
                 }
                 KeyCode::Tab => {
-                    // Tab: submit if idle, queue if busy
                     if app.agent_busy {
                         if let Some(msg) = app.submit_input() {
                             app.queued_message = Some(msg);
@@ -574,7 +688,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
 }
 
 /// Open $EDITOR with the given text, return the edited result.
-/// Temporarily exits raw mode so the editor can function normally.
 fn open_editor(initial_text: &str) -> Option<String> {
     use std::fs;
     use std::process::Command;
@@ -583,17 +696,14 @@ fn open_editor(initial_text: &str) -> Option<String> {
         .or_else(|_| std::env::var("VISUAL"))
         .unwrap_or_else(|_| "vi".to_string());
 
-    // Write current input to a temp file
     let tmp_dir = std::env::temp_dir();
     let tmp_path = tmp_dir.join("decipher-edit.tmp");
     if fs::write(&tmp_path, initial_text).is_err() {
         return None;
     }
 
-    // Exit raw mode so the editor works
     let _ = crossterm::terminal::disable_raw_mode();
 
-    // Spawn editor
     let status = Command::new(&editor)
         .arg(&tmp_path)
         .stdin(std::process::Stdio::inherit())
@@ -601,7 +711,6 @@ fn open_editor(initial_text: &str) -> Option<String> {
         .stderr(std::process::Stdio::inherit())
         .status();
 
-    // Re-enter raw mode
     let _ = crossterm::terminal::enable_raw_mode();
 
     match status {
