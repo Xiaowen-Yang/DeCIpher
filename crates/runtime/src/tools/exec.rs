@@ -202,6 +202,8 @@ async fn exec_shell(
     timeout_secs: u64,
     on_output: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> ExecResult {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     let mut child = match Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -219,24 +221,42 @@ async fn exec_shell(
         }
     };
 
-    // Read stdout and stderr independently, then merge.
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
 
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_end(&mut stdout_buf).await;
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_end(&mut stderr_buf).await;
-    }
+    // Stream stdout and stderr line-by-line in parallel, forwarding each
+    // line to the TUI via on_output for real-time display.
+    let tx_clone = on_output.clone();
+    let stdout_task = tokio::spawn(async move {
+        let mut lines = Vec::new();
+        if let Some(out) = stdout {
+            let mut reader = BufReader::new(out).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if let Some(ref tx) = tx_clone {
+                    let _ = tx.send(line.clone());
+                }
+                lines.push(line);
+            }
+        }
+        lines
+    });
 
-    let mut output = String::from_utf8_lossy(&stdout_buf).to_string();
-    output.push_str(&String::from_utf8_lossy(&stderr_buf));
+    let tx_clone2 = on_output.clone();
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = Vec::new();
+        if let Some(err) = stderr {
+            let mut reader = BufReader::new(err).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if let Some(ref tx) = tx_clone2 {
+                    let _ = tx.send(line.clone());
+                }
+                lines.push(line);
+            }
+        }
+        lines
+    });
 
-    if let Some(tx) = &on_output {
-        let _ = tx.send(output.clone());
-    }
-
+    // Wait for process with timeout.
     let exit_code = match tokio::time::timeout(
         Duration::from_secs(timeout_secs),
         child.wait(),
@@ -244,16 +264,29 @@ async fn exec_shell(
     .await
     {
         Ok(Ok(status)) => status.code().unwrap_or(-1),
-        Ok(Err(e)) => {
-            output.push_str(&format!("\nProcess wait error: {e}"));
-            1
-        }
+        Ok(Err(_)) => 1,
         Err(_) => {
             let _ = child.kill().await;
-            output.push_str("\n[Timed out]");
+            if let Some(ref tx) = on_output {
+                let _ = tx.send("[Timed out]".to_string());
+            }
             124
         }
     };
+
+    // Collect output for the tool result.
+    let stdout_lines = stdout_task.await.unwrap_or_default();
+    let stderr_lines = stderr_task.await.unwrap_or_default();
+    let mut output = stdout_lines.join("\n");
+    if !stderr_lines.is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&stderr_lines.join("\n"));
+    }
+    if exit_code == 124 {
+        output.push_str("\n[Timed out]");
+    }
 
     ExecResult {
         exit_code,

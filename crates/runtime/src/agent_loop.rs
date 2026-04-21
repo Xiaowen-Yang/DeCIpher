@@ -130,9 +130,23 @@ impl AgentLoop {
         };
 
         let mut amendments = PermissionAmendments::new();
+
+        // Wire exec output streaming to TUI via ExecOutputDelta events.
+        let (exec_out_tx, mut exec_out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        {
+            let event_tx_clone = event_tx.clone();
+            tokio::spawn(async move {
+                while let Some(line) = exec_out_rx.recv().await {
+                    let _ = event_tx_clone
+                        .send(ServerMessage::ExecOutputDelta { delta: line })
+                        .await;
+                }
+            });
+        }
+
         let tool_ctx = ToolContext {
             workspace: config.workspace.clone(),
-            on_exec_output: None,
+            on_exec_output: Some(exec_out_tx),
             mcp_clients: config.mcp_clients.clone(),
             api_key: config.api_key.clone(),
             model: config.model.clone(),

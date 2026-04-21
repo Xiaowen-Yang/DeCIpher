@@ -255,9 +255,44 @@ async fn run_hook(hook: &HookEntry, stdin_payload: &str) -> HookRunResult {
     HookRunResult::Ok(stdout)
 }
 
-/// Very simple whitespace-splitting (no quote handling needed for basic hooks).
+/// Split a command string into words, respecting single and double quotes.
+///
+/// `sh -c "echo hello world"` → `["sh", "-c", "echo hello world"]`
 fn shell_words(s: &str) -> Vec<String> {
-    s.split_whitespace().map(str::to_string).collect()
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+            }
+            '\\' if in_double || (!in_single && !in_double) => {
+                // Escape next char.
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            c => {
+                current.push(c);
+            }
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
 }
 
 #[cfg(test)]
@@ -337,5 +372,23 @@ mod tests {
     fn shell_words_splits_correctly() {
         let parts = shell_words("/usr/bin/env FOO=bar");
         assert_eq!(parts, vec!["/usr/bin/env", "FOO=bar"]);
+    }
+
+    #[test]
+    fn shell_words_handles_double_quotes() {
+        let parts = shell_words(r#"sh -c "echo hello world""#);
+        assert_eq!(parts, vec!["sh", "-c", "echo hello world"]);
+    }
+
+    #[test]
+    fn shell_words_handles_single_quotes() {
+        let parts = shell_words("sh -c 'echo hello world'");
+        assert_eq!(parts, vec!["sh", "-c", "echo hello world"]);
+    }
+
+    #[test]
+    fn shell_words_handles_escaped_chars() {
+        let parts = shell_words(r#"echo "hello \"world\"""#);
+        assert_eq!(parts, vec!["echo", r#"hello "world""#]);
     }
 }

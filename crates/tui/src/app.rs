@@ -161,6 +161,8 @@ pub struct App {
     pub agent_max_turns: u32,
     /// Mission start time (for elapsed display).
     pub mission_started: Option<std::time::Instant>,
+    /// Approval action detail (tool name + reasoning) for viewport display.
+    pub pending_approval_action: Option<String>,
     pub should_quit: bool,
     pub last_submitted: String,
     pub kill_buffer: String,
@@ -248,6 +250,7 @@ impl App {
             agent_turn: 0,
             agent_max_turns: 20,
             mission_started: None,
+            pending_approval_action: None,
             spinner_started: None,
             should_quit: false,
             last_submitted: String::new(),
@@ -306,9 +309,16 @@ impl App {
                 self.agent_busy = false;
                 self.agent_phase = AgentPhase::Idle;
             }
-            ServerMessage::ApprovalRequest { .. } => {
+            ServerMessage::ApprovalRequest { ref action, .. } => {
                 self.mode = InputMode::ApprovalPending;
                 self.agent_phase = AgentPhase::WaitingForApproval;
+                self.pending_approval_action = action.as_ref().map(|a| {
+                    if let Some(ref reason) = a.reasoning {
+                        format!("{} — {}", a.tool, reason.chars().take(60).collect::<String>())
+                    } else {
+                        a.tool.clone()
+                    }
+                });
             }
             ServerMessage::ToolStart { ref tool, ref args, .. } => {
                 self.agent_busy = true;
@@ -340,11 +350,24 @@ impl App {
                 self.agent_busy = true;
             }
             ServerMessage::AgentMessageDelta { .. } => {
+                self.agent_busy = true;
+                if self.spinner_label.is_none() {
+                    self.spinner_started = Some(std::time::Instant::now());
+                    self.spinner_label = Some("Working".to_string());
+                }
                 if matches!(self.agent_phase, AgentPhase::Idle | AgentPhase::Thinking | AgentPhase::Planning) {
                     self.agent_phase = AgentPhase::Thinking;
                 }
             }
-            ServerMessage::ExecOutputDelta { .. } => {}
+            ServerMessage::ExecOutputDelta { ref delta } => {
+                // Show latest output line in the activity bar detail.
+                let trimmed = delta.trim();
+                if !trimmed.is_empty() {
+                    self.agent_phase_detail = Some(
+                        trimmed.chars().take(60).collect(),
+                    );
+                }
+            }
             ServerMessage::AgentStatus { turn, max_turns, tool_name, phase, .. } => {
                 self.agent_turn = turn;
                 self.agent_max_turns = max_turns;
@@ -395,7 +418,7 @@ impl App {
             ServerMessage::FilesModified { .. } => {}  // handled in chat.rs
             ServerMessage::TokenUsage { prompt_tokens, completion_tokens, total_tokens, context_window } => {
                 self.last_tokens = total_tokens;
-                self.total_tokens = total_tokens;
+                self.total_tokens += total_tokens; // accumulate across turns
                 self.context_tokens = prompt_tokens;
                 if let Some(cw) = context_window {
                     self.context_window = cw;
@@ -473,6 +496,7 @@ impl App {
 
     pub fn respond_approval(&mut self, approved: bool) -> ClientMessage {
         self.mode = InputMode::Normal;
+        self.pending_approval_action = None;
         ClientMessage::ApprovalResponse { approved }
     }
 

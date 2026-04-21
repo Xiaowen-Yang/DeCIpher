@@ -447,6 +447,35 @@ impl ChatWidget {
                                                     ),
                                                 ]));
                                             }
+                                        } else if *success && !preview_lines.is_empty() {
+                                            // Success output: show last 3 lines (dim).
+                                            let show = preview_lines.len().min(3);
+                                            let start = preview_lines.len().saturating_sub(show);
+                                            for (i, line_text) in preview_lines[start..].iter().enumerate() {
+                                                let is_last = i == show - 1;
+                                                let pfx = if is_last { "\u{2514}" } else { "\u{2502}" };
+                                                let truncated: String = line_text.chars().take(100).collect();
+                                                lines.push(Line::from(vec![
+                                                    ratatui::text::Span::raw("    "),
+                                                    ratatui::text::Span::styled(
+                                                        format!("{pfx} "),
+                                                        ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                                                    ),
+                                                    ratatui::text::Span::styled(
+                                                        truncated,
+                                                        ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                                                    ),
+                                                ]));
+                                            }
+                                            if preview_lines.len() > show {
+                                                lines.push(Line::from(vec![
+                                                    ratatui::text::Span::raw("    "),
+                                                    ratatui::text::Span::styled(
+                                                        format!("  ({} lines total)", preview_lines.len()),
+                                                        ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                                                    ),
+                                                ]));
+                                            }
                                         }
                                     }
                                 }

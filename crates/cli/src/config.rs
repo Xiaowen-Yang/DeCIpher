@@ -117,7 +117,7 @@ fn read_config_file() -> Option<ConfigFile> {
 ///
 /// Default → Anthropic (native Claude). Custom base_url → OpenAI-compatible
 /// unless it's `api.anthropic.com`.
-fn auto_detect_provider(base_url: Option<&str>, model: &str) -> ProviderType {
+pub fn auto_detect_provider(base_url: Option<&str>, model: &str) -> ProviderType {
     // Explicit Anthropic endpoint or claude model with default endpoint.
     match base_url {
         None => {

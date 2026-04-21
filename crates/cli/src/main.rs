@@ -155,9 +155,11 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16) -> io::Result<()
     // Extract config fields used repeatedly in the loop.
     let workspace = cli_cfg.workspace.clone();
     let api_key = cli_cfg.api_key.clone();
-    let model = cli_cfg.model.clone();
+    let mut model = cli_cfg.model.clone();
     let base_url = cli_cfg.base_url.clone();
     let policy_mode = cli_cfg.policy_mode;
+    let mut provider_type = cli_cfg.provider_type;
+    let mut provider = provider;
 
     // ── MCP client initialization (lazy — deferred to first mission) ─────────
     let decipher_home = config::decipher_home();
@@ -498,6 +500,90 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16) -> io::Result<()
                                                     );
                                                 }
                                             }
+                                        } else if text_trimmed == "/model"
+                                            || text_trimmed.starts_with("/model ")
+                                        {
+                                            // ── /model [name] ────────────────────────────────
+                                            let arg = text_trimmed["/model".len()..].trim();
+                                            if arg.is_empty() {
+                                                let ptype = match provider_type {
+                                                    config::ProviderType::Anthropic => "anthropic",
+                                                    config::ProviderType::OpenAi => "openai-compat",
+                                                };
+                                                let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                    text: format!("Current model: {} ({})", model, ptype),
+                                                });
+                                            } else {
+                                                model = arg.to_string();
+                                                // Re-detect provider type from new model.
+                                                provider_type = config::auto_detect_provider(
+                                                    base_url.as_deref(), &model,
+                                                );
+                                                provider = match provider_type {
+                                                    config::ProviderType::OpenAi => {
+                                                        let base = base_url.as_deref().unwrap_or("https://api.openai.com");
+                                                        Arc::new(OpenAiProvider::new(&api_key, &model, base))
+                                                    }
+                                                    config::ProviderType::Anthropic => {
+                                                        let mut p = AnthropicProvider::new(&api_key, &model);
+                                                        if let Some(ref url) = base_url {
+                                                            p = p.with_base_url(url);
+                                                        }
+                                                        Arc::new(p)
+                                                    }
+                                                };
+                                                // Update banner.
+                                                if let Some(ref mut b) = app.banner {
+                                                    b.model = model.clone();
+                                                }
+                                                let ptype = match provider_type {
+                                                    config::ProviderType::Anthropic => "anthropic",
+                                                    config::ProviderType::OpenAi => "openai-compat",
+                                                };
+                                                let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                    text: format!("Switched to model: {} ({})", model, ptype),
+                                                });
+                                                // Update terminal title.
+                                                let mut stdout = io::stdout();
+                                                let _ = decipher_tui::render::set_terminal_title(
+                                                    &mut stdout,
+                                                    &format!("DeCIpher \u{2014} {}", model),
+                                                );
+                                            }
+                                        } else if text_trimmed == "/export"
+                                            || text_trimmed.starts_with("/export ")
+                                        {
+                                            // ── /export [path] ───────────────────────────────
+                                            let arg = text_trimmed["/export".len()..].trim();
+                                            let out_path = if arg.is_empty() {
+                                                let ts = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs();
+                                                format!("decipher-session-{ts}.md")
+                                            } else {
+                                                arg.to_string()
+                                            };
+                                            // Generate markdown from transcript lines.
+                                            let lines = app.chat.transcript_lines(120);
+                                            let mut md = String::from("# DeCIpher Session Export\n\n");
+                                            for line in &lines {
+                                                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                                                md.push_str(&text);
+                                                md.push('\n');
+                                            }
+                                            match std::fs::write(&out_path, &md) {
+                                                Ok(()) => {
+                                                    let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                        text: format!("Session exported to {out_path} ({} lines)", lines.len()),
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    let _ = event_tx.try_send(ServerMessage::Error {
+                                                        message: format!("export: {e}"),
+                                                    });
+                                                }
+                                            }
                                         } else if text_trimmed.starts_with("/resume") {
                                             // ── /resume [thread_id] ─────────────────────────
                                             let arg = text_trimmed["/resume".len()..].trim();
@@ -827,6 +913,13 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16) -> io::Result<()
             // Abort agent task if running.
             if let Some(h) = current_agent_task.take() {
                 h.abort();
+            }
+            // Gracefully shut down MCP server processes.
+            if let Some(ref clients) = mcp_clients_arc {
+                for client_arc in clients.as_ref() {
+                    let mut client = client_arc.lock().await;
+                    client.shutdown().await;
+                }
             }
             // Flush and close the session JSONL.
             if let Some(ss) = session_store.take() {

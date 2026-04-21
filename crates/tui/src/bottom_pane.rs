@@ -96,6 +96,16 @@ impl<'a> BottomPane<'a> {
             self.build_spinner(label, &mut lines);
         }
 
+        // Approval action detail (shown in viewport so user sees what needs approval).
+        if self.app.mode == InputMode::ApprovalPending {
+            if let Some(ref action) = self.app.pending_approval_action {
+                lines.push(Line::from(vec![
+                    Span::styled("    ", DIM),
+                    Span::styled(action.clone(), BOLD_YELLOW),
+                ]));
+            }
+        }
+
         // Queued message indicator
         if self.app.queued_message.is_some() {
             lines.push(Line::from(vec![
@@ -291,6 +301,19 @@ impl<'a> BottomPane<'a> {
                 format!("{}m {}s", secs / 60, secs % 60)
             } else {
                 format!("{secs}s")
+            };
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(display, DIM));
+        }
+
+        // Cumulative token count
+        if self.app.total_tokens > 0 {
+            let display = if self.app.total_tokens >= 1_000_000 {
+                format!("{:.1}M tok", self.app.total_tokens as f64 / 1_000_000.0)
+            } else if self.app.total_tokens >= 1_000 {
+                format!("{:.1}K tok", self.app.total_tokens as f64 / 1_000.0)
+            } else {
+                format!("{} tok", self.app.total_tokens)
             };
             spans.push(Span::raw("  "));
             spans.push(Span::styled(display, DIM));
