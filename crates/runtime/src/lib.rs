@@ -29,6 +29,7 @@
 pub mod agent_loop;
 pub mod compaction;
 pub mod hooks;
+pub mod instructions;
 pub mod output_parser;
 pub mod skills;
 pub mod tools;
