@@ -65,6 +65,31 @@ pub fn load_instructions(decipher_home: &Path, workspace: &Path) -> InstructionF
     }
 }
 
+/// Format loaded instructions into a system prompt section.
+///
+/// - If no files loaded: returns empty string.
+/// - If one layer: `## Project Instructions\n<content>` (no sub-headers).
+/// - If both layers: sub-headers for each layer.
+pub fn format_instructions_section(files: &InstructionFiles) -> String {
+    match (&files.user_content, &files.project_content) {
+        (None, None) => String::new(),
+        (Some(user), None) => {
+            format!("## Project Instructions\n\n{}", user).trim_end().to_string()
+        }
+        (None, Some(project)) => {
+            format!("## Project Instructions\n\n{}", project).trim_end().to_string()
+        }
+        (Some(user), Some(project)) => {
+            format!(
+                "## Project Instructions\n\n### User Instructions (~/.decipher/DECIPHER.md)\n{}\n\n### Workspace Instructions (./DECIPHER.md)\n{}",
+                user, project
+            )
+            .trim_end()
+            .to_string()
+        }
+    }
+}
+
 /// Read a file and return its trimmed content.
 ///
 /// Returns `(Some(path), Some(content))` if the file exists and has non-empty
@@ -190,5 +215,39 @@ mod tests {
 
         assert!(instructions.is_empty());
         assert!(instructions.loaded_paths_display().is_none());
+    }
+
+    #[test]
+    fn format_single_layer_no_subheaders() {
+        let files = InstructionFiles {
+            project_content: Some("Do the thing.".to_string()),
+            ..Default::default()
+        };
+        let output = format_instructions_section(&files);
+        assert!(output.contains("## Project Instructions"));
+        assert!(output.contains("Do the thing."));
+        assert!(!output.contains("### Workspace Instructions"));
+        assert!(!output.contains("### User Instructions"));
+    }
+
+    #[test]
+    fn format_both_layers_with_subheaders() {
+        let files = InstructionFiles {
+            user_content: Some("User guidance.".to_string()),
+            project_content: Some("Project guidance.".to_string()),
+            ..Default::default()
+        };
+        let output = format_instructions_section(&files);
+        assert!(output.contains("## Project Instructions"));
+        assert!(output.contains("### User Instructions (~/.decipher/DECIPHER.md)"));
+        assert!(output.contains("### Workspace Instructions (./DECIPHER.md)"));
+        assert!(output.contains("User guidance."));
+        assert!(output.contains("Project guidance."));
+    }
+
+    #[test]
+    fn format_empty_returns_empty() {
+        let files = InstructionFiles::default();
+        assert_eq!(format_instructions_section(&files), "");
     }
 }
