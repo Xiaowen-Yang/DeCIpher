@@ -546,6 +546,7 @@ pub fn banner_lines(
     model: &str,
     directory: &str,
     api_key_set: bool,
+    instructions_display: Option<&str>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(""));
@@ -574,6 +575,12 @@ pub fn banner_lines(
         Span::styled("  directory  ", DIM),
         Span::styled(directory.to_string(), Style::default().fg(Color::White)),
     ]));
+    if let Some(instr) = instructions_display {
+        lines.push(Line::from(vec![
+            Span::styled("  instruct.  ", DIM),
+            Span::styled(instr.to_string(), CYAN),
+        ]));
+    }
     lines.push(Line::from(vec![
         Span::styled("  approval   ", DIM),
         Span::styled("on-request", CYAN),

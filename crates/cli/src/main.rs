@@ -38,7 +38,7 @@ use decipher_providers::anthropic::AnthropicProvider;
 use decipher_providers::openai::OpenAiProvider;
 use decipher_providers::Provider;
 use decipher_mcp::{McpConfig, McpClient};
-use decipher_runtime::{AgentConfig, AgentLoop, HookConfig, load_skills};
+use decipher_runtime::{AgentConfig, AgentLoop, HookConfig, load_skills, load_instructions, generate_template};
 use decipher_session_store::{load_session, list_sessions, MemoryStore, SessionStore};
 use decipher_tui::app::{self, App};
 use decipher_tui::bottom_pane::{self, BottomPane};
@@ -225,7 +225,9 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16) -> io::Result<()
             &format!("DeCIpher \u{2014} {}", model),
         );
 
-        let banner = bottom_pane::banner_lines(version, provider, &model, &directory, api_key_set);
+        let instr_files = load_instructions(&decipher_home, std::path::Path::new(&workspace));
+        let instr_display = instr_files.loaded_paths_display();
+        let banner = bottom_pane::banner_lines(version, provider, &model, &directory, api_key_set, instr_display.as_deref());
         if !banner.is_empty() {
             let h = banner.len() as u16;
             terminal.insert_before(h, |buf| {
@@ -584,6 +586,16 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16) -> io::Result<()
                                                     });
                                                 }
                                             }
+                                        } else if text_trimmed == "/init" {
+                                            // ── /init ─────────────────────────────────────────
+                                            let text = match generate_template(std::path::Path::new(&workspace)) {
+                                                Ok(path) => format!("Created {}", path.display()),
+                                                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                                                    format!("DECIPHER.md already exists at {}/DECIPHER.md", workspace)
+                                                }
+                                                Err(e) => format!("Failed to create DECIPHER.md: {}", e),
+                                            };
+                                            let _ = event_tx.try_send(ServerMessage::AgentMessage { text });
                                         } else if text_trimmed.starts_with("/resume") {
                                             // ── /resume [thread_id] ─────────────────────────
                                             let arg = text_trimmed["/resume".len()..].trim();
@@ -744,10 +756,24 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16) -> io::Result<()
                             cols,
                             vp_h,
                         ))?;
-                        // Clear the viewport buffer so old content doesn't ghost
-                        // when the inline viewport shifts position on resize.
-                        terminal.clear()?;
-                        need_redraw = true;
+                        // terminal.resize() already calls clear() internally (moves cursor
+                        // to viewport top and clears AfterCursor). A second clear() is
+                        // redundant and was removed.
+                        //
+                        // Immediately redraw at the new width so that any reflow artifact
+                        // left by the terminal emulator's own resize handling (e.g. the
+                        // previous viewport render sitting one row above the cleared area)
+                        // is overwritten BEFORE the next insert_before() call can scroll
+                        // it into permanent scrollback (the "ghost spinner" flood bug).
+                        terminal.draw(|frame| {
+                            let area = frame.area();
+                            frame.render_widget(BottomPane::new(&app), area);
+                            if let Some((x, y)) = BottomPane::new(&app).cursor_position(area) {
+                                frame.set_cursor_position((x, y));
+                            }
+                        })?;
+                        fps.mark_drawn();
+                        need_redraw = false;
                     }
                     Ok(Event::FocusGained) => { app.terminal_focused = true; }
                     Ok(Event::FocusLost) => { app.terminal_focused = false; }
@@ -762,7 +788,7 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16) -> io::Result<()
                 if let ServerMessage::Banner { ref version, ref provider, ref model, ref directory, api_key_set } = msg {
                     let mut stdout = io::stdout();
                     decipher_tui::render::set_terminal_title(&mut stdout, &format!("DeCIpher \u{2014} {model}"))?;
-                    let banner = bottom_pane::banner_lines(version, provider, model, directory, api_key_set);
+                    let banner = bottom_pane::banner_lines(version, provider, model, directory, api_key_set, None);
                     if !banner.is_empty() {
                         let h = banner.len() as u16;
                         terminal.insert_before(h, |buf| {
@@ -1088,6 +1114,7 @@ fn build_agent_config(
     mcp_clients: Option<std::sync::Arc<Vec<std::sync::Arc<tokio::sync::Mutex<McpClient>>>>>,
 ) -> AgentConfig {
     let skills = load_skills(decipher_home, std::path::Path::new(&workspace));
+    let instructions = load_instructions(decipher_home, std::path::Path::new(&workspace));
     let hook_config = HookConfig::load(decipher_home);
     // Load memory context if not explicitly provided.
     let memory_context = memory_context.or_else(|| {
@@ -1104,6 +1131,7 @@ fn build_agent_config(
         mission_goal: goal,
         policy_mode,
         skills,
+        instructions,
         memory_context,
         hook_config,
         mcp_tools,
