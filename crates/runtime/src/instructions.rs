@@ -90,6 +90,52 @@ pub fn format_instructions_section(files: &InstructionFiles) -> String {
     }
 }
 
+const TEMPLATE: &str = r#"# DECIPHER.md
+
+## Project
+
+<!-- What this project is and what DeCIpher should know about it -->
+
+## Commands
+
+<!-- Common commands DeCIpher should know -->
+<!-- Example:
+```bash
+# Build
+make build
+
+# Test
+make test
+
+# Deploy
+make deploy
+```
+-->
+
+## Architecture
+
+<!-- Key directories, modules, or patterns -->
+
+## Rules
+
+<!-- Conventions, constraints, or things to avoid -->
+"#;
+
+/// Write the starter DECIPHER.md template to workspace root.
+///
+/// Returns `Ok(path)` on success. Returns `Err` if file already exists.
+pub fn generate_template(workspace: &Path) -> Result<PathBuf, std::io::Error> {
+    let target = workspace.join("DECIPHER.md");
+    if target.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("DECIPHER.md already exists at {}", target.display()),
+        ));
+    }
+    std::fs::write(&target, TEMPLATE)?;
+    Ok(target)
+}
+
 /// Read a file and return its trimmed content.
 ///
 /// Returns `(Some(path), Some(content))` if the file exists and has non-empty
@@ -249,5 +295,28 @@ mod tests {
     fn format_empty_returns_empty() {
         let files = InstructionFiles::default();
         assert_eq!(format_instructions_section(&files), "");
+    }
+
+    #[test]
+    fn generate_template_creates_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = generate_template(tmp.path()).unwrap();
+
+        assert!(path.exists());
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("# DECIPHER.md"));
+        assert!(content.contains("## Project"));
+        assert!(content.contains("## Commands"));
+        assert!(content.contains("## Architecture"));
+        assert!(content.contains("## Rules"));
+    }
+
+    #[test]
+    fn generate_template_fails_if_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("DECIPHER.md"), "existing content").unwrap();
+
+        let err = generate_template(tmp.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 }
