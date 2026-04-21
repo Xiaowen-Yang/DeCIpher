@@ -153,7 +153,7 @@ pub async fn fire_session_event(hooks: &[HookEntry]) {
 // ── Internal helpers ───────────────────────────────────────────────────────────
 
 enum HookRunResult {
-    Ok(String),
+    Ok(()),
     Blocked(String),
     Failed(String),
 }
@@ -252,7 +252,8 @@ async fn run_hook(hook: &HookEntry, stdin_payload: &str) -> HookRunResult {
         ));
     }
 
-    HookRunResult::Ok(stdout)
+    let _ = stdout;
+    HookRunResult::Ok(())
 }
 
 /// Split a command string into words, respecting single and double quotes.

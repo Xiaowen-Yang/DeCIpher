@@ -526,31 +526,6 @@ fn cursor_position_in_multiline(text: &str, cursor: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// Convert crossterm Color to ratatui Color.
-/// ratatui re-exports crossterm colors but they're different enum types.
-fn crossterm_to_ratatui_color(c: crossterm::style::Color) -> Color {
-    match c {
-        crossterm::style::Color::Rgb { r, g, b } => Color::Rgb(r, g, b),
-        crossterm::style::Color::Black => Color::Black,
-        crossterm::style::Color::Red => Color::Red,
-        crossterm::style::Color::Green => Color::Green,
-        crossterm::style::Color::Yellow => Color::Yellow,
-        crossterm::style::Color::Blue => Color::Blue,
-        crossterm::style::Color::Magenta => Color::Magenta,
-        crossterm::style::Color::Cyan => Color::Cyan,
-        crossterm::style::Color::White => Color::White,
-        crossterm::style::Color::DarkGrey => Color::DarkGray,
-        crossterm::style::Color::Grey => Color::Gray,
-        crossterm::style::Color::DarkRed => Color::Red,
-        crossterm::style::Color::DarkGreen => Color::Green,
-        crossterm::style::Color::DarkYellow => Color::Yellow,
-        crossterm::style::Color::DarkBlue => Color::Blue,
-        crossterm::style::Color::DarkMagenta => Color::Magenta,
-        crossterm::style::Color::DarkCyan => Color::Cyan,
-        crossterm::style::Color::AnsiValue(v) => Color::Indexed(v),
-        _ => Color::Reset,
-    }
-}
 
 fn format_tokens(n: u64) -> String {
     if n >= 1_000_000 {

@@ -58,6 +58,7 @@ impl AgentLoop {
     /// This function is indirectly recursive via spawn_agent → AgentLoop::run.
     /// The `#[async_recursion]` attribute boxes the future to break the cycle.
     #[async_recursion]
+    #[allow(unused_assignments)]
     pub async fn run(
         config: AgentConfig,
         provider: &dyn Provider,

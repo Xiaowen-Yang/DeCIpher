@@ -220,6 +220,7 @@ pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, String>
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct Hunk {
     orig_start: u32,
     orig_len: u32,

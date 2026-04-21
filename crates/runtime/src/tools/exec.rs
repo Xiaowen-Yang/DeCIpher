@@ -6,7 +6,6 @@ use super::{resolve_path, ToolContext, ToolOutput};
 use crate::output_parser::{self, ParsedOutput};
 use serde_json::Value;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 const EXEC_TIMEOUT_SECS: u64 = 120;
