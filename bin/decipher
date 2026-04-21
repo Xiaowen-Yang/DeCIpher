@@ -27,50 +27,6 @@ const [,, command, ...args] = process.argv;
 
 async function main() {
   switch (command) {
-    case 'doctor': {
-      const { checkEnvironment } = await import('../agents/verifier/index.js');
-      const result = await checkEnvironment();
-      process.exit(result.allPassed ? 0 : 1);
-    }
-
-    case 'bootstrap': {
-      const { generateBootstrapPlan } = await import('../agents/verifier/index.js');
-      await generateBootstrapPlan();
-      break;
-    }
-
-    case 'triage': {
-      if (!args[0]) {
-        console.error('Usage: decipher triage <log-file>');
-        process.exit(1);
-      }
-      const config = await readConfig();
-      const { triageLog } = await import('../agents/triage/index.js');
-      const { formatSection } = await import('../lib/reporter.js');
-      const result = await triageLog(args[0], {}, config);
-      console.log(formatSection('CLASSIFICATION', `  label:      ${result.classification}\n  confidence: ${result.confidence}`));
-      console.log(formatSection('EVIDENCE', result.root_causes.map(rc => `  ${rc.hypothesis}: ${rc.evidence}`).join('\n')));
-      break;
-    }
-
-    case 'verify': {
-      const cmd = args.join(' ');
-      if (!cmd) {
-        console.error('Usage: decipher verify "<command>"');
-        process.exit(1);
-      }
-      const { runVerification } = await import('../agents/verifier/index.js');
-      const { formatSection } = await import('../lib/reporter.js');
-      const result = await runVerification(cmd);
-      console.log(formatSection('VERIFICATION', [
-        `  Command:   ${cmd}`,
-        `  Exit code: ${result.exit_code}`,
-        `  Result:    ${result.result}`,
-        result.stdout_excerpt ? `\n${result.stdout_excerpt.split('\n').slice(0, 5).map(l => `  ${l}`).join('\n')}` : '',
-      ].join('\n')));
-      process.exit(result.result === 'PASS' ? 0 : 1);
-    }
-
     case 'config':
     case 'setting': {
       if (args[0] === 'set' && args[1] && args[2]) {
@@ -105,9 +61,7 @@ async function main() {
 
   Commands:
     decipher                     Interactive mode (Rust TUI)
-    decipher doctor              Check environment
-    decipher triage <log>        Triage a failure log
-    decipher verify "<cmd>"      Run a verification command
+    decipher exec <task>         Run a mission non-interactively (Rust)
     decipher setting show|set    Manage configuration
 `);
       break;

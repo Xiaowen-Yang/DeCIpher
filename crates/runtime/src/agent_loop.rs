@@ -25,6 +25,7 @@ use decipher_providers::{
         ToolDefinition, TokenUsage,
     },
 };
+use decipher_tools::classify::is_read_only_by_name;
 use decipher_tools::spec::all_tool_specs;
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -202,6 +203,20 @@ impl AgentLoop {
 
             let reasoning = first_text(&collected.content).unwrap_or_default();
 
+            // Classified tool calls for this turn.
+            struct PendingTool {
+                id: String,
+                name: String,
+                input: serde_json::Value,
+                decision: Decision,
+                tool_class: decipher_policy::ToolClass,
+                reason: String,
+            }
+
+            let mut parallel_tools: Vec<PendingTool> = Vec::new();
+            let mut sequential_tools: Vec<PendingTool> = Vec::new();
+
+            // First pass: handle `done` immediately; classify remaining tools.
             for block in &collected.content {
                 let ContentBlock::ToolUse { id, name, input } = block else {
                     continue;
@@ -231,17 +246,7 @@ impl AgentLoop {
                     break;
                 }
 
-                // Emit ToolStart.
-                let _ = event_tx
-                    .send(ServerMessage::ToolStart {
-                        tool: name.clone(),
-                        reasoning: reasoning.chars().take(200).collect(),
-                        args: Some(input.clone()),
-                        call_id: Some(id.clone()),
-                    })
-                    .await;
-
-                // Policy check.
+                // Evaluate policy early for classification.
                 let policy_result = evaluate_policy(
                     config.policy_mode,
                     name,
@@ -250,79 +255,143 @@ impl AgentLoop {
                     Some(config.workspace.as_str()),
                 );
 
-                let tool_class = policy_result.tool_class;
-                let tool_result_text: String;
+                let pending = PendingTool {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    decision: policy_result.decision,
+                    tool_class: policy_result.tool_class,
+                    reason: policy_result.reason.to_string(),
+                };
 
-                match policy_result.decision {
-                    Decision::Deny => {
-                        tool_result_text = format!(
-                            "Error: Action denied by policy ({}). \
-                             Try a different approach that does not require {} access.",
-                            policy_result.reason, tool_class
-                        );
-                        tool_result_blocks.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: tool_result_text,
-                            is_error: true,
-                        });
+                // Parallel: read-only AND allowed (no user gate, no risk).
+                if is_read_only_by_name(name) && policy_result.decision == Decision::Allow {
+                    parallel_tools.push(pending);
+                } else {
+                    sequential_tools.push(pending);
+                }
+            }
+
+            if done_in_turn {
+                // Already handled above.
+            } else {
+                // ── Parallel batch ────────────────────────────────────────────
+                if !parallel_tools.is_empty() {
+                    // Emit ToolStart for each parallel tool.
+                    for t in &parallel_tools {
+                        let _ = event_tx
+                            .send(ServerMessage::ToolStart {
+                                tool: t.name.clone(),
+                                reasoning: reasoning.chars().take(200).collect(),
+                                args: Some(t.input.clone()),
+                                call_id: Some(t.id.clone()),
+                            })
+                            .await;
                     }
-                    Decision::Ask => {
-                        // Wait for approval from the TUI, or auto-approve if no channel.
-                        let approved = if let Some(rx) = approval_rx.as_mut() {
-                            let _ = event_tx
-                                .send(ServerMessage::ApprovalRequest {
-                                    capabilities: vec![tool_class.to_string()],
-                                    action: Some(decipher_protocol::ActionDetail {
-                                        tool: name.clone(),
-                                        reasoning: Some(reasoning.chars().take(200).collect()),
-                                    }),
-                                })
-                                .await;
-                            rx.recv().await.unwrap_or(false)
-                        } else {
-                            true // No approval channel — auto-approve in non-interactive mode.
-                        };
 
-                        if !approved {
-                            outcome = RunOutcome::Fail;
-                            final_summary =
-                                "Stopped: approval denied for risky operation.".to_string();
-                            done_in_turn = true;
-                            break;
+                    // Execute all parallel tools concurrently.
+                    let futs = parallel_tools.iter().map(|t| {
+                        let name = t.name.clone();
+                        let id = t.id.clone();
+                        let input = t.input.clone();
+                        let ctx = tool_ctx.clone();
+                        let tx = event_tx.clone();
+                        async move {
+                            execute_tool_and_emit(&name, &id, &input, &ctx, &tx, start).await
                         }
-
-                        record_approval(&mut amendments, tool_class, Some(name.as_str()));
-
-                        // Execute the tool.
-                        let (result_block, emitted_done) = execute_tool_and_emit(
-                            name,
-                            id,
-                            input,
-                            &tool_ctx,
-                            &event_tx,
-                            start,
-                        )
-                        .await?;
-                        tool_result_blocks.push(result_block);
-                        if emitted_done {
-                            done_in_turn = true;
-                            break;
-                        }
+                    });
+                    let results = futures::future::join_all(futs).await;
+                    for result in results {
+                        let (block, _emitted_done) = result?;
+                        tool_result_blocks.push(block);
                     }
-                    Decision::Allow => {
-                        let (result_block, emitted_done) = execute_tool_and_emit(
-                            name,
-                            id,
-                            input,
-                            &tool_ctx,
-                            &event_tx,
-                            start,
-                        )
-                        .await?;
-                        tool_result_blocks.push(result_block);
-                        if emitted_done {
-                            done_in_turn = true;
-                            break;
+                }
+
+                // ── Sequential tools ──────────────────────────────────────────
+                for t in &sequential_tools {
+                    // Emit ToolStart.
+                    let _ = event_tx
+                        .send(ServerMessage::ToolStart {
+                            tool: t.name.clone(),
+                            reasoning: reasoning.chars().take(200).collect(),
+                            args: Some(t.input.clone()),
+                            call_id: Some(t.id.clone()),
+                        })
+                        .await;
+
+                    let tool_result_text: String;
+                    match t.decision {
+                        Decision::Deny => {
+                            tool_result_text = format!(
+                                "Error: Action denied by policy ({}). \
+                                 Try a different approach that does not require {} access.",
+                                t.reason, t.tool_class
+                            );
+                            tool_result_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id: t.id.clone(),
+                                content: tool_result_text,
+                                is_error: true,
+                            });
+                        }
+                        Decision::Ask => {
+                            // Wait for approval from the TUI, or auto-approve if no channel.
+                            let approved = if let Some(rx) = approval_rx.as_mut() {
+                                let _ = event_tx
+                                    .send(ServerMessage::ApprovalRequest {
+                                        capabilities: vec![t.tool_class.to_string()],
+                                        action: Some(decipher_protocol::ActionDetail {
+                                            tool: t.name.clone(),
+                                            reasoning: Some(
+                                                reasoning.chars().take(200).collect(),
+                                            ),
+                                        }),
+                                    })
+                                    .await;
+                                rx.recv().await.unwrap_or(false)
+                            } else {
+                                true // No approval channel — auto-approve in non-interactive mode.
+                            };
+
+                            if !approved {
+                                outcome = RunOutcome::Fail;
+                                final_summary =
+                                    "Stopped: approval denied for risky operation.".to_string();
+                                done_in_turn = true;
+                                break;
+                            }
+
+                            record_approval(&mut amendments, t.tool_class, Some(t.name.as_str()));
+
+                            let (result_block, emitted_done) = execute_tool_and_emit(
+                                &t.name,
+                                &t.id,
+                                &t.input,
+                                &tool_ctx,
+                                &event_tx,
+                                start,
+                            )
+                            .await?;
+                            tool_result_blocks.push(result_block);
+                            if emitted_done {
+                                done_in_turn = true;
+                                break;
+                            }
+                        }
+                        Decision::Allow => {
+                            let (result_block, emitted_done) = execute_tool_and_emit(
+                                &t.name,
+                                &t.id,
+                                &t.input,
+                                &tool_ctx,
+                                &event_tx,
+                                start,
+                            )
+                            .await?;
+                            tool_result_blocks.push(result_block);
+                            if emitted_done {
+                                done_in_turn = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -645,6 +714,7 @@ fn build_initial_user_message(config: &AgentConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use decipher_providers::anthropic::AnthropicProvider;
 
     #[test]
     fn system_prompt_contains_goal() {
@@ -708,5 +778,64 @@ mod tests {
     fn first_text_returns_none_for_empty_blocks() {
         let blocks: Vec<ContentBlock> = vec![];
         assert_eq!(first_text(&blocks), None);
+    }
+
+    /// Verify that multiple read-only tools in one turn all produce results.
+    /// Uses the MockProviderService to serve a multi_tool_turn scenario
+    /// (two read_file calls), then runs one turn of the AgentLoop and checks
+    /// that two ToolResult events arrived — proving the parallel batch ran.
+    #[tokio::test]
+    async fn parallel_read_only_tools_both_produce_results() {
+        use decipher_mock_provider::MockProviderService;
+        use tokio::sync::mpsc;
+
+        let mock = MockProviderService::spawn().await.unwrap();
+        let provider = AnthropicProvider::new("test-key", "claude-sonnet-4-5-20250514")
+            .with_base_url(mock.base_url());
+
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(64);
+
+        let workspace = tempfile::tempdir().unwrap();
+        // Create the files the mock tool will try to read.
+        std::fs::write(workspace.path().join("a.txt"), "content_a").unwrap();
+        std::fs::write(workspace.path().join("b.txt"), "content_b").unwrap();
+
+        let cfg = crate::types::AgentConfig {
+            model: "claude-sonnet-4-5-20250514".to_string(),
+            api_key: "test-key".to_string(),
+            workspace: workspace.path().to_string_lossy().to_string(),
+            mission_goal: "PARITY_SCENARIO:multi_tool_turn read a.txt b.txt".to_string(),
+            max_turns: 3,
+            ..Default::default()
+        };
+
+        let handle = tokio::spawn(async move {
+            let _ = AgentLoop::run(cfg, &provider, tx, None).await;
+        });
+
+        let mut tool_results = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            tokio::select! {
+                Some(msg) = rx.recv() => {
+                    if matches!(msg, ServerMessage::ToolResult { .. }) {
+                        tool_results += 1;
+                    }
+                    if matches!(msg, ServerMessage::MissionComplete { .. }) {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    break;
+                }
+            }
+        }
+        handle.abort();
+        mock.shutdown().await;
+
+        assert!(
+            tool_results >= 2,
+            "expected at least 2 ToolResult events (one per parallel read_file), got {tool_results}"
+        );
     }
 }

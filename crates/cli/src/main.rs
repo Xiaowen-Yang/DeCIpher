@@ -63,6 +63,13 @@ fn make_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<io::Stdout
 async fn main() -> io::Result<()> {
     let cli_cfg = config::CliConfig::load();
 
+    // ── Non-interactive exec mode ─────────────────────────────────────────────
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.first().map(|s| s.as_str()) == Some("exec") {
+        let exit_code = run_exec_mode(&raw_args[1..], cli_cfg).await;
+        std::process::exit(exit_code);
+    }
+
     // Push cursor to the terminal bottom BEFORE raw mode so that
     // Viewport::Inline anchors at the real bottom, not wherever the
     // shell prompt happened to leave the cursor.
@@ -228,7 +235,62 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                                         }
 
                                         let text_trimmed = text.trim();
-                                        if text_trimmed.starts_with("/resume") {
+                                        if text_trimmed == "/sessions"
+                                            || text_trimmed.starts_with("/sessions ")
+                                        {
+                                            // ── /sessions ─────────────────────────────────────
+                                            match list_sessions(&decipher_home).await {
+                                                Ok(sessions) if sessions.is_empty() => {
+                                                    let _ = event_tx.try_send(
+                                                        ServerMessage::AgentMessage {
+                                                            text: "No sessions recorded yet."
+                                                                .into(),
+                                                        },
+                                                    );
+                                                }
+                                                Ok(sessions) => {
+                                                    let mut lines =
+                                                        String::from("Recorded sessions:\n");
+                                                    for s in &sessions {
+                                                        let short_id = &s.thread_id
+                                                            [..s.thread_id.len().min(8)];
+                                                        let goal: String = s
+                                                            .mission_goal
+                                                            .chars()
+                                                            .take(50)
+                                                            .collect();
+                                                        let goal = if s.mission_goal.len() > 50 {
+                                                            format!("{goal}…")
+                                                        } else {
+                                                            goal
+                                                        };
+                                                        let outcome = s
+                                                            .outcome
+                                                            .as_deref()
+                                                            .unwrap_or("—");
+                                                        let date = s
+                                                            .started_at
+                                                            .format("%Y-%m-%d %H:%M")
+                                                            .to_string();
+                                                        lines.push_str(&format!(
+                                                            "[{short_id}] {goal} — {outcome} — {date}\n"
+                                                        ));
+                                                    }
+                                                    let _ = event_tx.try_send(
+                                                        ServerMessage::AgentMessage {
+                                                            text: lines.trim_end().to_string(),
+                                                        },
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    let _ = event_tx.try_send(
+                                                        ServerMessage::Error {
+                                                            message: format!("sessions: {e}"),
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        } else if text_trimmed.starts_with("/resume") {
                                             // ── /resume [thread_id] ─────────────────────────
                                             let arg = text_trimmed["/resume".len()..].trim();
                                             let tid_opt: Option<String> = if arg.is_empty() {
@@ -477,6 +539,128 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Non-interactive exec mode: run a mission headlessly, print results, return exit code.
+///
+/// Exit codes: 0=PASS, 1=FAIL, 2=PARTIAL, 3=error.
+async fn run_exec_mode(args: &[String], cli_cfg: config::CliConfig) -> i32 {
+    // ── Parse arguments ───────────────────────────────────────────────────────
+    // Usage: exec <task> [--output-format text|json] [--quiet]
+    let mut task = String::new();
+    let mut output_format = "text".to_string();
+    let mut quiet = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output-format" => {
+                i += 1;
+                if i < args.len() {
+                    output_format = args[i].clone();
+                }
+            }
+            "--quiet" => {
+                quiet = true;
+            }
+            other if !other.starts_with("--") => {
+                if task.is_empty() {
+                    task = other.to_string();
+                } else {
+                    task.push(' ');
+                    task.push_str(other);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if task.is_empty() {
+        eprintln!("decipher exec: task text is required");
+        eprintln!("Usage: decipher exec <task> [--output-format text|json] [--quiet]");
+        return 3;
+    }
+
+    // ── Provider ──────────────────────────────────────────────────────────────
+    let provider = {
+        let mut p = AnthropicProvider::new(&cli_cfg.api_key, &cli_cfg.model);
+        if let Some(ref url) = cli_cfg.base_url {
+            p = p.with_base_url(url);
+        }
+        Arc::new(p)
+    };
+
+    // ── Run agent ─────────────────────────────────────────────────────────────
+    let (event_tx, mut event_rx) = mpsc::channel::<ServerMessage>(128);
+
+    let agent_cfg = build_agent_config(
+        task.clone(),
+        cli_cfg.api_key.clone(),
+        cli_cfg.model.clone(),
+        cli_cfg.base_url.clone(),
+        cli_cfg.workspace.clone(),
+        cli_cfg.policy_mode,
+    );
+
+    let prov = provider.clone();
+    let tx = event_tx.clone();
+    let _agent_task = tokio::spawn(async move {
+        let _ = AgentLoop::run(agent_cfg, &*prov, tx, None).await;
+    });
+
+    let exec_start = Instant::now();
+    let mut outcome = "FAIL".to_string();
+    let mut summary = String::new();
+    let mut turns = 0u32;
+
+    // Drain events until MissionComplete.
+    while let Some(msg) = event_rx.recv().await {
+        if !quiet {
+            match &msg {
+                ServerMessage::AgentStatus { phase, turn, .. } => {
+                    eprintln!("[turn {turn}] {phase}");
+                }
+                ServerMessage::ToolStart { tool, .. } => {
+                    eprintln!("  → {tool}");
+                }
+                ServerMessage::ToolResult { tool, success, summary: s, .. } => {
+                    let status = if *success { "ok" } else { "fail" };
+                    eprintln!("  ← {tool} [{status}] {s}");
+                }
+                ServerMessage::AgentMessage { text } => {
+                    eprintln!("  {text}");
+                }
+                _ => {}
+            }
+        }
+        if let ServerMessage::MissionComplete { outcome: o, summary: s, turns: t, .. } = msg {
+            outcome = o;
+            summary = s;
+            turns = t;
+            break;
+        }
+    }
+
+    let elapsed_ms = exec_start.elapsed().as_millis() as u64;
+
+    // ── Output ────────────────────────────────────────────────────────────────
+    if output_format == "json" {
+        println!(
+            r#"{{"outcome":"{outcome}","summary":{summary_json},"turns":{turns},"elapsed_ms":{elapsed_ms}}}"#,
+            summary_json = serde_json::Value::String(summary.clone()),
+        );
+    } else {
+        println!("outcome: {outcome}");
+        println!("summary: {summary}");
+    }
+
+    // ── Exit code ─────────────────────────────────────────────────────────────
+    match outcome.as_str() {
+        "PASS" => 0,
+        "PARTIAL" => 2,
+        _ => 1,
+    }
 }
 
 /// Build an `AgentConfig` for a single mission run.
