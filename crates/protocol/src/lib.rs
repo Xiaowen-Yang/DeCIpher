@@ -103,6 +103,10 @@ pub enum ServerMessage {
         /// Correlation ID for multi-tool turns.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
+        /// Full tool output text for LLM history reconstruction (used by session resume).
+        /// Omitted from older session records — fall back to `summary` when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        llm_text: Option<String>,
     },
 
     #[serde(rename = "agent_message")]

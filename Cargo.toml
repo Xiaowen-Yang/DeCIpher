@@ -5,7 +5,6 @@ members = [
     "crates/protocol",
     "crates/markdown",
     "crates/clipboard",
-    "crates/agent-bridge",
     "crates/mock-provider",
     "crates/providers",
     "crates/policy",
@@ -26,7 +25,6 @@ decipher-protocol = { path = "crates/protocol" }
 decipher-tui = { path = "crates/tui" }
 decipher-markdown = { path = "crates/markdown" }
 decipher-clipboard = { path = "crates/clipboard" }
-decipher-agent-bridge = { path = "crates/agent-bridge" }
 decipher-providers = { path = "crates/providers" }
 decipher-mock-provider = { path = "crates/mock-provider" }
 decipher-policy = { path = "crates/policy" }

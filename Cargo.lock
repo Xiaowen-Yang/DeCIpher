@@ -296,15 +296,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "decipher-agent-bridge"
-version = "0.1.5"
-dependencies = [
- "decipher-protocol",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "decipher-cli"
 version = "0.1.5"
 dependencies = [
@@ -408,6 +399,7 @@ version = "0.1.5"
 dependencies = [
  "chrono",
  "decipher-protocol",
+ "decipher-providers",
  "serde",
  "serde_json",
  "tempfile",

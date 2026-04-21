@@ -31,11 +31,15 @@ pub(crate) async fn append_index_entry(
 }
 
 /// List all recorded sessions, most recent first.
-pub async fn list_sessions(base_dir: &Path) -> Vec<SessionIndexEntry> {
+///
+/// Returns `Ok(vec![])` when the index does not exist yet (first run).
+/// Returns `Err` only for real I/O or parse failures.
+pub async fn list_sessions(base_dir: &Path) -> Result<Vec<SessionIndexEntry>, crate::StoreError> {
     let index_path = base_dir.join(INDEX_FILE);
     let contents = match tokio::fs::read_to_string(&index_path).await {
         Ok(c) => c,
-        Err(_) => return vec![],
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(crate::StoreError::Io(e)),
     };
     let mut entries: Vec<SessionIndexEntry> = contents
         .lines()
@@ -43,5 +47,5 @@ pub async fn list_sessions(base_dir: &Path) -> Vec<SessionIndexEntry> {
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
     entries.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-    entries
+    Ok(entries)
 }

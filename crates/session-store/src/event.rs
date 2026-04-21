@@ -12,6 +12,8 @@ pub struct SessionMeta {
     pub started_at: DateTime<Utc>,
     pub model: String,
     pub workspace: String,
+    /// The user's initial mission goal — used to reconstruct LLM history on resume.
+    pub mission_goal: String,
 }
 
 /// A timestamped ServerMessage event.  Written as a JSONL line.
@@ -38,5 +40,6 @@ pub struct SessionIndexEntry {
     pub ended_at: Option<DateTime<Utc>>,
     pub model: String,
     pub workspace: String,
+    pub mission_goal: String,
     pub outcome: Option<String>,
 }

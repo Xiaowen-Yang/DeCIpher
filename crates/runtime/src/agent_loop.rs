@@ -81,12 +81,16 @@ impl AgentLoop {
             })
             .collect();
 
-        // Build the initial message history.
+        // Build the initial message history (or restore from a resumed session).
         let system_prompt = build_system_prompt(&config);
-        let mut messages: Vec<Message> = vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text(build_initial_user_message(&config)),
-        }];
+        let mut messages: Vec<Message> = if let Some(history) = config.resume_from.clone() {
+            history
+        } else {
+            vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text(build_initial_user_message(&config)),
+            }]
+        };
 
         let mut amendments = PermissionAmendments::new();
         let tool_ctx = ToolContext {
@@ -131,6 +135,16 @@ impl AgentLoop {
             // Collect streaming response.
             let collected = collect_stream(&mut stream, &event_tx).await?;
             last_prompt_tokens = collected.usage.input_tokens;
+
+            // Emit the assembled assistant text as AgentMessage so the session
+            // store can record it for history reconstruction.
+            if let Some(text) = first_text(&collected.content) {
+                if !text.is_empty() {
+                    let _ = event_tx
+                        .send(ServerMessage::AgentMessage { text })
+                        .await;
+                }
+            }
 
             // Emit token usage.
             let _ = event_tx
@@ -393,6 +407,8 @@ async fn execute_tool_and_emit(
                 .as_deref()
                 .map(|o| o.lines().count() as u32),
             call_id: Some(call_id.to_string()),
+            // Store full LLM-facing text for lossless session resume reconstruction.
+            llm_text: Some(tool_output.llm_text.clone()),
         })
         .await;
 

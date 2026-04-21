@@ -2,10 +2,7 @@ import { access, readFile } from "node:fs/promises";
 import { resolve, join, dirname } from "node:path";
 import { homedir } from "node:os";
 import pc from "picocolors";
-import {
-  loadSessionSnapshot,
-  formatSessionSnapshot,
-} from "../../lib/session-store.js";
+// lib/session-store.js removed in R4 — session history is now owned by crates/session-store.
 
 // ── Target resolution ─────────────────────────────────────────────────────────
 
@@ -556,71 +553,10 @@ export function decideResumeAction(snapshot = {}) {
   return { mode: "not_resumable" };
 }
 
-export async function resumeLastTarget(config, sessionState = {}) {
-  const snapshot = await loadSessionSnapshot();
-  if (!snapshot) {
-    console.log(pc.yellow("  No saved executor session to resume.\n"));
-    return null;
-  }
-
-  const resumeAction = decideResumeAction(snapshot);
-  if (resumeAction.mode === "not_resumable") {
-    console.log(pc.yellow("  The last saved session is not resumable.\n"));
-    console.log(`  ${formatSessionSnapshot(snapshot, { public: true })}\n`);
-    return null;
-  }
-
-  sessionState.currentMission =
-    snapshot.mission ?? sessionState.currentMission ?? null;
-  sessionState.currentPlan = snapshot.plan ?? sessionState.currentPlan ?? null;
-  sessionState.lastVerificationResult =
-    snapshot.last_verification_state ??
-    sessionState.lastVerificationResult ??
-    null;
-  sessionState.approved = snapshot.approved ?? sessionState.approved ?? false;
-
-  if (resumeAction.mode === "clarify") {
-    console.log(pc.bold("\n  Resuming mission clarification\n"));
-    if (snapshot.mission_summary) {
-      console.log(pc.dim(`  mission: ${snapshot.mission_summary}`));
-    }
-    console.log(
-      pc.dim(
-        `  previous state: ${snapshot.last_verification_state ?? "needs clarification"}`,
-      ),
-    );
-    console.log(pc.yellow(`  question: ${resumeAction.question}\n`));
-    return {
-      needs_clarification: resumeAction.question,
-      resumed: true,
-      mode: "clarify",
-      snapshot,
-    };
-  }
-
-  const target = await resolvePathTarget(snapshot.target_path);
-  if (!target) {
-    throw new Error(
-      `Saved target is no longer available: ${snapshot.target_path}`,
-    );
-  }
-
-  sessionState.currentTarget = target;
-
-  console.log(pc.bold("\n  Resuming executor session\n"));
-  console.log(pc.dim(`  target: ${snapshot.target_path}`));
+// resumeLastTarget removed in R4 — session resume is handled by /resume in the Rust TUI.
+export async function resumeLastTarget(_config, _sessionState = {}) {
   console.log(
-    pc.dim(
-      `  previous state: ${snapshot.last_verification_state ?? "unknown"}`,
-    ),
+    pc.yellow("  Use /resume in the DeCIpher TUI to resume a session.\n"),
   );
-  console.log(
-    pc.dim(
-      `  iteration: ${snapshot.iteration ?? 0}/${snapshot.max_iterations ?? 3}\n`,
-    ),
-  );
-
-  return executeTarget(target, "fix", config, sessionState, {
-    resumeFrom: snapshot,
-  });
+  return null;
 }

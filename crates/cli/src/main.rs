@@ -37,7 +37,7 @@ use tokio::sync::mpsc;
 use decipher_protocol::{ClientMessage, ServerMessage};
 use decipher_providers::anthropic::AnthropicProvider;
 use decipher_runtime::{AgentConfig, AgentLoop};
-use decipher_session_store::SessionStore;
+use decipher_session_store::{load_session, list_sessions, SessionStore};
 use decipher_tui::app::{self, App};
 use decipher_tui::bottom_pane::{self, BottomPane};
 
@@ -160,9 +160,12 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
     let policy_mode = cli_cfg.policy_mode;
 
     // ── Session store ─────────────────────────────────────────────────────────
+    // No Drop impl on SessionStore: session_end is intentionally best-effort —
+    // a crash will leave the JSONL without a final record, which is acceptable.
     let decipher_home = config::decipher_home();
-    let mut session_store: Option<SessionStore> =
-        SessionStore::new(&decipher_home, &model, &workspace).await.ok();
+    // Session store is created per-mission (when UserInput is submitted) so that
+    // mission_goal is known at creation time.
+    let mut session_store: Option<SessionStore> = None;
     let mut last_outcome: Option<String> = None;
 
     // ── TUI state ─────────────────────────────────────────────────────────────
@@ -220,27 +223,93 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
 
                                 match msg {
                                     ClientMessage::UserInput { ref text, .. } => {
-                                        // Abort any running agent task first.
                                         if let Some(h) = current_agent_task.take() {
                                             h.abort();
                                         }
-                                        // Fresh approval channel for this run.
-                                        let (atx, arx) = mpsc::channel::<bool>(1);
-                                        current_approval_tx = Some(atx);
 
-                                        let agent_cfg = build_agent_config(
-                                            text.clone(),
-                                            api_key.clone(),
-                                            model.clone(),
-                                            base_url.clone(),
-                                            workspace.clone(),
-                                            policy_mode,
-                                        );
-                                        let tx = event_tx.clone();
-                                        let prov = provider.clone();
-                                        current_agent_task = Some(tokio::spawn(async move {
-                                            let _ = AgentLoop::run(agent_cfg, &*prov, tx, Some(arx)).await;
-                                        }));
+                                        let text_trimmed = text.trim();
+                                        if text_trimmed.starts_with("/resume") {
+                                            // ── /resume [thread_id] ─────────────────────────
+                                            let arg = text_trimmed["/resume".len()..].trim();
+                                            let tid_opt: Option<String> = if arg.is_empty() {
+                                                match list_sessions(&decipher_home).await {
+                                                    Ok(list) => list.into_iter().next().map(|e| e.thread_id),
+                                                    Err(_) => None,
+                                                }
+                                            } else {
+                                                Some(arg.to_string())
+                                            };
+
+                                            match tid_opt {
+                                                None => {
+                                                    let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                        text: "error: no sessions found to resume".into(),
+                                                    });
+                                                }
+                                                Some(tid) => match load_session(&decipher_home, &tid).await {
+                                                    Err(e) => {
+                                                        let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                            text: format!("error: could not resume {tid}: {e}"),
+                                                        });
+                                                    }
+                                                    Ok((meta, history)) => {
+                                                        // Close previous session if any.
+                                                        if let Some(ss) = session_store.take() {
+                                                            let prev = last_outcome.take();
+                                                            tokio::spawn(async move { ss.close(prev).await; });
+                                                        }
+                                                        session_store = SessionStore::new(
+                                                            &decipher_home, &model,
+                                                            &meta.workspace, &meta.mission_goal,
+                                                        ).await.ok();
+
+                                                        let (atx, arx) = mpsc::channel::<bool>(1);
+                                                        current_approval_tx = Some(atx);
+                                                        let resume_cfg = AgentConfig {
+                                                            model: model.clone(),
+                                                            api_key: api_key.clone(),
+                                                            base_url: base_url.clone(),
+                                                            workspace: meta.workspace.clone(),
+                                                            mission_goal: meta.mission_goal.clone(),
+                                                            policy_mode,
+                                                            resume_from: Some(history),
+                                                            ..Default::default()
+                                                        };
+                                                        let tx = event_tx.clone();
+                                                        let prov = provider.clone();
+                                                        current_agent_task = Some(tokio::spawn(async move {
+                                                            let _ = AgentLoop::run(resume_cfg, &*prov, tx, Some(arx)).await;
+                                                        }));
+                                                    }
+                                                },
+                                            }
+                                        } else {
+                                            // ── Normal mission ───────────────────────────────
+                                            // Close previous session; open one for this mission.
+                                            if let Some(ss) = session_store.take() {
+                                                let prev = last_outcome.take();
+                                                tokio::spawn(async move { ss.close(prev).await; });
+                                            }
+                                            session_store = SessionStore::new(
+                                                &decipher_home, &model, &workspace, text,
+                                            ).await.ok();
+
+                                            let (atx, arx) = mpsc::channel::<bool>(1);
+                                            current_approval_tx = Some(atx);
+                                            let agent_cfg = build_agent_config(
+                                                text.clone(),
+                                                api_key.clone(),
+                                                model.clone(),
+                                                base_url.clone(),
+                                                workspace.clone(),
+                                                policy_mode,
+                                            );
+                                            let tx = event_tx.clone();
+                                            let prov = provider.clone();
+                                            current_agent_task = Some(tokio::spawn(async move {
+                                                let _ = AgentLoop::run(agent_cfg, &*prov, tx, Some(arx)).await;
+                                            }));
+                                        }
                                     }
                                     ClientMessage::ApprovalResponse { approved } => {
                                         if let Some(atx) = &current_approval_tx {
@@ -361,6 +430,15 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                     if let Some(h) = current_agent_task.take() {
                         h.abort();
                     }
+                    // Close previous session; open one for this queued mission.
+                    if let Some(ss) = session_store.take() {
+                        let prev = last_outcome.take();
+                        tokio::spawn(async move { ss.close(prev).await; });
+                    }
+                    session_store = SessionStore::new(
+                        &decipher_home, &model, &workspace, text,
+                    ).await.ok();
+
                     let (atx, arx) = mpsc::channel::<bool>(1);
                     current_approval_tx = Some(atx);
                     let agent_cfg = build_agent_config(

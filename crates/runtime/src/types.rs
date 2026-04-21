@@ -1,5 +1,6 @@
 //! Public types for the runtime crate.
 
+use decipher_providers::types::Message;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for a single agent run.
@@ -23,6 +24,10 @@ pub struct AgentConfig {
     pub policy_mode: decipher_policy::PolicyMode,
     /// Maximum output tokens per LLM call.
     pub max_tokens: u32,
+    /// Pre-loaded message history for session resume.
+    /// When `Some`, the agent loop uses this as the initial history instead of
+    /// building a fresh first user message from `mission_goal`.
+    pub resume_from: Option<Vec<Message>>,
 }
 
 impl Default for AgentConfig {
@@ -40,6 +45,7 @@ impl Default for AgentConfig {
             max_turns: 20,
             policy_mode: decipher_policy::PolicyMode::Auto,
             max_tokens: 8192,
+            resume_from: None,
         }
     }
 }

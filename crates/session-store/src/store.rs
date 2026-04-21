@@ -23,6 +23,7 @@ pub struct SessionStore {
     started_at: chrono::DateTime<Utc>,
     model: String,
     workspace: String,
+    mission_goal: String,
     base_dir: std::path::PathBuf,
     /// Send pre-serialized JSONL lines to the background writer.
     tx: mpsc::Sender<String>,
@@ -36,6 +37,7 @@ impl SessionStore {
         base_dir: &Path,
         model: &str,
         workspace: &str,
+        mission_goal: &str,
     ) -> Result<Self, StoreError> {
         let thread_id = Uuid::new_v4().to_string();
         let started_at = Utc::now();
@@ -57,6 +59,7 @@ impl SessionStore {
             started_at,
             model: model.to_string(),
             workspace: workspace.to_string(),
+            mission_goal: mission_goal.to_string(),
         };
         let mut line = serde_json::to_string(&meta)?;
         line.push('\n');
@@ -76,6 +79,7 @@ impl SessionStore {
             started_at,
             model: model.to_string(),
             workspace: workspace.to_string(),
+            mission_goal: mission_goal.to_string(),
             base_dir: base_dir.to_path_buf(),
             tx,
             writer_task,
@@ -135,6 +139,7 @@ impl SessionStore {
             ended_at: Some(ended_at),
             model: self.model.clone(),
             workspace: self.workspace.clone(),
+            mission_goal: self.mission_goal.clone(),
             outcome,
         };
         let _ = crate::index::append_index_entry(&self.base_dir, &entry).await;
@@ -150,7 +155,7 @@ mod tests {
     #[tokio::test]
     async fn creates_jsonl_with_meta_header() {
         let dir = TempDir::new().unwrap();
-        let store = SessionStore::new(dir.path(), "claude-sonnet-4-6", "/tmp/workspace")
+        let store = SessionStore::new(dir.path(), "claude-sonnet-4-6", "/tmp/workspace", "fix the CI pipeline")
             .await
             .unwrap();
         let thread_id = store.thread_id().to_string();
@@ -167,12 +172,13 @@ mod tests {
         assert_eq!(meta["thread_id"], thread_id.as_str());
         assert_eq!(meta["model"], "claude-sonnet-4-6");
         assert_eq!(meta["workspace"], "/tmp/workspace");
+        assert_eq!(meta["mission_goal"], "fix the CI pipeline");
     }
 
     #[tokio::test]
     async fn records_events_and_skips_deltas() {
         let dir = TempDir::new().unwrap();
-        let store = SessionStore::new(dir.path(), "test-model", "/workspace")
+        let store = SessionStore::new(dir.path(), "test-model", "/workspace", "test mission")
             .await
             .unwrap();
         let thread_id = store.thread_id().to_string();
@@ -217,13 +223,13 @@ mod tests {
     #[tokio::test]
     async fn index_updated_on_close() {
         let dir = TempDir::new().unwrap();
-        let store = SessionStore::new(dir.path(), "model", "/workspace")
+        let store = SessionStore::new(dir.path(), "model", "/workspace", "deploy app")
             .await
             .unwrap();
         let thread_id = store.thread_id().to_string();
         store.close(Some("FAIL".into())).await;
 
-        let sessions = crate::index::list_sessions(dir.path()).await;
+        let sessions = crate::index::list_sessions(dir.path()).await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].thread_id, thread_id);
         assert_eq!(sessions[0].outcome, Some("FAIL".into()));
@@ -234,17 +240,17 @@ mod tests {
     async fn multiple_sessions_sorted_most_recent_first() {
         let dir = TempDir::new().unwrap();
 
-        let s1 = SessionStore::new(dir.path(), "m", "/w").await.unwrap();
+        let s1 = SessionStore::new(dir.path(), "m", "/w", "goal 1").await.unwrap();
         s1.close(Some("PASS".into())).await;
 
         // Small sleep so started_at timestamps differ.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-        let s2 = SessionStore::new(dir.path(), "m", "/w").await.unwrap();
+        let s2 = SessionStore::new(dir.path(), "m", "/w", "goal 2").await.unwrap();
         let id2 = s2.thread_id().to_string();
         s2.close(Some("FAIL".into())).await;
 
-        let sessions = crate::index::list_sessions(dir.path()).await;
+        let sessions = crate::index::list_sessions(dir.path()).await.unwrap();
         assert_eq!(sessions.len(), 2);
         // Most recent (s2) should be first.
         assert_eq!(sessions[0].thread_id, id2);

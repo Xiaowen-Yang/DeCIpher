@@ -328,7 +328,7 @@ impl ChatWidget {
                 lines
             }
 
-            ServerMessage::ToolResult { tool, success, summary, elapsed_ms, exit_code, output_preview, output_lines_total, call_id } => {
+            ServerMessage::ToolResult { tool, success, summary, elapsed_ms, exit_code, output_preview, output_lines_total, call_id, .. } => {
                 let mut lines = Vec::new();
                 if let Some(ref mut cell) = self.active_cell {
                     if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
@@ -681,6 +681,7 @@ mod tests {
             output_preview: None,
             output_lines_total: None,
             call_id: None,
+            llm_text: None,
         });
         assert!(!lines.is_empty());
         assert_eq!(widget.committed_cells.len(), 1);
@@ -896,6 +897,7 @@ mod tests {
             output_preview: None,
             output_lines_total: None,
             call_id: None,
+            llm_text: None,
         });
         assert!(!lines.is_empty(), "read_file ToolResult should emit the compact result line");
     }
