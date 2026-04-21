@@ -358,6 +358,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "decipher-runtime"
+version = "0.1.5"
+dependencies = [
+ "async-trait",
+ "decipher-mock-provider",
+ "decipher-policy",
+ "decipher-protocol",
+ "decipher-providers",
+ "decipher-tools",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "decipher-tools"
+version = "0.1.5"
+dependencies = [
+ "decipher-policy",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "decipher-tui"
 version = "0.1.5"
 dependencies = [

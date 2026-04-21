@@ -1,0 +1,10 @@
+[package]
+name = "decipher-tools"
+version.workspace = true
+edition.workspace = true
+description = "Tool schema definitions, classification, and registry for DeCIpher agents"
+
+[dependencies]
+decipher-policy = { path = "../policy" }
+serde = { workspace = true }
+serde_json = { workspace = true }

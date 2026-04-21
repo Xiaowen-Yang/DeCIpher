@@ -1,0 +1,23 @@
+[package]
+name = "decipher-runtime"
+version.workspace = true
+edition.workspace = true
+description = "Rust-native agent execution core — replaces agents/executor/agent-loop.js and tools.js"
+
+[dependencies]
+decipher-protocol  = { path = "../protocol" }
+decipher-providers = { path = "../providers" }
+decipher-policy    = { path = "../policy" }
+decipher-tools     = { path = "../tools" }
+
+tokio      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+futures    = { workspace = true }
+thiserror  = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+decipher-mock-provider = { path = "../mock-provider" }
+tokio = { workspace = true }
+tempfile = "3"

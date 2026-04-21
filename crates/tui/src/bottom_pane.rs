@@ -24,7 +24,25 @@ const BOLD_YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23)).add_modifie
 const GREEN: Style = Style::new().fg(Color::Green);
 const RED: Style = Style::new().fg(Color::Red);
 
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// 3x3 dot matrix spinner encoded as braille character pairs.
+/// Each frame shows 2 lit perimeter positions rotating clockwise.
+///
+/// Perimeter positions:     Braille mapping (2 chars):
+///   0 1 2                   Left char (cols 0-1):  d1=0,0  d4=0,1  d2=1,0  d5=center  d3=2,0  d6=2,1
+///   7 . 3                   Right char (col 2):    d1=0,2  d2=1,2  d3=2,2
+///   6 5 4
+///
+/// The entire spinner fits within a single line, same height as text.
+const MATRIX_FRAMES: &[&str] = &[
+    "\u{2809}\u{2800}", // frame 0: pos 0,1 — ⠉⠀
+    "\u{2808}\u{2801}", // frame 1: pos 1,2 — ⠈⠁
+    "\u{2800}\u{2803}", // frame 2: pos 2,3 — ⠀⠃
+    "\u{2800}\u{2806}", // frame 3: pos 3,4 — ⠀⠆
+    "\u{2820}\u{2804}", // frame 4: pos 4,5 — ⠠⠄
+    "\u{2824}\u{2800}", // frame 5: pos 5,6 — ⠤⠀
+    "\u{2806}\u{2800}", // frame 6: pos 6,7 — ⠆⠀
+    "\u{2803}\u{2800}", // frame 7: pos 7,0 — ⠃⠀
+];
 
 /// Fixed viewport height — the terminal is created ONCE with this height and
 /// never recreated.  Recreating mid-session queries cursor position via \x1b[6n
@@ -78,8 +96,18 @@ impl<'a> BottomPane<'a> {
             ]));
         }
 
-        // Spinner (above input — agent status stays above the user panel)
-        if let Some(ref label) = self.app.spinner_label {
+        // Live activity bar — shown whenever the agent is busy or waiting for approval.
+        // This replaces the legacy spinner_label gate: the bar is driven by agent_phase,
+        // not by whether the Node.js server has sent a Spinner message.
+        let show_activity_bar = self.app.agent_busy
+            || self.app.mode == InputMode::ApprovalPending
+            || self.app.agent_phase.is_active();
+        if show_activity_bar {
+            let label = if let Some(ref lbl) = self.app.spinner_label {
+                lbl.as_str()
+            } else {
+                self.app.agent_phase.label()
+            };
             self.build_spinner(label, &mut lines);
         }
 
@@ -218,23 +246,32 @@ impl<'a> BottomPane<'a> {
 
     fn build_spinner(&self, label: &str, lines: &mut Vec<Line<'static>>) {
         let frame_idx = self.app.spinner_started
-            .map(|t| (t.elapsed().as_millis() / 80) as usize)
+            .map(|t| (t.elapsed().as_millis() / 100) as usize)
             .unwrap_or(self.app.spinner_frame);
-        let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
+        let frame = MATRIX_FRAMES[frame_idx % MATRIX_FRAMES.len()];
 
-        // Use agent phase as display label when available
         let phase = &self.app.agent_phase;
-        let display_label = if phase != &crate::app::AgentPhase::Idle {
+
+        // Phase label: spec vocabulary takes precedence over raw spinner label.
+        // For WaitingForApproval, use yellow instead of the default spinner color.
+        let display_label = if phase.is_active() {
             phase.label()
         } else {
             label
+        };
+
+        let is_approval = *phase == crate::app::AgentPhase::WaitingForApproval;
+        let spinner_style = if is_approval {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Green)
         };
 
         // Build shimmer spans (convert crossterm Color → ratatui Color)
         let shimmer_chars = shimmer::shimmer_chars(display_label);
         let mut spans = vec![
             Span::raw("  "),
-            Span::styled(frame.to_string(), CYAN),
+            Span::styled(frame.to_string(), spinner_style),
             Span::raw(" "),
         ];
         for (ch, color) in &shimmer_chars {
@@ -242,11 +279,16 @@ impl<'a> BottomPane<'a> {
             spans.push(Span::styled(ch.to_string(), Style::default().fg(rat_color)));
         }
 
-        // Tool display (e.g., "Executing: $ docker build .")
-        if phase == &crate::app::AgentPhase::Executing {
+        // Inline detail: show current tool/file for action phases.
+        let inline_detail_phases = [
+            crate::app::AgentPhase::ApplyingEdits,
+            crate::app::AgentPhase::RunningChecks,
+            crate::app::AgentPhase::Executing,
+        ];
+        if inline_detail_phases.contains(phase) {
             if let Some(ref detail) = self.app.agent_phase_detail {
                 let truncated: String = detail.chars().take(40).collect();
-                spans.push(Span::styled(format!(": {truncated}"), DIM));
+                spans.push(Span::styled(format!(" \u{00b7} {truncated}"), DIM));
             }
         }
 
@@ -265,7 +307,7 @@ impl<'a> BottomPane<'a> {
             spans.push(Span::styled(banner.model.clone(), DIM));
         }
 
-        // Mission elapsed time
+        // Mission elapsed time — always visible while active.
         if let Some(started) = self.app.mission_started {
             let secs = started.elapsed().as_secs();
             let display = if secs >= 60 {
@@ -277,14 +319,23 @@ impl<'a> BottomPane<'a> {
             spans.push(Span::styled(display, DIM));
         }
 
-        // Interrupt hint
-        spans.push(Span::styled(" \u{2022} ", DIM));
-        spans.push(Span::styled("esc to interrupt", DIM));
+        // Right-side hint: differs for approval vs. normal active phases.
+        if is_approval {
+            spans.push(Span::styled("  y/n to decide", YELLOW));
+        } else {
+            spans.push(Span::styled(" \u{00b7} ", DIM));
+            spans.push(Span::styled("esc to interrupt", DIM));
+        }
 
         lines.push(Line::from(spans));
 
-        // Phase detail line (only for non-Executing phases — Executing shows detail inline)
-        if phase != &crate::app::AgentPhase::Executing {
+        // Phase detail line (only for non-inline phases — Applying/Running show detail inline).
+        let no_inline_phases = [
+            crate::app::AgentPhase::Planning,
+            crate::app::AgentPhase::Thinking,
+            crate::app::AgentPhase::Verifying,
+        ];
+        if no_inline_phases.contains(phase) {
             if let Some(ref detail) = self.app.agent_phase_detail {
                 let truncated: String = detail.chars().take(60).collect();
                 lines.push(Line::from(vec![
@@ -453,9 +504,22 @@ impl<'a> BottomPane<'a> {
         if self.app.chat.is_streaming() {
             input_row_start += 1;
         }
-        // Spinner (now above input)
-        if self.app.spinner_label.is_some() {
+        // Activity bar (single-line braille 3x3 matrix + optional detail line).
+        // Must match the condition in build_content_lines().
+        let show_activity_bar = self.app.agent_busy
+            || self.app.mode == InputMode::ApprovalPending
+            || self.app.agent_phase.is_active();
+        if show_activity_bar {
             input_row_start += 1;
+            // Phase detail line only for non-inline phases.
+            let no_inline = [
+                crate::app::AgentPhase::Planning,
+                crate::app::AgentPhase::Thinking,
+                crate::app::AgentPhase::Verifying,
+            ];
+            if no_inline.contains(&self.app.agent_phase) && self.app.agent_phase_detail.is_some() {
+                input_row_start += 1;
+            }
         }
         // Queued message indicator (now above input)
         if self.app.queued_message.is_some() {

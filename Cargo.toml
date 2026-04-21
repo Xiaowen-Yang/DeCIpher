@@ -9,6 +9,8 @@ members = [
     "crates/mock-provider",
     "crates/providers",
     "crates/policy",
+    "crates/tools",
+    "crates/runtime",
 ]
 resolver = "2"
 
@@ -27,6 +29,8 @@ decipher-agent-bridge = { path = "crates/agent-bridge" }
 decipher-providers = { path = "crates/providers" }
 decipher-mock-provider = { path = "crates/mock-provider" }
 decipher-policy = { path = "crates/policy" }
+decipher-tools = { path = "crates/tools" }
+decipher-runtime = { path = "crates/runtime" }
 
 # External
 crossterm = { version = "0.28", features = ["bracketed-paste", "event-stream"] }
@@ -43,6 +47,9 @@ unicode-width = "0.2"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
+thiserror = "2"
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["full"] }
 
 [profile.release]
 opt-level = "z"

@@ -29,6 +29,12 @@ pub struct ChatWidget {
     streaming: bool,
     /// Terminal width for display_lines.
     width: u16,
+    /// Set when a write/exec ToolCard was flushed since the last GroupDivider.
+    /// Used to decide whether to insert a divider before the next TaskCard.
+    had_write_exec_since_divider: bool,
+    /// Files modified by write_file / apply_patch during the current task group.
+    /// Cleared when a DiffCard is emitted.
+    files_modified_pending: Vec<String>,
 }
 
 impl ChatWidget {
@@ -40,6 +46,8 @@ impl ChatWidget {
             stream_collector: MarkdownStreamCollector::new(Some(width)),
             streaming: false,
             width,
+            had_write_exec_since_divider: false,
+            files_modified_pending: Vec::new(),
         }
     }
 
@@ -71,13 +79,18 @@ impl ChatWidget {
     /// MarkdownStreamCollector and commits complete lines.
     ///
     /// Returns the newly committed lines (for `insert_before`).
+    /// On the first delta of a new stream, prepends any flush output (e.g. a
+    /// TaskCard summary) that was pending from the previous active cell.
     pub fn push_delta(&mut self, delta: &str) -> Vec<Line<'static>> {
-        if !self.streaming {
+        let flush_lines = if !self.streaming {
             self.streaming = true;
             let is_first = self.active_cell.is_none();
-            self.flush_active_cell_internal();
+            let flushed = self.flush_and_emit();
             self.active_cell = Some(Box::new(AgentMessageCell::new(vec![], is_first)));
-        }
+            flushed
+        } else {
+            Vec::new()
+        };
 
         self.stream_collector.push_delta(delta);
         let new_lines = self.stream_collector.commit_complete_lines();
@@ -89,14 +102,76 @@ impl ChatWidget {
             }
             self.active_cell_revision += 1;
         }
-        new_lines
+
+        let mut all = flush_lines;
+        all.extend(new_lines);
+        all
     }
 
-    /// Flush the active cell to committed (internal — no scrollback lines returned).
+    /// Flush the active cell to committed without conversion or scrollback.
+    ///
+    /// Used by `finalize_active_cell_as_failed` and stream finalization where
+    /// we deliberately skip TaskCard conversion.
     fn flush_active_cell_internal(&mut self) {
         if let Some(cell) = self.active_cell.take() {
             self.committed_cells.push(cell);
             self.active_cell_revision += 1;
+        }
+    }
+
+    /// Flush the active cell to committed, converting read-only ExecCells to
+    /// TaskCards and inserting GroupDividers as needed.
+    ///
+    /// Returns scrollback lines for any newly committed cells (TaskCard summary,
+    /// GroupDivider). For write/exec ExecCells the scrollback was already emitted
+    /// in the ToolStart/ToolResult handler, so this returns nothing for them.
+    fn flush_and_emit(&mut self) -> Vec<Line<'static>> {
+        let Some(cell) = self.active_cell.take() else {
+            return Vec::new();
+        };
+        self.active_cell_revision += 1;
+        let w = self.width;
+
+        // Determine if this is a completed read-only group eligible for TaskCard.
+        let readonly_data: Option<TaskCard> = {
+            if let Some(ec) = cell.as_any().downcast_ref::<ExecCell>() {
+                let is_ro = !ec.calls.is_empty()
+                    && ec.calls.iter().all(|c| is_read_only_tool(&c.tool))
+                    && ec.calls.iter().all(|c| c.success.is_some());
+                if is_ro { Some(TaskCard::from_exec_cell(ec)) } else { None }
+            } else {
+                None
+            }
+            // borrow of `cell` via `ec` ends here
+        };
+
+        if let Some(task_card) = readonly_data {
+            let task_lines = task_card.display_lines(w);
+            let mut all_lines: Vec<Line<'static>> = Vec::new();
+
+            // Insert GroupDivider before a new read-only group when write/exec
+            // operations have already been flushed since the last divider.
+            if self.had_write_exec_since_divider && !self.committed_cells.is_empty() {
+                let divider = GroupDivider;
+                all_lines.extend(divider.display_lines(w));
+                self.committed_cells.push(Box::new(divider));
+                self.had_write_exec_since_divider = false;
+            }
+
+            drop(cell);
+            all_lines.extend(task_lines);
+            self.committed_cells.push(Box::new(task_card));
+            all_lines
+        } else {
+            // Track whether this was a write/exec group for future divider logic.
+            let has_write_exec = cell.as_any().downcast_ref::<ExecCell>()
+                .map(|ec| ec.calls.iter().any(|c| !is_read_only_tool(&c.tool)))
+                .unwrap_or(false);
+            if has_write_exec {
+                self.had_write_exec_since_divider = true;
+            }
+            self.committed_cells.push(cell);
+            Vec::new()
         }
     }
 
@@ -157,7 +232,7 @@ impl ChatWidget {
             ServerMessage::Mission { understood, target, steps, .. } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
-                self.flush_active_cell_internal();
+                lines.extend(self.flush_and_emit());
                 // Green ✓ line to signal mission understanding completed
                 lines.push(Line::from(vec![
                     ratatui::text::Span::raw("  "),
@@ -181,7 +256,7 @@ impl ChatWidget {
             ServerMessage::Clarification { question } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
-                self.flush_active_cell_internal();
+                lines.extend(self.flush_and_emit());
                 let cell = ClarificationCell::new(question.clone());
                 lines.extend(cell.display_lines(w));
                 self.committed_cells.push(Box::new(cell));
@@ -191,7 +266,7 @@ impl ChatWidget {
             ServerMessage::ApprovalRequest { action, capabilities } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
-                self.flush_active_cell_internal();
+                lines.extend(self.flush_and_emit());
                 let action_str = action.as_ref().map(|a| {
                     let mut s = a.tool.clone();
                     if let Some(ref r) = a.reasoning {
@@ -211,40 +286,45 @@ impl ChatWidget {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
 
-                // Coalesce read-only exploring calls into the same ExecCell
-                let is_exploring = matches!(tool.as_str(), "read_file" | "list_files" | "search");
+                // Coalesce read-only calls into the same ExecCell.
+                // They produce NO scrollback start lines — only the final TaskCard
+                // summary (emitted on flush) appears in committed history.
+                let is_exploring = is_read_only_tool(tool.as_str());
                 if is_exploring {
                     if let Some(ref mut cell) = self.active_cell {
                         if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
                             exec_cell.add_call(tool.clone(), reasoning.clone(), args.clone(), call_id.clone());
                             self.active_cell_revision += 1;
-                            // Render the new call using rich display
-                            let new_call = exec_cell.calls.last().unwrap();
-                            let display = format_tool_display(
-                                &new_call.tool,
-                                new_call.args.as_ref(),
-                                new_call.output.as_deref().unwrap_or(""),
-                            );
-                            lines.push(Line::from(vec![
-                                ratatui::text::Span::raw("  "),
-                                ratatui::text::Span::styled("\u{2847}", ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)),
-                                ratatui::text::Span::raw(" "),
-                                ratatui::text::Span::styled(
-                                    display,
-                                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
-                                ),
-                            ]));
                             return lines;
                         }
                     }
+                    // No active ExecCell to coalesce into — flush pending cell and
+                    // create a new silent read-only cell.
+                    lines.extend(self.flush_and_emit());
+                    let cell = ExecCell::new(tool.clone(), reasoning.clone(), args.clone(), call_id.clone());
+                    self.active_cell = Some(Box::new(cell));
+                    self.active_cell_revision += 1;
+                    return lines;
                 }
 
-                // Non-exploring or no active ExecCell: flush and create new
-                self.flush_active_cell_internal();
+                // Non-read-only tool: flush pending cell (may emit TaskCard summary)
+                // then create a new ToolCard with a visible start line.
+                lines.extend(self.flush_and_emit());
                 let cell = ExecCell::new(tool.clone(), reasoning.clone(), args.clone(), call_id.clone());
                 lines.extend(cell.display_lines(w));
                 self.active_cell = Some(Box::new(cell));
                 self.active_cell_revision += 1;
+
+                // Track write/exec tools for pending files_modified.
+                if matches!(tool.as_str(), "write_file" | "apply_patch") {
+                    if let Some(path) = args.as_ref()
+                        .and_then(|a| a.get("path").or_else(|| a.get("target_file")))
+                        .and_then(|v| v.as_str())
+                    {
+                        self.files_modified_pending.push(path.to_string());
+                    }
+                }
+
                 lines
             }
 
@@ -257,60 +337,62 @@ impl ChatWidget {
                             *exit_code, output_preview.clone(), *output_lines_total,
                             call_id.as_deref(),
                         );
-                        // Clear streaming output after tool completes
                         exec_cell.streaming_output.clear();
                         self.active_cell_revision += 1;
 
-                        // Find the completed call for rich scrollback rendering
-                        let completed_call = exec_cell.calls.iter().rev()
-                            .find(|c| c.tool == *tool && c.success.is_some());
-                        if let Some(call) = completed_call {
-                            let display = format_tool_display(
-                                &call.tool,
-                                call.args.as_ref(),
-                                call.output.as_deref().unwrap_or(""),
-                            );
-                            let icon = if *success {
-                                ratatui::text::Span::styled("\u{2713}", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
-                            } else {
-                                ratatui::text::Span::styled("\u{2717}", ratatui::style::Style::default().fg(ratatui::style::Color::Red))
-                            };
-                            let s = *elapsed_ms as f64 / 1000.0;
-                            let exit_info = if !success {
-                                exit_code.map(|c| format!(" [exit {c}]")).unwrap_or_default()
-                            } else {
-                                String::new()
-                            };
-                            lines.push(Line::from(vec![
-                                ratatui::text::Span::raw("  "),
-                                icon,
-                                ratatui::text::Span::raw(format!(" {display}{exit_info} ")),
-                                ratatui::text::Span::styled(
-                                    format!("({s:.1}s)"),
-                                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
-                                ),
-                            ]));
-                            // Show error output preview for failed commands
-                            if !success {
-                                if let Some(ref preview) = output_preview {
-                                    let preview_lines: Vec<&str> = preview.lines().collect();
-                                    let show = preview_lines.len().min(5);
-                                    let start = preview_lines.len().saturating_sub(show);
-                                    for (i, line_text) in preview_lines[start..].iter().enumerate() {
-                                        let is_last = i == show - 1;
-                                        let pfx = if is_last { "\u{2514}" } else { "\u{2502}" };
-                                        let truncated: String = line_text.chars().take(100).collect();
-                                        lines.push(Line::from(vec![
-                                            ratatui::text::Span::raw("    "),
-                                            ratatui::text::Span::styled(
-                                                format!("{pfx} "),
-                                                ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
-                                            ),
-                                            ratatui::text::Span::styled(
-                                                truncated,
-                                                ratatui::style::Style::default().fg(ratatui::style::Color::Red).add_modifier(ratatui::style::Modifier::DIM),
-                                            ),
-                                        ]));
+                        // Emit scrollback only for NON-read-only tools.
+                        // Read-only tools will emit a compact TaskCard summary when flushed.
+                        if !is_read_only_tool(tool) {
+                            let completed_call = exec_cell.calls.iter().rev()
+                                .find(|c| c.tool == *tool && c.success.is_some());
+                            if let Some(call) = completed_call {
+                                let display = format_tool_display(
+                                    &call.tool,
+                                    call.args.as_ref(),
+                                    call.output.as_deref().unwrap_or(""),
+                                );
+                                let icon = if *success {
+                                    ratatui::text::Span::styled("\u{2713}", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
+                                } else {
+                                    ratatui::text::Span::styled("\u{2717}", ratatui::style::Style::default().fg(ratatui::style::Color::Red))
+                                };
+                                let s = *elapsed_ms as f64 / 1000.0;
+                                let exit_info = if !success {
+                                    exit_code.map(|c| format!(" [exit {c}]")).unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+                                lines.push(Line::from(vec![
+                                    ratatui::text::Span::raw("  "),
+                                    icon,
+                                    ratatui::text::Span::raw(format!(" {display}{exit_info} ")),
+                                    ratatui::text::Span::styled(
+                                        format!("({s:.1}s)"),
+                                        ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                                    ),
+                                ]));
+                                // Show error output preview for failed commands
+                                if !success {
+                                    if let Some(ref preview) = output_preview {
+                                        let preview_lines: Vec<&str> = preview.lines().collect();
+                                        let show = preview_lines.len().min(5);
+                                        let start = preview_lines.len().saturating_sub(show);
+                                        for (i, line_text) in preview_lines[start..].iter().enumerate() {
+                                            let is_last = i == show - 1;
+                                            let pfx = if is_last { "\u{2514}" } else { "\u{2502}" };
+                                            let truncated: String = line_text.chars().take(100).collect();
+                                            lines.push(Line::from(vec![
+                                                ratatui::text::Span::raw("    "),
+                                                ratatui::text::Span::styled(
+                                                    format!("{pfx} "),
+                                                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                                                ),
+                                                ratatui::text::Span::styled(
+                                                    truncated,
+                                                    ratatui::style::Style::default().fg(ratatui::style::Color::Red).add_modifier(ratatui::style::Modifier::DIM),
+                                                ),
+                                            ]));
+                                        }
                                     }
                                 }
                             }
@@ -318,7 +400,8 @@ impl ChatWidget {
                     }
                 }
 
-                // Flush if all calls are complete
+                // Flush when all calls in this cell are complete.
+                // flush_and_emit will convert a completed read-only group to TaskCard.
                 let all_done = self.active_cell.as_ref().map_or(false, |c| {
                     if let Some(exec_cell) = c.as_any().downcast_ref::<ExecCell>() {
                         exec_cell.calls.iter().all(|call| call.success.is_some())
@@ -327,7 +410,7 @@ impl ChatWidget {
                     }
                 });
                 if all_done {
-                    self.flush_active_cell_internal();
+                    lines.extend(self.flush_and_emit());
                 }
                 lines
             }
@@ -338,16 +421,18 @@ impl ChatWidget {
                     // Only return the remaining partial line.
                     self.end_stream_returning_remaining()
                 } else {
-                    self.flush_active_cell_internal();
+                    let mut lines = self.flush_and_emit();
                     let cell = AgentMessageCell::from_text(text);
-                    let lines = cell.display_lines(w);
+                    lines.extend(cell.display_lines(w));
                     self.committed_cells.push(Box::new(cell));
                     lines
                 }
             }
 
             ServerMessage::AgentMessageDelta { delta } => {
-                self.push_delta(delta)
+                // Sanitize ANSI/OSC before streaming into the transcript.
+                let clean = crate::cell::sanitize_display_text(delta);
+                self.push_delta(&clean)
             }
 
             ServerMessage::MissionComplete {
@@ -356,32 +441,51 @@ impl ChatWidget {
             } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
-                self.flush_active_cell_internal();
+                lines.extend(self.flush_and_emit());
+
+                // Emit DiffCard before ResultCard when files were modified.
+                // Use files from the protocol event, falling back to pending list.
+                let diff_files: Vec<String> = if !files_modified.is_empty() {
+                    files_modified.clone()
+                } else {
+                    std::mem::take(&mut self.files_modified_pending)
+                };
+                self.files_modified_pending.clear();
+
+                if !diff_files.is_empty() {
+                    let diff_card = DiffCard::new(diff_files, Vec::new());
+                    lines.extend(diff_card.display_lines(w));
+                    self.committed_cells.push(Box::new(diff_card));
+                }
+
                 let cell = ResultCell::new(
                     outcome.clone(), summary.clone(), *turns, *elapsed_ms,
                     files_modified.clone(), errors_encountered.clone(), next_steps.clone(),
                 );
                 lines.extend(cell.display_lines(w));
                 self.committed_cells.push(Box::new(cell));
+                // Reset divider tracking after mission complete.
+                self.had_write_exec_since_divider = false;
                 lines
             }
 
             ServerMessage::Error { message } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
-                self.flush_active_cell_internal();
+                lines.extend(self.flush_and_emit());
                 let cell = ErrorCell::new(message.clone());
                 lines.extend(cell.display_lines(w));
                 self.committed_cells.push(Box::new(cell));
                 lines
             }
 
-            // Native function calling — display like ToolStart/ToolResult
+            // Native function calling — mirrors ToolStart/ToolResult but via the
+            // tool_call / tool_call_result protocol path.
             ServerMessage::ToolCall { call_id, name, input } => {
                 let mut lines = Vec::new();
                 if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
                 let args = serde_json::from_str::<serde_json::Value>(input).ok();
-                let is_exploring = matches!(name.as_str(), "read_file" | "list_files" | "search");
+                let is_exploring = is_read_only_tool(name.as_str());
                 if is_exploring {
                     if let Some(ref mut cell) = self.active_cell {
                         if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
@@ -390,8 +494,13 @@ impl ChatWidget {
                             return lines;
                         }
                     }
+                    lines.extend(self.flush_and_emit());
+                    let cell = ExecCell::new(name.clone(), input.chars().take(80).collect(), args, Some(call_id.clone()));
+                    self.active_cell = Some(Box::new(cell));
+                    self.active_cell_revision += 1;
+                    return lines;
                 }
-                self.flush_active_cell_internal();
+                lines.extend(self.flush_and_emit());
                 let cell = ExecCell::new(name.clone(), input.chars().take(80).collect(), args, Some(call_id.clone()));
                 lines.extend(cell.display_lines(w));
                 self.active_cell = Some(Box::new(cell));
@@ -406,22 +515,26 @@ impl ChatWidget {
                         let summary: String = output.chars().take(100).collect();
                         exec_cell.complete_call(name, *success, summary.clone(), 0, None, None, None, Some(call_id.as_str()));
                         self.active_cell_revision += 1;
-                        let completed_call = exec_cell.calls.iter().rev()
-                            .find(|c| c.tool == *name && c.success.is_some());
-                        if let Some(call) = completed_call {
-                            let display = format_tool_display(
-                                &call.tool, call.args.as_ref(), call.output.as_deref().unwrap_or(""),
-                            );
-                            let icon = if *success {
-                                ratatui::text::Span::styled("\u{2713}", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
-                            } else {
-                                ratatui::text::Span::styled("\u{2717}", ratatui::style::Style::default().fg(ratatui::style::Color::Red))
-                            };
-                            lines.push(Line::from(vec![
-                                ratatui::text::Span::raw("  "),
-                                icon,
-                                ratatui::text::Span::raw(format!(" {display} ")),
-                            ]));
+
+                        // Only emit scrollback for non-read-only tools.
+                        if !is_read_only_tool(name) {
+                            let completed_call = exec_cell.calls.iter().rev()
+                                .find(|c| c.tool == *name && c.success.is_some());
+                            if let Some(call) = completed_call {
+                                let display = format_tool_display(
+                                    &call.tool, call.args.as_ref(), call.output.as_deref().unwrap_or(""),
+                                );
+                                let icon = if *success {
+                                    ratatui::text::Span::styled("\u{2713}", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
+                                } else {
+                                    ratatui::text::Span::styled("\u{2717}", ratatui::style::Style::default().fg(ratatui::style::Color::Red))
+                                };
+                                lines.push(Line::from(vec![
+                                    ratatui::text::Span::raw("  "),
+                                    icon,
+                                    ratatui::text::Span::raw(format!(" {display} ")),
+                                ]));
+                            }
                         }
                     }
                 }
@@ -430,23 +543,54 @@ impl ChatWidget {
                         ec.calls.iter().all(|call| call.success.is_some())
                     } else { false }
                 });
-                if all_done { self.flush_active_cell_internal(); }
+                if all_done {
+                    lines.extend(self.flush_and_emit());
+                }
                 lines
             }
 
-            // Exec output delta — show last few lines in scrollback as dimmed output
+            // Exec output delta — append to active ExecCell for streaming preview.
+            // No scrollback emitted; output visible in final ToolResult summary.
             ServerMessage::ExecOutputDelta { delta } => {
-                // Append output to active ExecCell if one exists
                 if let Some(ref mut cell) = self.active_cell {
                     if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
                         exec_cell.append_output(delta);
                         self.active_cell_revision += 1;
                     }
                 }
-                // Don't emit scrollback lines for every chunk — the output
-                // will be visible in the final tool_result summary.
-                // Only bump revision so the viewport redraws with streaming preview.
                 Vec::new()
+            }
+
+            // FilesModified: build a DiffCard for the current task group.
+            ServerMessage::FilesModified { files } => {
+                let mut lines = Vec::new();
+                if self.streaming { lines.extend(self.end_stream_returning_remaining()); }
+                lines.extend(self.flush_and_emit());
+
+                let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+                if !paths.is_empty() {
+                    // Build preview lines from the first file's preview data.
+                    let preview = files.iter()
+                        .flat_map(|f| f.preview.iter().map(|p| {
+                            let kind = if p.starts_with('+') {
+                                crate::cell::DiffPreviewKind::Add
+                            } else {
+                                crate::cell::DiffPreviewKind::Remove
+                            };
+                            crate::cell::DiffPreviewLine {
+                                kind,
+                                text: p.trim_start_matches(['+', '-', ' ']).to_string(),
+                            }
+                        }))
+                        .take(3)
+                        .collect();
+
+                    let diff_card = DiffCard::new(paths, preview);
+                    lines.extend(diff_card.display_lines(w));
+                    self.committed_cells.push(Box::new(diff_card));
+                    self.files_modified_pending.clear();
+                }
+                lines
             }
 
             // Non-visual messages — no cells, no scrollback
@@ -670,6 +814,108 @@ mod tests {
         assert!(lines.is_empty(), "TokenUsage must not produce scrollback lines");
     }
 
+    // ── P1.0: Read-only ToolStart suppression ───────────────────────────
+
+    #[test]
+    fn read_file_tool_start_produces_no_scrollback() {
+        let mut widget = ChatWidget::new(80);
+        let lines = widget.handle_server_message(&ServerMessage::ToolStart {
+            tool: "read_file".into(),
+            reasoning: "package.json".into(),
+            args: Some(serde_json::json!({"path": "package.json"})),
+            call_id: None,
+        });
+        assert!(lines.is_empty(), "read_file ToolStart should not emit scrollback lines");
+        // But it should create an active cell for viewport display
+        assert!(widget.active_cell.is_some());
+    }
+
+    #[test]
+    fn list_files_tool_start_produces_no_scrollback() {
+        let mut widget = ChatWidget::new(80);
+        let lines = widget.handle_server_message(&ServerMessage::ToolStart {
+            tool: "list_files".into(),
+            reasoning: "src/".into(),
+            args: Some(serde_json::json!({"path": "src/"})),
+            call_id: None,
+        });
+        assert!(lines.is_empty(), "list_files ToolStart should not emit scrollback lines");
+    }
+
+    #[test]
+    fn exec_command_tool_start_produces_scrollback() {
+        let mut widget = ChatWidget::new(80);
+        let lines = widget.handle_server_message(&ServerMessage::ToolStart {
+            tool: "exec_command".into(),
+            reasoning: "build".into(),
+            args: Some(serde_json::json!({"cmd": "npm test"})),
+            call_id: None,
+        });
+        assert!(!lines.is_empty(), "exec_command ToolStart should emit scrollback lines");
+    }
+
+    #[test]
+    fn read_file_coalesce_produces_no_scrollback() {
+        let mut widget = ChatWidget::new(80);
+        // First read — creates silent active cell
+        widget.handle_server_message(&ServerMessage::ToolStart {
+            tool: "read_file".into(),
+            reasoning: "a.rs".into(),
+            args: Some(serde_json::json!({"path": "a.rs"})),
+            call_id: None,
+        });
+        // Second read — coalesces silently
+        let lines = widget.handle_server_message(&ServerMessage::ToolStart {
+            tool: "read_file".into(),
+            reasoning: "b.rs".into(),
+            args: Some(serde_json::json!({"path": "b.rs"})),
+            call_id: None,
+        });
+        assert!(lines.is_empty(), "coalesced read_file should not emit scrollback");
+        // Active cell should have 2 calls
+        let exec = widget.active_cell.as_ref().unwrap()
+            .as_any().downcast_ref::<ExecCell>().unwrap();
+        assert_eq!(exec.calls.len(), 2);
+    }
+
+    #[test]
+    fn read_file_result_produces_scrollback() {
+        let mut widget = ChatWidget::new(80);
+        widget.handle_server_message(&ServerMessage::ToolStart {
+            tool: "read_file".into(),
+            reasoning: "main.rs".into(),
+            args: Some(serde_json::json!({"path": "src/main.rs"})),
+            call_id: None,
+        });
+        let lines = widget.handle_server_message(&ServerMessage::ToolResult {
+            tool: "read_file".into(),
+            success: true,
+            summary: "42 lines".into(),
+            elapsed_ms: 50,
+            exit_code: None,
+            output_preview: None,
+            output_lines_total: None,
+            call_id: None,
+        });
+        assert!(!lines.is_empty(), "read_file ToolResult should emit the compact result line");
+    }
+
+    // ── P1.0: Content sanitization in scrollback ──────────────────────
+
+    #[test]
+    fn agent_message_delta_strips_ansi() {
+        let mut widget = ChatWidget::new(80);
+        // Go through handle_server_message to test the full sanitization path.
+        let lines = widget.handle_server_message(&ServerMessage::AgentMessageDelta {
+            delta: "\x1b[31mred text\x1b[0m\n".into(),
+        });
+        // The scrollback line should not contain ANSI escapes
+        for line in &lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(!text.contains('\x1b'), "ANSI leaked into delta scrollback: {text}");
+        }
+    }
+
     #[test]
     fn mission_complete_renders_clean_result() {
         let mut widget = ChatWidget::new(80);
@@ -696,7 +942,78 @@ mod tests {
         let all_text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>().join("");
-        assert!(all_text.contains("PASS"), "Result should contain PASS");
-        assert!(all_text.contains("[RESULT]"), "Result should contain [RESULT]");
+        assert!(all_text.contains("Pass"), "Result should contain Pass");
+        assert!(!all_text.contains("[RESULT]"), "Result should not contain legacy [RESULT] header");
+    }
+
+    #[test]
+    fn files_modified_creates_diff_card() {
+        use decipher_protocol::FileModification;
+        let mut widget = ChatWidget::new(80);
+        let lines = widget.handle_server_message(&ServerMessage::FilesModified {
+            files: vec![
+                FileModification {
+                    path: "src/main.rs".into(),
+                    added: Some(5),
+                    removed: Some(2),
+                    preview: vec![
+                        "+ fn new_function() {}".into(),
+                        "- fn old_function() {}".into(),
+                    ],
+                },
+                FileModification {
+                    path: "src/lib.rs".into(),
+                    added: Some(1),
+                    removed: None,
+                    preview: vec![],
+                },
+            ],
+        });
+        assert!(!lines.is_empty(), "FilesModified should emit scrollback lines");
+
+        // Committed cells should contain a DiffCard
+        let has_diff = widget.committed_cells.iter().any(|c| {
+            c.as_any().downcast_ref::<crate::cell::DiffCard>().is_some()
+        });
+        assert!(has_diff, "FilesModified should push a DiffCard to committed_cells");
+
+        let all_text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>().join("");
+        assert!(all_text.contains("Edited 2 files"), "DiffCard header should say 'Edited 2 files'");
+    }
+
+    #[test]
+    fn mission_complete_with_files_emits_diff_card() {
+        let mut widget = ChatWidget::new(80);
+        widget.handle_server_message(&ServerMessage::MissionComplete {
+            outcome: "PASS".into(),
+            summary: "Done".into(),
+            turns: 2,
+            elapsed_ms: 10000,
+            urls: vec![],
+            files_modified: vec!["src/main.rs".into()],
+            errors_encountered: vec![],
+            next_steps: vec![],
+        });
+
+        // Both DiffCard and ResultCell should be committed
+        let has_diff = widget.committed_cells.iter().any(|c| {
+            c.as_any().downcast_ref::<crate::cell::DiffCard>().is_some()
+        });
+        let has_result = widget.committed_cells.iter().any(|c| {
+            c.as_any().downcast_ref::<crate::cell::ResultCell>().is_some()
+        });
+        assert!(has_diff, "MissionComplete with files should commit a DiffCard");
+        assert!(has_result, "MissionComplete should commit a ResultCell");
+
+        // DiffCard must appear before ResultCell
+        let diff_pos = widget.committed_cells.iter().position(|c| {
+            c.as_any().downcast_ref::<crate::cell::DiffCard>().is_some()
+        }).unwrap();
+        let result_pos = widget.committed_cells.iter().position(|c| {
+            c.as_any().downcast_ref::<crate::cell::ResultCell>().is_some()
+        }).unwrap();
+        assert!(diff_pos < result_pos, "DiffCard must appear before ResultCell");
     }
 }

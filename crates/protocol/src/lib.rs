@@ -35,7 +35,10 @@ pub enum ClientMessage {
 
 #[derive(Debug, Serialize)]
 pub struct ImageData {
-    pub data: String, // base64-encoded PNG
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub mime: String,
 }
 
@@ -160,6 +163,14 @@ pub enum ServerMessage {
     #[serde(rename = "exec_output_delta")]
     ExecOutputDelta { delta: String },
 
+    /// Notification that files were modified during the current task group.
+    /// Emitted by the server after write_file / apply_patch completes.
+    /// Used by the TUI to build a DiffCard in the history stream.
+    #[serde(rename = "files_modified")]
+    FilesModified {
+        files: Vec<FileModification>,
+    },
+
     /// Native tool call from the LLM (parallel tool calling support).
     #[serde(rename = "tool_call")]
     ToolCall {
@@ -177,6 +188,22 @@ pub enum ServerMessage {
         output: String,
         success: bool,
     },
+}
+
+/// A single file modification entry in a FilesModified event.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FileModification {
+    /// Path relative to the working directory.
+    pub path: String,
+    /// Lines added (if known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<u32>,
+    /// Lines removed (if known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<u32>,
+    /// Up to 3 preview lines from the diff (format: `+ added line` / `- removed line`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

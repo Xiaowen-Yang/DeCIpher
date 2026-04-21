@@ -5,9 +5,95 @@
 //! their desired height at a given terminal width.
 
 use std::any::Any;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+
+// ── Blink animation ──────────────────────────────────────────────────────
+
+/// Process start time for blink animation (deterministic across restarts).
+fn blink_start() -> Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+/// Returns true when the blink state is "on" (filled dot), alternating every 500ms.
+fn blink_on() -> bool {
+    (blink_start().elapsed().as_millis() / 500) % 2 == 0
+}
+
+/// Current blink tick (changes every 500ms) — used for cache invalidation.
+fn blink_tick() -> u64 {
+    blink_start().elapsed().as_millis() as u64 / 500
+}
+
+// ── Content sanitization ──────────────────────────────────────────────────
+
+/// Strip ANSI escape sequences (CSI, OSC), OSC 8 hyperlink fragments,
+/// and raw JSON protocol envelopes from user-visible display text.
+///
+/// This is the content-level defense: even if the transport layer leaks
+/// escape sequences or protocol JSON into a field, the TUI will not
+/// render them as raw text.
+pub fn sanitize_display_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek() {
+                // CSI sequence: ESC [ ... <letter>
+                Some('[') => {
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                // OSC sequence: ESC ] ... (BEL | ESC \)
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+// ── Read-only tool classification ─────────────────────────────────────────
+
+/// Returns true for tools that only read state and never modify files or run
+/// commands. Used to decide whether to coalesce calls into a compact TaskCard
+/// rather than emitting individual ToolCard lines.
+pub fn is_read_only_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read_file"
+            | "list_files"
+            | "search"
+            | "grep_search"
+            | "file_search"
+            | "kubectl_get"
+            | "kubectl_logs"
+            | "kubectl_describe"
+            | "kubectl_events"
+    )
+}
 
 // ── Theme constants ────────────────────────────────────────────────────────
 
@@ -111,7 +197,11 @@ pub struct MissionCell {
 
 impl MissionCell {
     pub fn new(understood: String, target: Option<String>, steps: Vec<String>) -> Self {
-        Self { understood, target, steps }
+        Self {
+            understood: sanitize_display_text(&understood),
+            target: target.map(|t| sanitize_display_text(&t)),
+            steps: steps.into_iter().map(|s| sanitize_display_text(&s)).collect(),
+        }
     }
 }
 
@@ -123,15 +213,13 @@ impl Cell for MissionCell {
         let mut lines = Vec::new();
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("\u{250c} ", DIM),
-            Span::styled("MISSION", BOLD_CYAN),
-            Span::raw(" "),
-            Span::styled("\u{2500}".repeat(40), DIM),
+            Span::raw("  "),
+            Span::styled("Mission", BOLD_CYAN),
         ]));
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("Understood: ", BOLD_YELLOW),
-            Span::styled(self.understood.clone(), Style::default().fg(Color::White)),
+            Span::styled("Understood: ", DIM),
+            Span::styled(self.understood.clone(), Style::default()),
         ]));
         if let Some(ref target) = self.target {
             lines.push(Line::from(vec![
@@ -235,10 +323,10 @@ impl ExecCell {
         };
         if let Some(call) = target {
             call.success = Some(success);
-            call.output = Some(summary);
+            call.output = Some(sanitize_display_text(&summary));
             call.elapsed_ms = Some(elapsed_ms);
             call.exit_code = exit_code;
-            call.output_preview = output_preview;
+            call.output_preview = output_preview.map(|p| sanitize_display_text(&p));
             call.output_lines_total = output_lines_total;
         }
     }
@@ -261,8 +349,10 @@ impl ExecCell {
 
 /// Format a tool call for display based on tool type.
 /// Returns a display string like `$ docker build .` or `Read: src/main.rs`
+///
+/// All output is sanitized — ANSI/OSC escapes are stripped.
 pub fn format_tool_display(tool: &str, args: Option<&serde_json::Value>, reasoning: &str) -> String {
-    match tool {
+    let raw = match tool {
         "exec_command" => {
             if let Some(cmd) = args.and_then(|a| a.get("cmd")).and_then(|v| v.as_str()) {
                 let truncated: String = cmd.chars().take(120).collect();
@@ -306,12 +396,21 @@ pub fn format_tool_display(tool: &str, args: Option<&serde_json::Value>, reasoni
                 format!("{tool} \u{2014} {r}")
             }
         }
-    }
+    };
+    sanitize_display_text(&raw)
 }
 
 impl Cell for ExecCell {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if self.calls.iter().any(|c| c.success.is_none()) {
+            Some(blink_tick())
+        } else {
+            None
+        }
+    }
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
@@ -321,18 +420,19 @@ impl Cell for ExecCell {
                 call.args.as_ref(),
                 call.output.as_deref().unwrap_or(""),
             );
-            // Read-only tools get dimmed styling for lower noise
-            let is_read_only = matches!(
-                call.tool.as_str(),
-                "read_file" | "kubectl_get" | "kubectl_logs" | "kubectl_describe" | "kubectl_events"
-            );
+            let is_read_only = is_read_only_tool(&call.tool);
 
             match call.success {
                 None => {
-                    // In-progress: show spinner icon + tool display
+                    // In-progress: blinking ●/○ indicator
+                    let icon = if blink_on() {
+                        Span::styled("\u{25CF}", BOLD_CYAN) // ● filled
+                    } else {
+                        Span::styled("\u{25CB}", CYAN)      // ○ hollow
+                    };
                     lines.push(Line::from(vec![
                         Span::raw("  "),
-                        Span::styled("\u{2847}", CYAN),
+                        icon,
                         Span::raw(" "),
                         Span::styled(display, DIM),
                     ]));
@@ -451,6 +551,36 @@ impl Cell for ExecCell {
         }
         lines
     }
+
+    /// Pager view: same header as display_lines but shows ALL streaming output.
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = self.display_lines(width);
+        // Replace the truncated streaming tail with the full output.
+        // display_lines already emits up to EXEC_OUTPUT_PREVIEW_LINES; if there
+        // are more, append the rest here.
+        if !self.streaming_output.is_empty() {
+            let output_lines: Vec<&str> = self.streaming_output.lines().collect();
+            let total = output_lines.len();
+            if total > EXEC_OUTPUT_PREVIEW_LINES {
+                // display_lines shows a "… +N lines" header then the last N lines.
+                // Re-emit everything so the pager has the complete output.
+                // Strip the trailing preview block (1 ellipsis line + N preview lines).
+                let strip = 1 + EXEC_OUTPUT_PREVIEW_LINES.min(total);
+                lines.truncate(lines.len().saturating_sub(strip));
+                for (i, line_text) in output_lines.iter().enumerate() {
+                    let is_last = i == total - 1;
+                    let prefix = if is_last { "\u{2514} " } else { "\u{2502} " };
+                    let safe = sanitize_display_text(line_text);
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(prefix, DIM),
+                        Span::styled(safe, DIM),
+                    ]));
+                }
+            }
+        }
+        lines
+    }
 }
 
 // ── AgentMessageCell ───────────────────────────────────────────────────────
@@ -471,9 +601,9 @@ impl AgentMessageCell {
 
     /// Create from raw markdown text (for non-streamed messages).
     pub fn from_text(text: &str) -> Self {
-        // Simple fallback: plain text with 2-space indent.
-        // In Phase 3 this will use the markdown renderer to produce styled lines.
-        let rendered_lines = text
+        // Sanitize ANSI/OSC before rendering.
+        let clean = sanitize_display_text(text);
+        let rendered_lines = clean
             .lines()
             .map(|line| Line::from(format!("  {}", line)))
             .collect();
@@ -528,6 +658,7 @@ pub enum ErrorCategory {
 
 impl ErrorCell {
     pub fn new(message: String) -> Self {
+        let message = sanitize_display_text(&message);
         // Auto-detect error category from message content
         let category = if message.contains("rate limit") || message.contains("429") || message.contains("API error") {
             ErrorCategory::Api
@@ -580,23 +711,278 @@ impl Cell for ErrorCell {
         }
         lines.push(Line::from(header_spans));
 
-        // Additional lines indented (up to 5 lines)
-        for line_text in msg_lines.iter().skip(1).take(5) {
+        // Additional lines indented (up to 4 more lines, capping card at 6 total)
+        for line_text in msg_lines.iter().skip(1).take(4) {
             let truncated: String = line_text.chars().take(100).collect();
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled(truncated, Style::new().fg(Color::Red).add_modifier(Modifier::DIM)),
             ]));
         }
-        if msg_lines.len() > 6 {
+        if msg_lines.len() > 5 {
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled(format!("... ({} more lines)", msg_lines.len() - 6), DIM),
+                Span::styled(format!("... ({} more lines)", msg_lines.len() - 5), DIM),
             ]));
         }
 
         lines
     }
+}
+
+// ── TaskCard ───────────────────────────────────────────────────────────────
+
+/// Compact milestone cell for a group of completed read-only operations.
+///
+/// Replaces the individual per-call ExecCell lines in committed scrollback
+/// with a single "Read N files · path1, path2…" summary.
+#[derive(Debug)]
+pub struct TaskCard {
+    /// Short human-readable title, e.g. "Read 4 files".
+    pub title: String,
+    /// File/resource paths that were read (display-truncated).
+    pub paths: Vec<String>,
+}
+
+impl TaskCard {
+    /// Build a TaskCard from a completed read-only ExecCell.
+    pub fn from_exec_cell(cell: &ExecCell) -> Self {
+        let count = cell.calls.len();
+        let paths: Vec<String> = cell.calls.iter()
+            .filter_map(|c| {
+                c.args.as_ref()
+                    .and_then(|a| a.get("path").or_else(|| a.get("directory")))
+                    .and_then(|v| v.as_str())
+                    .map(|p| {
+                        // Show last 2 path components for readability.
+                        let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+                        if parts.len() >= 2 {
+                            format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+                        } else {
+                            p.to_string()
+                        }
+                    })
+            })
+            .collect();
+
+        let title = match count {
+            1 => {
+                let name = paths.first().cloned().unwrap_or_else(|| "file".into());
+                // If it looks like a full path, just say "Read file"
+                let base = name.rsplit('/').next().unwrap_or(&name);
+                format!("Read {}", base)
+            }
+            n => format!("Read {} files", n),
+        };
+
+        Self { title: sanitize_display_text(&title), paths }
+    }
+}
+
+impl Cell for TaskCard {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        // Title line: ✓ Read N files (dim green check, secondary title)
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("\u{2713} ", DIM),
+            Span::styled(self.title.clone(), DIM),
+        ]));
+        // Path list: indented, comma-separated, truncated to width
+        if !self.paths.is_empty() {
+            let max_w = (width as usize).saturating_sub(8);
+            let joined = self.paths.join(", ");
+            let display: String = if joined.len() > max_w {
+                let truncated: String = joined.chars().take(max_w.saturating_sub(1)).collect();
+                format!("{}\u{2026}", truncated)
+            } else {
+                joined
+            };
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("\u{00b7} ", DIM),
+                Span::styled(display, DIM),
+            ]));
+        }
+        lines
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        if self.paths.is_empty() { 1 } else { self.display_lines(width).len() as u16 }
+    }
+}
+
+// ── DiffCard ───────────────────────────────────────────────────────────────
+
+/// A single preview line in a DiffCard.
+#[derive(Debug, Clone)]
+pub struct DiffPreviewLine {
+    pub kind: DiffPreviewKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiffPreviewKind {
+    Add,
+    Remove,
+}
+
+/// History card for file modifications — "Edited N files" + compact diff preview.
+///
+/// Appears after write_file / apply_patch operations and before ResultCard.
+/// Full diffs are in the pager (Ctrl+T).
+#[derive(Debug)]
+pub struct DiffCard {
+    /// Modified file paths.
+    pub files: Vec<String>,
+    /// Up to 3 preview lines from the most representative diff hunk.
+    pub preview: Vec<DiffPreviewLine>,
+}
+
+impl DiffCard {
+    pub fn new(files: Vec<String>, preview: Vec<DiffPreviewLine>) -> Self {
+        let files = files.into_iter().map(|f| sanitize_display_text(&f)).collect();
+        let preview = preview.into_iter().map(|l| DiffPreviewLine {
+            kind: l.kind,
+            text: sanitize_display_text(&l.text),
+        }).collect();
+        Self { files, preview }
+    }
+}
+
+impl Cell for DiffCard {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let n = self.files.len();
+        // Header: "Edited N files" or "Edited 1 file"
+        let header = if n == 1 { "Edited 1 file".to_string() } else { format!("Edited {} files", n) };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(header, Style::default().fg(Color::Cyan)),
+        ]));
+
+        // File list (up to 3)
+        for path in self.files.iter().take(3) {
+            let max_w = (width as usize).saturating_sub(4);
+            let display: String = if path.len() > max_w {
+                let t: String = path.chars().take(max_w.saturating_sub(1)).collect();
+                format!("{}\u{2026}", t)
+            } else {
+                path.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(display, DIM),
+            ]));
+        }
+        if n > 3 {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("  \u{2026} {} more", n - 3), DIM),
+            ]));
+        }
+
+        // Diff preview lines (max 3)
+        for line in self.preview.iter().take(3) {
+            let (prefix, style) = match line.kind {
+                DiffPreviewKind::Add => ("+", GREEN),
+                DiffPreviewKind::Remove => ("-", RED),
+            };
+            let max_w = (width as usize).saturating_sub(6);
+            let text: String = if line.text.len() > max_w {
+                let t: String = line.text.chars().take(max_w.saturating_sub(1)).collect();
+                format!("{}\u{2026}", t)
+            } else {
+                line.text.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{} ", prefix), style),
+                Span::styled(text, DIM),
+            ]));
+        }
+
+        lines
+    }
+
+    /// Pager view: all files + all preview lines (no 3-item caps).
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let n = self.files.len();
+        let header = if n == 1 { "Edited 1 file".to_string() } else { format!("Edited {} files", n) };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(header, Style::default().fg(Color::Cyan)),
+        ]));
+        for path in &self.files {
+            let max_w = (width as usize).saturating_sub(4);
+            let display: String = if path.len() > max_w {
+                let t: String = path.chars().take(max_w.saturating_sub(1)).collect();
+                format!("{}\u{2026}", t)
+            } else {
+                path.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(display, DIM),
+            ]));
+        }
+        for line in &self.preview {
+            let (prefix, style) = match line.kind {
+                DiffPreviewKind::Add => ("+", GREEN),
+                DiffPreviewKind::Remove => ("-", RED),
+            };
+            let max_w = (width as usize).saturating_sub(6);
+            let text: String = if line.text.len() > max_w {
+                let t: String = line.text.chars().take(max_w.saturating_sub(1)).collect();
+                format!("{}\u{2026}", t)
+            } else {
+                line.text.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{} ", prefix), style),
+                Span::styled(text, DIM),
+            ]));
+        }
+        lines
+    }
+}
+
+// ── GroupDivider ───────────────────────────────────────────────────────────
+
+/// Thin dim separator between distinct task groups in the history stream.
+///
+/// Emitted when a new read-only exploration group begins after a write/exec group.
+#[derive(Debug)]
+pub struct GroupDivider;
+
+impl Cell for GroupDivider {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        // Use the dashed divider style from the visual spec for mid-flow separators.
+        let w = (width as usize).saturating_sub(2).min(60);
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {}", "\u{2504}".repeat(w)),
+                DIM,
+            )),
+            Line::from(""),
+        ]
+    }
+
+    fn desired_height(&self, _width: u16) -> u16 { 3 }
+
+    fn is_continuation(&self) -> bool { true }
 }
 
 // ── ResultCell ─────────────────────────────────────────────────────────────
@@ -618,12 +1004,17 @@ impl ResultCell {
         outcome: String, summary: String, turns: u32, elapsed_ms: u64,
         files_modified: Vec<String>, errors_encountered: Vec<String>, next_steps: Vec<String>,
     ) -> Self {
-        Self { outcome, summary, turns, elapsed_ms, files_modified, errors_encountered, next_steps }
+        Self {
+            outcome: sanitize_display_text(&outcome),
+            summary: sanitize_display_text(&summary),
+            turns,
+            elapsed_ms,
+            files_modified: files_modified.into_iter().map(|f| sanitize_display_text(&f)).collect(),
+            errors_encountered: errors_encountered.into_iter().map(|e| sanitize_display_text(&e)).collect(),
+            next_steps: next_steps.into_iter().map(|s| sanitize_display_text(&s)).collect(),
+        }
     }
 }
-
-/// Style for the PARTIAL outcome (yellow).
-const PARTIAL_STYLE: Style = Style::new().fg(Color::Rgb(232, 163, 23));
 
 impl Cell for ResultCell {
     fn as_any(&self) -> &dyn Any { self }
@@ -631,86 +1022,44 @@ impl Cell for ResultCell {
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let secs = self.elapsed_ms as f64 / 1000.0;
-        let w = 60;
         let mut lines = Vec::new();
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("\u{2500}".repeat(w), DIM)));
-        lines.push(Line::from(""));
 
-        // Outcome header with color
-        let (outcome_span, header_style) = match self.outcome.as_str() {
-            "PASS" => (Span::styled(format!("PASS ({secs:.1}s)"), GREEN), GREEN),
-            "PARTIAL" => (Span::styled(format!("PARTIAL ({secs:.1}s)"), PARTIAL_STYLE), PARTIAL_STYLE),
-            _ => (Span::styled(format!("FAIL ({secs:.1}s)"), RED), RED),
+        // Outcome: "  ✓ Pass  (12.4s)" or "  ✗ Fail  (3.2s)"
+        let (icon, label, outcome_style) = match self.outcome.as_str() {
+            "PASS" => ("\u{2713}", "Pass", GREEN),
+            "PARTIAL" => ("\u{25d0}", "Partial", YELLOW),
+            _ => ("\u{2717}", "Fail", RED),
         };
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("[RESULT]", BOLD),
+            Span::styled(format!("{icon} "), outcome_style),
+            Span::styled(label.to_string(), Style::new().fg(outcome_style.fg.unwrap_or(Color::Reset)).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  ({secs:.1}s)"), DIM),
         ]));
-        lines.push(Line::from(vec![
-            Span::raw("  Outcome:     "),
-            outcome_span,
-        ]));
-        lines.push(Line::from(format!("  Turns:       {}", self.turns)));
 
-        // Summary
+        // One-line summary (primary description of what happened)
         if !self.summary.is_empty() {
-            lines.push(Line::from(""));
-            for line in self.summary.lines() {
-                lines.push(Line::from(format!("  {line}")));
-            }
-        }
-
-        // Files modified
-        if !self.files_modified.is_empty() {
-            lines.push(Line::from(""));
+            let first = self.summary.lines().next().unwrap_or(&self.summary);
+            let truncated: String = first.chars().take(120).collect();
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("Files modified:", DIM),
+                Span::styled(truncated, Style::default()),
             ]));
-            for f in &self.files_modified {
+        }
+
+        // Next step hint for non-pass outcomes (max 1 line)
+        if self.outcome != "PASS" {
+            if let Some(step) = self.next_steps.first() {
+                let truncated: String = step.chars().take(100).collect();
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("\u{2022} ", header_style),
-                    Span::styled(f.clone(), CYAN),
+                    Span::raw("  "),
+                    Span::styled("\u{2192} ", DIM),
+                    Span::styled(truncated, DIM),
                 ]));
             }
         }
 
-        // Errors encountered
-        if !self.errors_encountered.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Errors:", RED),
-            ]));
-            for e in &self.errors_encountered {
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("\u{2022} ", RED),
-                    Span::styled(e.clone(), Style::new().fg(Color::Red).add_modifier(Modifier::DIM)),
-                ]));
-            }
-        }
-
-        // Next steps (for FAIL/PARTIAL)
-        if !self.next_steps.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Next steps:", BOLD),
-            ]));
-            for (i, step) in self.next_steps.iter().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(format!("{}. ", i + 1), DIM),
-                    Span::raw(step.clone()),
-                ]));
-            }
-        }
-
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("\u{2500}".repeat(w), DIM)));
         lines.push(Line::from(""));
         lines
     }
@@ -726,7 +1075,7 @@ pub struct ClarificationCell {
 
 impl ClarificationCell {
     pub fn new(question: String) -> Self {
-        Self { question }
+        Self { question: sanitize_display_text(&question) }
     }
 }
 
@@ -803,7 +1152,7 @@ impl Cell for ApprovalCell {
         for cap in &self.capabilities {
             lines.push(Line::from(vec![
                 Span::styled("  \u{2502}   ", DIM),
-                Span::styled("\u{203a} ", YELLOW),
+                Span::styled("\u{00b7} ", YELLOW),
                 Span::raw(cap.clone()),
             ]));
         }
@@ -946,7 +1295,14 @@ mod tests {
     fn result_cell_success() {
         let cell = ResultCell::new("PASS".into(), "All tests pass".into(), 5, 12000, vec![], vec![], vec![]);
         let lines = cell.display_lines(80);
-        assert!(lines.len() >= 6);
+        // blank + outcome + summary + blank = 4 lines minimum
+        assert!(lines.len() >= 3, "Expected >= 3 lines, got {}", lines.len());
+        let all_text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>().join("");
+        // New design: no legacy [RESULT] header
+        assert!(!all_text.contains("[RESULT]"), "Legacy [RESULT] header must be removed");
+        assert!(all_text.contains("Pass"), "Should contain Pass");
     }
 
     #[test]
@@ -960,8 +1316,83 @@ mod tests {
             vec!["Check Python version".into(), "Update requirements.txt".into()],
         );
         let lines = cell.display_lines(80);
-        // Should have: header + outcome + turns + summary + files section + errors section + next steps
-        assert!(lines.len() >= 15, "Expected >= 15 lines, got {}", lines.len());
+        // blank + outcome + summary + next_step hint + blank = 5 lines
+        assert!(lines.len() >= 3, "Expected >= 3 lines, got {}", lines.len());
+        let all_text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>().join("");
+        assert!(!all_text.contains("[RESULT]"), "Legacy [RESULT] header must be removed");
+        assert!(all_text.contains("Fail"), "Should contain Fail");
+    }
+
+    // ── New cell types ─────────────────────────────────────────────────────
+
+    #[test]
+    fn task_card_single_file() {
+        let mut cell = ExecCell::new(
+            "read_file".into(), "reading".into(),
+            Some(serde_json::json!({"path": "crates/tui/src/cell.rs"})), None,
+        );
+        cell.complete_call("read_file", true, "ok".into(), 50, None, None, None, None);
+        let card = TaskCard::from_exec_cell(&cell);
+        let lines = card.display_lines(80);
+        assert!(lines.len() >= 1);
+        let text: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect::<Vec<_>>().join("");
+        assert!(text.contains("cell.rs") || text.contains("Read"), "Should contain filename or Read: {text}");
+    }
+
+    #[test]
+    fn task_card_multi_file() {
+        let mut cell = ExecCell::new(
+            "read_file".into(), "reading a".into(),
+            Some(serde_json::json!({"path": "a.rs"})), None,
+        );
+        cell.add_call("read_file".into(), "reading b".into(), Some(serde_json::json!({"path": "b.rs"})), None);
+        cell.add_call("read_file".into(), "reading c".into(), Some(serde_json::json!({"path": "c.rs"})), None);
+        cell.complete_call("read_file", true, "ok".into(), 30, None, None, None, None);
+        cell.complete_call("read_file", true, "ok".into(), 20, None, None, None, None);
+        cell.complete_call("read_file", true, "ok".into(), 10, None, None, None, None);
+        let card = TaskCard::from_exec_cell(&cell);
+        let lines = card.display_lines(80);
+        let text: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect::<Vec<_>>().join("");
+        assert!(text.contains("3"), "Should mention file count: {text}");
+        assert!(card.desired_height(80) >= 1);
+    }
+
+    #[test]
+    fn diff_card_renders() {
+        let card = DiffCard::new(
+            vec!["src/main.rs".into(), "src/lib.rs".into()],
+            vec![
+                DiffPreviewLine { kind: DiffPreviewKind::Remove, text: "old line".into() },
+                DiffPreviewLine { kind: DiffPreviewKind::Add, text: "new line".into() },
+            ],
+        );
+        let lines = card.display_lines(80);
+        assert!(lines.len() >= 4, "Expected header + 2 paths + 2 preview = >=5, got {}", lines.len());
+        let text: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect::<Vec<_>>().join("");
+        assert!(text.contains("Edited 2 files"), "Should say 'Edited 2 files': {text}");
+        assert!(text.contains("+ ") || text.contains("- "), "Should contain diff lines: {text}");
+    }
+
+    #[test]
+    fn group_divider_renders() {
+        let d = GroupDivider;
+        assert_eq!(d.desired_height(80), 3);
+        let lines = d.display_lines(80);
+        assert_eq!(lines.len(), 3);
+        assert!(d.is_continuation(), "GroupDivider should suppress blank separator");
+    }
+
+    #[test]
+    fn is_read_only_tool_classification() {
+        assert!(is_read_only_tool("read_file"));
+        assert!(is_read_only_tool("list_files"));
+        assert!(is_read_only_tool("search"));
+        assert!(is_read_only_tool("kubectl_get"));
+        assert!(!is_read_only_tool("exec_command"));
+        assert!(!is_read_only_tool("write_file"));
+        assert!(!is_read_only_tool("apply_patch"));
     }
 
     #[test]
@@ -999,5 +1430,148 @@ mod tests {
     fn agent_message_continuation() {
         let cell = AgentMessageCell::new(vec![], false);
         assert!(cell.is_continuation());
+    }
+
+    // ── sanitize_display_text ──────────────────────────────────────────
+
+    #[test]
+    fn sanitize_strips_csi_sequences() {
+        assert_eq!(sanitize_display_text("\x1b[31mred text\x1b[0m"), "red text");
+        assert_eq!(sanitize_display_text("\x1b[1;32mbold green\x1b[0m"), "bold green");
+    }
+
+    #[test]
+    fn sanitize_strips_osc_hyperlinks() {
+        // BEL-terminated OSC 8 hyperlink
+        assert_eq!(
+            sanitize_display_text("\x1b]8;;https://example.com\x07link text\x1b]8;;\x07"),
+            "link text"
+        );
+        // ST-terminated OSC
+        assert_eq!(sanitize_display_text("\x1b]0;window title\x1b\\rest"), "rest");
+    }
+
+    #[test]
+    fn sanitize_preserves_plain_text() {
+        assert_eq!(sanitize_display_text("hello world"), "hello world");
+        assert_eq!(sanitize_display_text(""), "");
+        assert_eq!(sanitize_display_text("path/to/file.rs (42 lines)"), "path/to/file.rs (42 lines)");
+    }
+
+    #[test]
+    fn sanitize_handles_mixed_content() {
+        // ANSI bold around a path + trailing OSC fragment
+        assert_eq!(
+            sanitize_display_text("\x1b[1msrc/main.rs\x1b[0m \x1b]8;;\x07"),
+            "src/main.rs "
+        );
+    }
+
+    #[test]
+    fn error_cell_sanitizes_ansi_in_message() {
+        let cell = ErrorCell::new("rate limit \x1b[31mexceeded\x1b[0m".into());
+        assert_eq!(cell.message, "rate limit exceeded");
+        // Category detection should still work after sanitization
+        assert!(matches!(cell.category, ErrorCategory::Api));
+    }
+
+    #[test]
+    fn result_cell_sanitizes_summary() {
+        let cell = ResultCell::new(
+            "PASS".into(),
+            "Cloned \x1b]8;;https://github.com/repo\x07repo\x1b]8;;\x07 successfully".into(),
+            3, 5000, vec![], vec![], vec![],
+        );
+        assert_eq!(cell.summary, "Cloned repo successfully");
+        assert!(!cell.summary.contains('\x1b'));
+    }
+
+    #[test]
+    fn mission_cell_sanitizes_steps() {
+        let cell = MissionCell::new(
+            "Fix \x1b[1mDocker\x1b[0m build".into(),
+            Some("/app/\x1b[36mDockerfile\x1b[0m".into()),
+            vec!["Read \x1b[33mfile\x1b[0m".into()],
+        );
+        assert_eq!(cell.understood, "Fix Docker build");
+        assert_eq!(cell.target.as_deref(), Some("/app/Dockerfile"));
+        assert_eq!(cell.steps[0], "Read file");
+    }
+
+    #[test]
+    fn format_tool_display_sanitizes_output() {
+        let display = format_tool_display(
+            "exec_command",
+            Some(&serde_json::json!({"cmd": "echo \x1b[31mhello\x1b[0m"})),
+            "",
+        );
+        assert!(!display.contains('\x1b'), "ANSI leaked into tool display: {display}");
+        assert!(display.contains("echo hello"));
+    }
+
+    // ── transcript_lines pager routing ─────────────────────────────────────
+
+    #[test]
+    fn exec_cell_transcript_shows_full_output() {
+        // Build an ExecCell with more than EXEC_OUTPUT_PREVIEW_LINES of streaming output.
+        let mut cell = ExecCell::new(
+            "exec_command".into(),
+            "run tests".into(),
+            Some(serde_json::json!({"cmd": "cargo test"})),
+            None,
+        );
+        // Append 12 lines of streaming output — exceeds the 5-line preview cap.
+        let big_output = (1..=12).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        cell.append_output(&big_output);
+
+        let display = cell.display_lines(80);
+        let transcript = cell.transcript_lines(80);
+
+        // Pager should have strictly more lines than scrollback (full output vs truncated).
+        assert!(
+            transcript.len() > display.len(),
+            "transcript ({}) should be longer than display ({})",
+            transcript.len(), display.len(),
+        );
+
+        // Pager should contain all 12 lines.
+        let pager_text: String = transcript.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>().join(" ");
+        assert!(pager_text.contains("line 1"), "pager should contain first line");
+        assert!(pager_text.contains("line 12"), "pager should contain last line");
+    }
+
+    #[test]
+    fn diff_card_transcript_shows_all_files() {
+        // Build a DiffCard with 5 files and 5 preview lines — both exceed the 3-item caps.
+        let files: Vec<String> = (1..=5).map(|i| format!("src/file{i}.rs")).collect();
+        let preview: Vec<DiffPreviewLine> = (1..=5).map(|i| DiffPreviewLine {
+            kind: if i % 2 == 0 { DiffPreviewKind::Add } else { DiffPreviewKind::Remove },
+            text: format!("line {i}"),
+        }).collect();
+        let card = DiffCard::new(files, preview);
+
+        let display = card.display_lines(80);
+        let transcript = card.transcript_lines(80);
+
+        // Pager should have strictly more lines (no "… N more" truncation).
+        assert!(
+            transcript.len() > display.len(),
+            "transcript ({}) should be longer than display ({})",
+            transcript.len(), display.len(),
+        );
+
+        // Display should have the "… N more" truncation for files.
+        let display_text: String = display.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>().join(" ");
+        assert!(display_text.contains("more"), "display should mention truncated files");
+
+        // Pager should contain all 5 file names.
+        let pager_text: String = transcript.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect::<Vec<_>>().join(" ");
+        assert!(pager_text.contains("file5.rs"), "pager should contain all 5 files");
     }
 }

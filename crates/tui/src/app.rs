@@ -8,25 +8,47 @@ use crate::cell::AgentMessageCell;
 use crate::chat::ChatWidget;
 use crate::terminal_detect::TerminalCaps;
 
-/// Agent processing phase — shown in the status indicator.
+/// Agent processing phase — shown in the live activity bar.
+///
+/// Labels match the visual spec vocabulary exactly.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentPhase {
     Idle,
+    /// Mission just received — LLM is parsing intent and building plan.
     Planning,
+    /// LLM is reasoning between tool calls.
     Thinking,
+    /// Generic tool execution (fallback).
     Executing,
+    /// write_file / apply_patch in progress.
+    ApplyingEdits,
+    /// exec_command / test runner in progress.
+    RunningChecks,
+    /// Post-tool LLM review pass.
     Verifying,
+    /// Waiting for user approval before proceeding.
+    WaitingForApproval,
 }
 
 impl AgentPhase {
+    /// Display label as shown in the live activity bar.
+    /// Must match `docs/plans/2026-04-21-interaction-surface-visual-spec.md`.
     pub fn label(&self) -> &str {
         match self {
             Self::Idle => "",
-            Self::Planning => "Planning",
-            Self::Thinking => "Thinking",
-            Self::Executing => "Executing",
-            Self::Verifying => "Verifying",
+            Self::Planning => "Understanding mission",
+            Self::Thinking => "Working",
+            Self::Executing => "Working",
+            Self::ApplyingEdits => "Applying edits",
+            Self::RunningChecks => "Running checks",
+            Self::Verifying => "Reviewing changes",
+            Self::WaitingForApproval => "Waiting for approval",
         }
+    }
+
+    /// True when this phase should display the animated spinner.
+    pub fn is_active(&self) -> bool {
+        !matches!(self, Self::Idle)
     }
 }
 
@@ -206,7 +228,7 @@ impl App {
             }
             ServerMessage::Mission { .. } => {
                 self.agent_busy = true;
-                self.agent_phase = AgentPhase::Thinking;
+                self.agent_phase = AgentPhase::Planning;
                 self.agent_phase_detail = None;
                 self.agent_turn = 0;
                 self.mission_started = Some(std::time::Instant::now());
@@ -217,9 +239,15 @@ impl App {
             }
             ServerMessage::ApprovalRequest { .. } => {
                 self.mode = InputMode::ApprovalPending;
+                self.agent_phase = AgentPhase::WaitingForApproval;
             }
             ServerMessage::ToolStart { ref tool, .. } => {
-                self.agent_phase = AgentPhase::Executing;
+                self.agent_phase = match tool.as_str() {
+                    "write_file" | "apply_patch" => AgentPhase::ApplyingEdits,
+                    "exec_command" | "kubectl_exec" | "kubectl_apply" | "kubectl_delete" => AgentPhase::RunningChecks,
+                    "read_file" | "list_files" | "search" | "grep_search" | "file_search" => AgentPhase::Thinking,
+                    _ => AgentPhase::Executing,
+                };
                 self.agent_phase_detail = Some(tool.clone());
             }
             ServerMessage::ToolResult { .. } => {
@@ -228,7 +256,7 @@ impl App {
             }
             ServerMessage::AgentMessage { .. } => {}
             ServerMessage::AgentMessageDelta { .. } => {
-                if self.agent_phase != AgentPhase::Executing {
+                if matches!(self.agent_phase, AgentPhase::Idle | AgentPhase::Thinking | AgentPhase::Planning) {
                     self.agent_phase = AgentPhase::Thinking;
                 }
             }
@@ -269,6 +297,7 @@ impl App {
             ServerMessage::CommandList { commands } => { self.commands = commands; }
             ServerMessage::ToolCall { .. } => {}
             ServerMessage::ToolCallResult { .. } => {}
+            ServerMessage::FilesModified { .. } => {}  // handled in chat.rs
             ServerMessage::TokenUsage { prompt_tokens, completion_tokens, total_tokens, context_window } => {
                 self.last_tokens = total_tokens;
                 self.total_tokens = total_tokens;
@@ -288,10 +317,14 @@ impl App {
         self.input_history.push(text.clone());
         self.history_index = None;
         self.last_submitted = text.clone();
+        let images = std::mem::take(&mut self.pending_images);
+        let image_refs = images.iter()
+            .map(|img| img.path.clone().unwrap_or_else(|| img.mime.clone()))
+            .collect();
 
         // Push UserCell to ChatWidget for pager transcript
         self.chat.committed_cells.push(Box::new(
-            crate::cell::UserCell::new(text.clone(), vec![])
+            crate::cell::UserCell::new(text.clone(), image_refs)
         ));
 
         self.input.clear();
@@ -313,7 +346,6 @@ impl App {
             let args = parts.get(1).map(|s| s.to_string());
             return Some(ClientMessage::SlashCommand { name, args });
         }
-        let images = std::mem::take(&mut self.pending_images);
         Some(ClientMessage::UserInput { text, images })
     }
 
@@ -508,5 +540,38 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_input_preserves_image_refs_in_user_cell_and_message() {
+        let mut app = App::new();
+        app.input = "Please inspect this screenshot [Image #1]".to_string();
+        app.cursor = app.input.len();
+        app.pending_images.push(ImageData {
+            data: "ignored-base64".to_string(),
+            path: Some("/tmp/decipher-clipboard/test.png".to_string()),
+            mime: "image/png".to_string(),
+        });
+
+        let msg = app.submit_input().expect("user input message");
+
+        match msg {
+            ClientMessage::UserInput { text, images } => {
+                assert_eq!(text, "Please inspect this screenshot [Image #1]");
+                assert_eq!(images.len(), 1);
+            }
+            other => panic!("expected user_input, got {other:?}"),
+        }
+
+        let user_cell = app.chat.committed_cells
+            .last()
+            .and_then(|cell| cell.as_any().downcast_ref::<crate::cell::UserCell>())
+            .expect("user cell");
+        assert_eq!(user_cell.images.len(), 1);
     }
 }
