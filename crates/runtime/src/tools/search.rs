@@ -304,6 +304,7 @@ mod tests {
             base_url: None,
             event_tx: None,
             depth: 0,
+            policy_mode: decipher_policy::PolicyMode::Auto,
         }
     }
 
@@ -333,6 +334,7 @@ mod tests {
             base_url: None,
             event_tx: None,
             depth: 0,
+            policy_mode: decipher_policy::PolicyMode::Auto,
         };
         let args = serde_json::json!({
             "pattern": "*.txt",
@@ -358,6 +360,7 @@ mod tests {
             base_url: None,
             event_tx: None,
             depth: 0,
+            policy_mode: decipher_policy::PolicyMode::Auto,
         };
         let args = serde_json::json!({
             "pattern": "hello_world",

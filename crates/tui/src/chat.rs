@@ -308,10 +308,11 @@ impl ChatWidget {
                 }
 
                 // Non-read-only tool: flush pending cell (may emit TaskCard summary)
-                // then create a new ToolCard with a visible start line.
+                // then create a new active cell. NO scrollback emitted here —
+                // the in-progress state is shown by the activity bar (blinking ●).
+                // The completed ✓ line is emitted only on ToolResult.
                 lines.extend(self.flush_and_emit());
                 let cell = ExecCell::new(tool.clone(), reasoning.clone(), args.clone(), call_id.clone());
-                lines.extend(cell.display_lines(w));
                 self.active_cell = Some(Box::new(cell));
                 self.active_cell_revision += 1;
 
@@ -387,10 +388,15 @@ impl ChatWidget {
                                             ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
                                         ),
                                     ]));
-                                    // Show error output preview for failed commands
-                                    if !success {
-                                        if let Some(ref preview) = output_preview {
-                                            let preview_lines: Vec<&str> = preview.lines().collect();
+                                    // Show output preview body lines.
+                                    if let Some(ref preview) = output_preview {
+                                        let preview_lines: Vec<&str> = preview.lines().collect();
+                                        let is_write = matches!(
+                                            call.tool.as_str(),
+                                            "write_file" | "apply_patch"
+                                        );
+                                        if !success {
+                                            // Error output: last 5 lines in red.
                                             let show = preview_lines.len().min(5);
                                             let start = preview_lines.len().saturating_sub(show);
                                             for (i, line_text) in preview_lines[start..].iter().enumerate() {
@@ -406,6 +412,38 @@ impl ChatWidget {
                                                     ratatui::text::Span::styled(
                                                         truncated,
                                                         ratatui::style::Style::default().fg(ratatui::style::Color::Red).add_modifier(ratatui::style::Modifier::DIM),
+                                                    ),
+                                                ]));
+                                            }
+                                        } else if is_write && !preview_lines.is_empty() {
+                                            // Write/patch diff: show content lines with +/- coloring.
+                                            let show = preview_lines.len().min(12);
+                                            for (i, line_text) in preview_lines.iter().take(show).enumerate() {
+                                                let is_last = i == show - 1 && show == preview_lines.len();
+                                                let pfx = if is_last { "\u{2514}" } else { "\u{2502}" };
+                                                let truncated: String = line_text.chars().take(100).collect();
+                                                let style = if line_text.starts_with('+') {
+                                                    ratatui::style::Style::default().fg(ratatui::style::Color::Green).add_modifier(ratatui::style::Modifier::DIM)
+                                                } else if line_text.starts_with('-') {
+                                                    ratatui::style::Style::default().fg(ratatui::style::Color::Red).add_modifier(ratatui::style::Modifier::DIM)
+                                                } else {
+                                                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM)
+                                                };
+                                                lines.push(Line::from(vec![
+                                                    ratatui::text::Span::raw("    "),
+                                                    ratatui::text::Span::styled(
+                                                        format!("{pfx} "),
+                                                        ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                                                    ),
+                                                    ratatui::text::Span::styled(truncated, style),
+                                                ]));
+                                            }
+                                            if preview_lines.len() > show {
+                                                lines.push(Line::from(vec![
+                                                    ratatui::text::Span::raw("    "),
+                                                    ratatui::text::Span::styled(
+                                                        format!("  ({} more lines)", preview_lines.len() - show),
+                                                        ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
                                                     ),
                                                 ]));
                                             }
@@ -698,7 +736,9 @@ mod tests {
             call_id: None,
         };
         let lines = widget.handle_server_message(&msg);
-        assert!(!lines.is_empty()); // renders tool start line
+        // Non-read tools no longer emit scrollback on ToolStart — the in-progress
+        // state is shown by the activity bar. Scrollback appears on ToolResult.
+        assert!(lines.is_empty());
         assert!(widget.active_cell.is_some());
     }
 
@@ -884,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_command_tool_start_produces_scrollback() {
+    fn exec_command_tool_start_no_scrollback() {
         let mut widget = ChatWidget::new(80);
         let lines = widget.handle_server_message(&ServerMessage::ToolStart {
             tool: "exec_command".into(),
@@ -892,7 +932,8 @@ mod tests {
             args: Some(serde_json::json!({"cmd": "npm test"})),
             call_id: None,
         });
-        assert!(!lines.is_empty(), "exec_command ToolStart should emit scrollback lines");
+        // Non-read tools no longer emit on ToolStart — only on ToolResult.
+        assert!(lines.is_empty(), "exec_command ToolStart should NOT emit scrollback");
     }
 
     #[test]

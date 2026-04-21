@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +48,13 @@ impl HookConfig {
         let Ok(data) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        serde_json::from_str(&data).unwrap_or_default()
+        match serde_json::from_str::<HookConfig>(&data) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("[hooks] failed to parse {}: {e}", path.display());
+                Self::default()
+            }
+        }
     }
 }
 
@@ -126,14 +133,20 @@ pub async fn fire_post_tool_use(
     let payload_str = payload.to_string();
 
     for hook in &config.post_tool_use {
-        let _ = run_hook(hook, &payload_str).await;
+        match run_hook(hook, &payload_str).await {
+            HookRunResult::Failed(e) => eprintln!("[hooks] PostToolUse failed: {e}"),
+            _ => {}
+        }
     }
 }
 
 /// Fire a list of hooks (SessionStart / SessionEnd).
 pub async fn fire_session_event(hooks: &[HookEntry]) {
     for hook in hooks {
-        let _ = run_hook(hook, "{}").await;
+        match run_hook(hook, "{}").await {
+            HookRunResult::Failed(e) => eprintln!("[hooks] session hook failed: {e}"),
+            _ => {}
+        }
     }
 }
 
@@ -145,9 +158,12 @@ enum HookRunResult {
     Failed(String),
 }
 
+const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn run_hook(hook: &HookEntry, stdin_payload: &str) -> HookRunResult {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
+    use tokio::time::timeout;
 
     // Parse command string into program + args (simple shell-word split).
     let parts = shell_words(&hook.command);
@@ -170,21 +186,55 @@ async fn run_hook(hook: &HookEntry, stdin_payload: &str) -> HookRunResult {
         return HookRunResult::Failed(format!("failed to spawn: {}", hook.command));
     };
 
-    // Write payload to stdin.
+    // Write payload to stdin then close the write end.
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_payload.as_bytes()).await;
-        // stdin is dropped here, closing the pipe.
     }
 
-    let Ok(output) = child.wait_with_output().await else {
-        return HookRunResult::Failed("hook process error".into());
+    // Read stdout in a background task so the pipe buffer never fills
+    // (avoids deadlock) and so we can still call child.kill() on timeout.
+    let stdout_task = if let Some(out) = child.stdout.take() {
+        use tokio::io::AsyncReadExt;
+        Some(tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut r = out;
+            let _ = r.read_to_end(&mut buf).await;
+            buf
+        }))
+    } else {
+        None
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    // Wait for exit with timeout; kill the process if it takes too long.
+    let status = match timeout(HOOK_TIMEOUT, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(_)) => return HookRunResult::Failed("[hooks] process error".into()),
+        Err(_) => {
+            let _ = child.kill().await;
+            return HookRunResult::Failed(format!(
+                "[hooks] timed out after {}s: {}",
+                HOOK_TIMEOUT.as_secs(),
+                hook.command
+            ));
+        }
+    };
+
+    let stdout_bytes = if let Some(task) = stdout_task {
+        task.await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Re-assemble an Output-like view for the existing blocking/exit-code checks.
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let exit_success = status.success();
 
     // Check if hook requests blocking via JSON stdout.
+    // Recognises both {"block": true} and {"action": "deny"} forms.
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout) {
-        if val.get("block").and_then(|b| b.as_bool()).unwrap_or(false) {
+        let is_blocked = val.get("block").and_then(|b| b.as_bool()).unwrap_or(false)
+            || val.get("action").and_then(|a| a.as_str()) == Some("deny");
+        if is_blocked {
             let reason = val
                 .get("reason")
                 .and_then(|r| r.as_str())
@@ -195,10 +245,10 @@ async fn run_hook(hook: &HookEntry, stdin_payload: &str) -> HookRunResult {
     }
 
     // Non-zero exit code also blocks for PreToolUse.
-    if !output.status.success() {
+    if !exit_success {
         return HookRunResult::Blocked(format!(
-            "hook exited with code {}",
-            output.status.code().unwrap_or(-1)
+            "hook exited with non-zero status: {}",
+            hook.command
         ));
     }
 

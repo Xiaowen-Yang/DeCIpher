@@ -21,8 +21,7 @@ use crossterm::{
     event::{
         DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste,
         EnableFocusChange, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
@@ -36,6 +35,8 @@ use tokio::sync::mpsc;
 
 use decipher_protocol::{ClientMessage, ServerMessage};
 use decipher_providers::anthropic::AnthropicProvider;
+use decipher_providers::openai::OpenAiProvider;
+use decipher_providers::Provider;
 use decipher_mcp::{McpConfig, McpClient};
 use decipher_runtime::{AgentConfig, AgentLoop, HookConfig, load_skills};
 use decipher_session_store::{load_session, list_sessions, MemoryStore, SessionStore};
@@ -74,37 +75,22 @@ async fn main() -> io::Result<()> {
     // Push cursor to the terminal bottom BEFORE raw mode so that
     // Viewport::Inline anchors at the real bottom, not wherever the
     // shell prompt happened to leave the cursor.
-    {
-        let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        print!("{}", "\n".repeat(rows as usize));
-        io::stdout().flush()?;
-    }
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    print!("{}", "\n".repeat(rows as usize));
+    io::stdout().flush()?;
 
     // Raw mode + bracketed paste + focus detection. NO alternate screen.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnableBracketedPaste, EnableFocusChange)?;
 
-    // Keyboard enhancement flags for better key detection (Kitty protocol).
-    let has_keyboard_enhancement = crossterm::terminal::supports_keyboard_enhancement()
-        .unwrap_or(false);
-    if has_keyboard_enhancement {
-        execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-            )
-        )?;
-    }
+    // Keyboard enhancement (Kitty protocol) is skipped to avoid the 200-2000ms
+    // detection timeout on non-Kitty terminals (Terminal.app, iTerm2).
+    // The TUI works correctly without it — only losing some key disambiguation.
 
-    let result = run_app(cli_cfg).await;
+    let result = run_app(cli_cfg, cols).await;
 
     let mut stdout = io::stdout();
-    if has_keyboard_enhancement {
-        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
-    }
     disable_raw_mode()?;
     execute!(stdout, DisableBracketedPaste, DisableFocusChange)?;
     println!();
@@ -143,14 +129,20 @@ impl FrameRateLimiter {
 /// Owns the terminal and all channel state. The AgentLoop runs as a
 /// background tokio task; this loop receives `ServerMessage` events from
 /// it and sends approval decisions back via a separate channel.
-async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
+async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16) -> io::Result<()> {
     // ── Provider ─────────────────────────────────────────────────────────────
-    let provider = {
-        let mut p = AnthropicProvider::new(&cli_cfg.api_key, &cli_cfg.model);
-        if let Some(ref url) = cli_cfg.base_url {
-            p = p.with_base_url(url);
+    let provider: Arc<dyn Provider> = match cli_cfg.provider_type {
+        config::ProviderType::OpenAi => {
+            let base = cli_cfg.base_url.as_deref().unwrap_or("https://api.openai.com");
+            Arc::new(OpenAiProvider::new(&cli_cfg.api_key, &cli_cfg.model, base))
         }
-        Arc::new(p)
+        config::ProviderType::Anthropic => {
+            let mut p = AnthropicProvider::new(&cli_cfg.api_key, &cli_cfg.model);
+            if let Some(ref url) = cli_cfg.base_url {
+                p = p.with_base_url(url);
+            }
+            Arc::new(p)
+        }
     };
 
     // ── Channels ─────────────────────────────────────────────────────────────
@@ -167,9 +159,11 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
     let base_url = cli_cfg.base_url.clone();
     let policy_mode = cli_cfg.policy_mode;
 
-    // ── MCP client initialization ─────────────────────────────────────────────
+    // ── MCP client initialization (lazy — deferred to first mission) ─────────
     let decipher_home = config::decipher_home();
-    let (mcp_tools, mcp_clients_arc) = init_mcp_clients(&decipher_home).await;
+    let mut mcp_tools: Vec<decipher_mcp::McpTool> = Vec::new();
+    let mut mcp_clients_arc: Option<std::sync::Arc<Vec<std::sync::Arc<tokio::sync::Mutex<McpClient>>>>> = None;
+    let mut mcp_initialized = false;
 
     // ── Session store ─────────────────────────────────────────────────────────
     // No Drop impl on SessionStore: session_end is intentionally best-effort —
@@ -193,7 +187,8 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
     // Fixed viewport height — never recreated mid-session (see original comment).
     let viewport_height = bottom_pane::MAX_PANE_HEIGHT;
     let mut terminal = make_terminal(viewport_height)?;
-    let actual_width = terminal.size()?.width;
+    // Use the terminal width captured before raw mode to avoid a redundant syscall.
+    let actual_width = initial_cols;
     if actual_width != app.chat.width() {
         app.chat.set_width(actual_width);
     }
@@ -204,7 +199,12 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
     // a Banner ServerMessage would leave the screen empty.
     {
         let version = env!("CARGO_PKG_VERSION");
-        let provider = if cli_cfg.base_url.is_some() { "custom" } else { "anthropic" };
+        let provider = match cli_cfg.provider_type {
+            config::ProviderType::Anthropic => {
+                if cli_cfg.base_url.is_some() { "anthropic (custom)" } else { "anthropic" }
+            }
+            config::ProviderType::OpenAi => "openai-compat",
+        };
         let api_key_set = !cli_cfg.api_key.is_empty();
         let directory = std::env::current_dir()
             .map(|p| {
@@ -533,22 +533,34 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                                                             &meta.workspace, &meta.mission_goal,
                                                         ).await.ok();
 
+                                                        // Lazy MCP init for resume path.
+                                                        if !mcp_initialized {
+                                                            let (mt, mc) = init_mcp_clients(&decipher_home).await;
+                                                            mcp_tools = mt;
+                                                            mcp_clients_arc = mc;
+                                                            mcp_initialized = true;
+                                                        }
                                                         let (atx, arx) = mpsc::channel::<bool>(1);
                                                         current_approval_tx = Some(atx);
-                                                        let resume_cfg = AgentConfig {
-                                                            model: model.clone(),
-                                                            api_key: api_key.clone(),
-                                                            base_url: base_url.clone(),
-                                                            workspace: meta.workspace.clone(),
-                                                            mission_goal: meta.mission_goal.clone(),
+                                                        let mut resume_cfg = build_agent_config(
+                                                            meta.mission_goal.clone(),
+                                                            api_key.clone(),
+                                                            model.clone(),
+                                                            base_url.clone(),
+                                                            meta.workspace.clone(),
                                                             policy_mode,
-                                                            resume_from: Some(history),
-                                                            ..Default::default()
-                                                        };
+                                                            &decipher_home,
+                                                            None,
+                                                            mcp_tools.clone(),
+                                                            mcp_clients_arc.clone(),
+                                                        );
+                                                        resume_cfg.resume_from = Some(history);
                                                         let tx = event_tx.clone();
                                                         let prov = provider.clone();
                                                         current_agent_task = Some(tokio::spawn(async move {
-                                                            let _ = AgentLoop::run(resume_cfg, &*prov, tx, Some(arx)).await;
+                                                            if let Err(e) = AgentLoop::run(resume_cfg, &*prov, tx.clone(), Some(arx)).await {
+                                                                let _ = tx.send(ServerMessage::Error { message: format!("Agent error: {e}") }).await;
+                                                            }
                                                         }));
                                                     }
                                                 },
@@ -562,7 +574,9 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                                                 let tx = event_tx.clone();
                                                 let prov = provider.clone();
                                                 current_agent_task = Some(tokio::spawn(async move {
-                                                    let _ = AgentLoop::run(exec_cfg, &*prov, tx, Some(arx)).await;
+                                                    if let Err(e) = AgentLoop::run(exec_cfg, &*prov, tx.clone(), Some(arx)).await {
+                                                        let _ = tx.send(ServerMessage::Error { message: format!("Agent error: {e}") }).await;
+                                                    }
                                                 }));
                                             } else {
                                                 let _ = event_tx.try_send(ServerMessage::AgentMessage {
@@ -570,6 +584,13 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                                                 });
                                             }
                                         } else {
+                                            // ── Lazy MCP init (once) ─────────────────────────
+                                            if !mcp_initialized {
+                                                let (mt, mc) = init_mcp_clients(&decipher_home).await;
+                                                mcp_tools = mt;
+                                                mcp_clients_arc = mc;
+                                                mcp_initialized = true;
+                                            }
                                             // ── Normal mission ───────────────────────────────
                                             // Close previous session; open one for this mission.
                                             if let Some(ss) = session_store.take() {
@@ -601,7 +622,9 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                                             let tx = event_tx.clone();
                                             let prov = provider.clone();
                                             current_agent_task = Some(tokio::spawn(async move {
-                                                let _ = AgentLoop::run(agent_cfg, &*prov, tx, Some(arx)).await;
+                                                if let Err(e) = AgentLoop::run(agent_cfg, &*prov, tx.clone(), Some(arx)).await {
+                                                    let _ = tx.send(ServerMessage::Error { message: format!("Agent error: {e}") }).await;
+                                                }
                                             }));
                                         }
                                     }
@@ -635,6 +658,9 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                             cols,
                             vp_h,
                         ))?;
+                        // Clear the viewport buffer so old content doesn't ghost
+                        // when the inline viewport shifts position on resize.
+                        terminal.clear()?;
                         need_redraw = true;
                     }
                     Ok(Event::FocusGained) => { app.terminal_focused = true; }
@@ -691,7 +717,7 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                 if let ServerMessage::MissionComplete { ref outcome, ref summary, .. } = msg {
                     if outcome == "PLAN" && plan_mode_flag {
                         // Build the execution config (plan_mode = false this time).
-                        let exec_cfg = build_agent_config(
+                        let mut exec_cfg = build_agent_config(
                             app.last_submitted.clone(),
                             api_key.clone(),
                             model.clone(),
@@ -703,6 +729,11 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                             mcp_tools.clone(),
                             mcp_clients_arc.clone(),
                         );
+                        // 5B: Inject the approved plan into the execution agent's context
+                        // so it starts execution with full knowledge of the plan steps.
+                        exec_cfg.memory_context = Some(format!(
+                            "## Approved Plan\n{summary}\n\nFollow this plan. Execute each step in order."
+                        ));
                         pending_plan_execution = Some(exec_cfg);
                         // Show the plan as an AgentMessage.
                         let plan_display = format!(
@@ -765,7 +796,7 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
 
                     let (atx, arx) = mpsc::channel::<bool>(1);
                     current_approval_tx = Some(atx);
-                    let agent_cfg = build_agent_config(
+                    let mut agent_cfg = build_agent_config(
                         text.clone(),
                         api_key.clone(),
                         model.clone(),
@@ -777,10 +808,16 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                         mcp_tools.clone(),
                         mcp_clients_arc.clone(),
                     );
+                    // 5C: propagate plan_mode to queued message dispatch.
+                    if plan_mode_flag {
+                        agent_cfg.plan_mode = true;
+                    }
                     let tx = event_tx.clone();
                     let prov = provider.clone();
                     current_agent_task = Some(tokio::spawn(async move {
-                        let _ = AgentLoop::run(agent_cfg, &*prov, tx, Some(arx)).await;
+                        if let Err(e) = AgentLoop::run(agent_cfg, &*prov, tx.clone(), Some(arx)).await {
+                            let _ = tx.send(ServerMessage::Error { message: format!("Agent error: {e}") }).await;
+                        }
                     }));
                 }
             }
@@ -849,12 +886,18 @@ async fn run_exec_mode(args: &[String], cli_cfg: config::CliConfig) -> i32 {
     }
 
     // ── Provider ──────────────────────────────────────────────────────────────
-    let provider = {
-        let mut p = AnthropicProvider::new(&cli_cfg.api_key, &cli_cfg.model);
-        if let Some(ref url) = cli_cfg.base_url {
-            p = p.with_base_url(url);
+    let provider: Arc<dyn Provider> = match cli_cfg.provider_type {
+        config::ProviderType::OpenAi => {
+            let base = cli_cfg.base_url.as_deref().unwrap_or("https://api.openai.com");
+            Arc::new(OpenAiProvider::new(&cli_cfg.api_key, &cli_cfg.model, base))
         }
-        Arc::new(p)
+        config::ProviderType::Anthropic => {
+            let mut p = AnthropicProvider::new(&cli_cfg.api_key, &cli_cfg.model);
+            if let Some(ref url) = cli_cfg.base_url {
+                p = p.with_base_url(url);
+            }
+            Arc::new(p)
+        }
     };
 
     // ── Run agent ─────────────────────────────────────────────────────────────
@@ -878,7 +921,9 @@ async fn run_exec_mode(args: &[String], cli_cfg: config::CliConfig) -> i32 {
     let prov = provider.clone();
     let tx = event_tx.clone();
     let _agent_task = tokio::spawn(async move {
-        let _ = AgentLoop::run(agent_cfg, &*prov, tx, None).await;
+        if let Err(e) = AgentLoop::run(agent_cfg, &*prov, tx.clone(), None).await {
+            let _ = tx.send(ServerMessage::Error { message: format!("Agent error: {e}") }).await;
+        }
     });
 
     let exec_start = Instant::now();
@@ -1381,9 +1426,8 @@ async fn init_mcp_clients(
                 all_tools.extend(tools);
                 clients.push(std::sync::Arc::new(tokio::sync::Mutex::new(client)));
             }
-            Err(_) => {
-                // Server unavailable — skip silently (mcp.json may reference
-                // servers not installed in the current environment).
+            Err(e) => {
+                eprintln!("[mcp] failed to connect to '{}': {e}", server_cfg.name);
             }
         }
     }

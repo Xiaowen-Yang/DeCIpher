@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use crate::app::{App, InputMode};
-use crate::shimmer;
+// shimmer removed — activity bar now uses a clean blinking dot (Claude Code style).
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
@@ -24,35 +24,20 @@ const BOLD_YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23)).add_modifie
 const GREEN: Style = Style::new().fg(Color::Green);
 const RED: Style = Style::new().fg(Color::Red);
 
-/// 3x3 dot matrix spinner encoded as braille character pairs.
-/// Each frame shows 2 lit perimeter positions rotating clockwise.
-///
-/// Perimeter positions:     Braille mapping (2 chars):
-///   0 1 2                   Left char (cols 0-1):  d1=0,0  d4=0,1  d2=1,0  d5=center  d3=2,0  d6=2,1
-///   7 . 3                   Right char (col 2):    d1=0,2  d2=1,2  d3=2,2
-///   6 5 4
-///
-/// The entire spinner fits within a single line, same height as text.
-const MATRIX_FRAMES: &[&str] = &[
-    "\u{2809}\u{2800}", // frame 0: pos 0,1 — ⠉⠀
-    "\u{2808}\u{2801}", // frame 1: pos 1,2 — ⠈⠁
-    "\u{2800}\u{2803}", // frame 2: pos 2,3 — ⠀⠃
-    "\u{2800}\u{2806}", // frame 3: pos 3,4 — ⠀⠆
-    "\u{2820}\u{2804}", // frame 4: pos 4,5 — ⠠⠄
-    "\u{2824}\u{2800}", // frame 5: pos 5,6 — ⠤⠀
-    "\u{2806}\u{2800}", // frame 6: pos 6,7 — ⠆⠀
-    "\u{2803}\u{2800}", // frame 7: pos 7,0 — ⠃⠀
-];
+/// Blinking dot glyphs for the activity indicator (Claude Code style).
+/// Alternates between filled ● and empty ○ on a 500ms period.
+const DOT_FILLED: &str = "\u{25cf}"; // ●
+const DOT_EMPTY: &str = "\u{25cb}";  // ○
 
-/// Fixed viewport height — the terminal is created ONCE with this height and
-/// never recreated.  Recreating mid-session queries cursor position via \x1b[6n
-/// on /dev/tty, but the async EventStream is also reading /dev/tty and will
-/// consume the response first, causing a timeout crash.
+/// Viewport height — the terminal is created ONCE with this height.
 ///
-/// Content shorter than this is pushed to the bottom via top-padding in
-/// `build_lines()`.  Large overlays (shortcuts: ~19 lines, input: 4 lines,
-/// commands: up to 10 + 4 = 14 lines) all fit within 25 rows.
-pub const MAX_PANE_HEIGHT: u16 = 25;
+/// Kept small so the startup banner remains visible in terminals as short as
+/// ~15 rows (matching Claude Code's behaviour).  Overlays that exceed this
+/// height are truncated rather than pushing the banner off-screen.
+///
+/// Layout budget (normal): spinner (1) + divider (1) + input (1) + divider (1)
+///                         + hints (1) + margin (1) = 6 rows.
+pub const MAX_PANE_HEIGHT: u16 = 6;
 
 /// The bottom pane widget — renders the prompt region.
 ///
@@ -136,15 +121,19 @@ impl<'a> BottomPane<'a> {
 
     /// Build the full viewport lines: blank top-padding + content.
     ///
-    /// The viewport is a fixed MAX_PANE_HEIGHT rows.  Blank padding pins
-    /// the actual content to the viewport bottom, so it always appears at
-    /// the physical bottom of the terminal without needing to recreate the
-    /// Terminal struct (which would trigger a cursor-position query that
-    /// races with the async EventStream reader).
+    /// Content is truncated (from the top) to fit MAX_PANE_HEIGHT so that
+    /// overlays like shortcuts don't push the viewport beyond its budget.
+    /// Blank padding pins the content to the viewport bottom.
     fn build_lines(&self) -> Vec<Line<'static>> {
-        let content = self.build_content_lines();
-        let pad = (MAX_PANE_HEIGHT as usize).saturating_sub(content.len());
-        let mut lines = Vec::with_capacity(MAX_PANE_HEIGHT as usize);
+        let mut content = self.build_content_lines();
+        let max = MAX_PANE_HEIGHT as usize;
+        // Truncate excess content from the top (keep the bottom — input + hints).
+        if content.len() > max {
+            let skip = content.len() - max;
+            content = content.into_iter().skip(skip).collect();
+        }
+        let pad = max.saturating_sub(content.len());
+        let mut lines = Vec::with_capacity(max);
         for _ in 0..pad {
             lines.push(Line::from(""));
         }
@@ -245,15 +234,15 @@ impl<'a> BottomPane<'a> {
     }
 
     fn build_spinner(&self, label: &str, lines: &mut Vec<Line<'static>>) {
-        let frame_idx = self.app.spinner_started
-            .map(|t| (t.elapsed().as_millis() / 100) as usize)
-            .unwrap_or(self.app.spinner_frame);
-        let frame = MATRIX_FRAMES[frame_idx % MATRIX_FRAMES.len()];
+        // Blinking dot: ● / ○ on 500ms period (Claude Code style).
+        let blink_on = self.app.spinner_started
+            .map(|t| (t.elapsed().as_millis() / 500) % 2 == 0)
+            .unwrap_or(true);
+        let dot = if blink_on { DOT_FILLED } else { DOT_EMPTY };
 
         let phase = &self.app.agent_phase;
 
         // Phase label: spec vocabulary takes precedence over raw spinner label.
-        // For WaitingForApproval, use yellow instead of the default spinner color.
         let display_label = if phase.is_active() {
             phase.label()
         } else {
@@ -261,53 +250,41 @@ impl<'a> BottomPane<'a> {
         };
 
         let is_approval = *phase == crate::app::AgentPhase::WaitingForApproval;
-        let spinner_style = if is_approval {
+        let dot_style = if is_approval {
             Style::default().fg(Color::Yellow)
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(Color::Cyan)
         };
 
-        // Build shimmer spans (convert crossterm Color → ratatui Color)
-        let shimmer_chars = shimmer::shimmer_chars(display_label);
         let mut spans = vec![
             Span::raw("  "),
-            Span::styled(frame.to_string(), spinner_style),
+            Span::styled(dot, dot_style),
             Span::raw(" "),
+            Span::styled(display_label.to_string(), Style::default().fg(Color::White)),
         ];
-        for (ch, color) in &shimmer_chars {
-            let rat_color = crossterm_to_ratatui_color(*color);
-            spans.push(Span::styled(ch.to_string(), Style::default().fg(rat_color)));
+
+        // Inline detail: tool name/file for action phases.
+        if let Some(ref detail) = self.app.agent_phase_detail {
+            let truncated: String = detail.chars().take(40).collect();
+            spans.push(Span::styled(format!(" \u{00b7} {truncated}"), DIM));
         }
 
-        // Inline detail: show current tool/file for action phases.
-        let inline_detail_phases = [
-            crate::app::AgentPhase::ApplyingEdits,
-            crate::app::AgentPhase::RunningChecks,
-            crate::app::AgentPhase::Executing,
-        ];
-        if inline_detail_phases.contains(phase) {
-            if let Some(ref detail) = self.app.agent_phase_detail {
-                let truncated: String = detail.chars().take(40).collect();
-                spans.push(Span::styled(format!(" \u{00b7} {truncated}"), DIM));
-            }
-        }
-
-        // Turn counter (e.g., "[turn 3/20]")
+        // Turn counter (no max shown — agent runs until done or interrupted).
         if self.app.agent_turn > 0 {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
-                format!("[turn {}/{}]", self.app.agent_turn, self.app.agent_max_turns),
+                format!("[turn {}]", self.app.agent_turn),
                 DIM,
             ));
         }
 
-        // Model name (from banner)
+        // Model name
         if let Some(ref banner) = self.app.banner {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(banner.model.clone(), DIM));
         }
 
-        // Mission elapsed time — always visible while active.
+        // Elapsed time
         if let Some(started) = self.app.mission_started {
             let secs = started.elapsed().as_secs();
             let display = if secs >= 60 {
@@ -319,7 +296,7 @@ impl<'a> BottomPane<'a> {
             spans.push(Span::styled(display, DIM));
         }
 
-        // Right-side hint: differs for approval vs. normal active phases.
+        // Right-side hint
         if is_approval {
             spans.push(Span::styled("  y/n to decide", YELLOW));
         } else {
@@ -328,23 +305,6 @@ impl<'a> BottomPane<'a> {
         }
 
         lines.push(Line::from(spans));
-
-        // Phase detail line (only for non-inline phases — Applying/Running show detail inline).
-        let no_inline_phases = [
-            crate::app::AgentPhase::Planning,
-            crate::app::AgentPhase::Thinking,
-            crate::app::AgentPhase::Verifying,
-        ];
-        if no_inline_phases.contains(phase) {
-            if let Some(ref detail) = self.app.agent_phase_detail {
-                let truncated: String = detail.chars().take(60).collect();
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("\u{2514} ", DIM),
-                    Span::styled(truncated, DIM),
-                ]));
-            }
-        }
     }
 
     fn build_hints(&self, lines: &mut Vec<Line<'static>>) {
@@ -481,52 +441,22 @@ impl<'a> BottomPane<'a> {
             return None; // No cursor in pager mode
         }
 
-        // Compute top-padding so the cursor row aligns with the padded build_lines().
-        let content = self.build_content_lines();
-        let pad = (MAX_PANE_HEIGHT as usize).saturating_sub(content.len()) as u16;
+        // Use the same build_lines() output to find the cursor row,
+        // ensuring truncation and padding are accounted for identically.
+        let lines = self.build_lines();
 
-        // Find the input line row — count lines before input (within content).
-        // Start at `pad` to skip the blank top-padding rows.
-        let mut input_row_start = pad;
-
-        // Count popup lines
-        if self.app.mode == InputMode::CommandPopup {
-            let filtered = self.app.filtered_commands();
-            input_row_start += filtered.len().min(10) as u16;
-            if filtered.len() > 10 { input_row_start += 1; }
-        }
-        if self.app.mode == InputMode::FileSearch && !self.app.file_search_results.is_empty() {
-            let max_show = self.app.file_search_results.len().min(10);
-            input_row_start += max_show as u16;
-            if self.app.file_search_results.len() > max_show { input_row_start += 1; }
-        }
-        // Streaming preview (always shown during streaming for the blinking cursor)
-        if self.app.chat.is_streaming() {
-            input_row_start += 1;
-        }
-        // Activity bar (single-line braille 3x3 matrix + optional detail line).
-        // Must match the condition in build_content_lines().
-        let show_activity_bar = self.app.agent_busy
-            || self.app.mode == InputMode::ApprovalPending
-            || self.app.agent_phase.is_active();
-        if show_activity_bar {
-            input_row_start += 1;
-            // Phase detail line only for non-inline phases.
-            let no_inline = [
-                crate::app::AgentPhase::Planning,
-                crate::app::AgentPhase::Thinking,
-                crate::app::AgentPhase::Verifying,
-            ];
-            if no_inline.contains(&self.app.agent_phase) && self.app.agent_phase_detail.is_some() {
-                input_row_start += 1;
+        // The input line is the one starting with "│ ❯" or "  ❯".
+        // Find its index from the bottom (it's always near the end,
+        // followed by bottom-rule + hints + optional shortcuts).
+        let mut input_row: Option<u16> = None;
+        for (i, line) in lines.iter().enumerate() {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if text.contains('\u{276f}') || text.contains("❯") {
+                input_row = Some(i as u16);
+                break;
             }
         }
-        // Queued message indicator (now above input)
-        if self.app.queued_message.is_some() {
-            input_row_start += 1;
-        }
-        // Top rule line
-        input_row_start += 1;
+        let input_row_start = input_row.unwrap_or(1); // fallback
 
         // Find cursor position within input
         let (cursor_line, cursor_col) = cursor_position_in_multiline(&self.app.input, self.app.cursor);

@@ -94,15 +94,31 @@ async function main() {
 async function findTuiBinary() {
   const { access } = await import('node:fs/promises');
 
-  // Check next to this script (npm install location)
   const binDir = dirname(fileURLToPath(import.meta.url));
+  const repoRoot = join(binDir, '..');
+
+  // Prefer release binary (faster startup, signed via `make release`).
+  const releasePath = join(repoRoot, 'target', 'release', 'decipher-tui');
+  try {
+    await access(releasePath);
+    return releasePath;
+  } catch { /* not found */ }
+
+  // Fall back to debug binary.
+  const debugPath = join(repoRoot, 'target', 'debug', 'decipher-tui');
+  try {
+    await access(debugPath);
+    return debugPath;
+  } catch { /* not found */ }
+
+  // Check next to this script (npm install location).
   const localPath = join(binDir, 'decipher-tui');
   try {
     await access(localPath);
     return localPath;
   } catch { /* not found */ }
 
-  // Check in PATH
+  // Check in PATH.
   const { execSync } = await import('node:child_process');
   try {
     const p = execSync('which decipher-tui 2>/dev/null', { encoding: 'utf8' }).trim();

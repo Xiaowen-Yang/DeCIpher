@@ -36,6 +36,8 @@ pub struct ToolContext {
     pub event_tx: Option<tokio::sync::mpsc::Sender<decipher_protocol::ServerMessage>>,
     /// Nesting depth: 0 = top-level agent, 1 = subagent, etc.
     pub depth: u8,
+    /// Policy mode inherited from the parent agent config.
+    pub policy_mode: decipher_policy::PolicyMode,
 }
 
 /// Result from a single tool invocation.
@@ -117,27 +119,31 @@ pub async fn dispatch(
         }
         "spawn_agent" => subagent::spawn_agent(args, ctx).await,
         unknown => {
-            // Try MCP clients if available.
+            // Route prefixed MCP tool names: mcp__<server>_<tool>
             if let Some(ref mcp_clients) = ctx.mcp_clients {
-                for client_arc in mcp_clients.as_ref() {
-                    let mut client = client_arc.lock().await;
-                    match client.call_tool(unknown, args.clone()).await {
-                        Ok(result) => {
-                            return Ok(ToolOutput::ok(
-                                format!("mcp:{}", client.server_name),
-                                format!("[Tool result: {unknown}]\n{result}"),
-                            ));
-                        }
-                        Err(decipher_mcp::McpError::Protocol(_))
-                        | Err(decipher_mcp::McpError::Rpc { .. }) => {
-                            // This server doesn't have the tool — try next.
-                            continue;
-                        }
-                        Err(e) => {
-                            return Ok(ToolOutput::err(
-                                format!("MCP error: {e}"),
-                                format!("Error calling MCP tool \"{unknown}\": {e}"),
-                            ));
+                if let Some(rest) = unknown.strip_prefix("mcp__") {
+                    for client_arc in mcp_clients.as_ref() {
+                        let client_guard = client_arc.lock().await;
+                        let server_prefix = format!("{}_", client_guard.server_name);
+                        if let Some(tool_name) = rest.strip_prefix(&server_prefix) {
+                            let tool_name = tool_name.to_string();
+                            let server_name = client_guard.server_name.clone();
+                            drop(client_guard);
+                            let mut client = client_arc.lock().await;
+                            match client.call_tool(&tool_name, args.clone()).await {
+                                Ok(result) => {
+                                    return Ok(ToolOutput::ok(
+                                        format!("mcp:{server_name}"),
+                                        format!("[Tool result: {tool_name}]\n{result}"),
+                                    ));
+                                }
+                                Err(e) => {
+                                    return Ok(ToolOutput::err(
+                                        format!("MCP error: {e}"),
+                                        format!("Error calling MCP tool \"{tool_name}\": {e}"),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -192,6 +198,7 @@ mod tests {
             base_url: None,
             event_tx: None,
             depth: 0,
+            policy_mode: decipher_policy::PolicyMode::Auto,
         };
         let out = dispatch("nonexistent_tool", &serde_json::json!({}), &ctx)
             .await

@@ -408,6 +408,7 @@ mod tests {
             base_url: None,
             event_tx: None,
             depth: 0,
+            policy_mode: decipher_policy::PolicyMode::Auto,
         };
         let patch = "\
 --- a/hello.txt

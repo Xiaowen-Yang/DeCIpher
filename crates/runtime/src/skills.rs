@@ -70,10 +70,27 @@ fn parse_skill_file(path: &Path) -> Option<Skill> {
     let content = std::fs::read_to_string(path).ok()?;
 
     // Try to parse YAML frontmatter between --- delimiters.
+    // Find the closing --- that is on its own line (\n---\n or \n--- at EOF)
+    // to avoid false matches on --- inside the skill body.
     let (name, description, body) = if content.starts_with("---") {
-        let end = content[3..].find("\n---")?;
+        let after_open = &content[3..];
+        // Prefer \n---\n; fall back to \n--- at exact EOF.
+        let end = after_open
+            .find("\n---\n")
+            .or_else(|| {
+                after_open
+                    .find("\n---")
+                    .filter(|&p| p + 4 == after_open.len())
+            })?;
         let frontmatter = &content[3..end + 3];
-        let body = content[end + 7..].trim_start().to_string();
+        let body_start = if after_open[end..].starts_with("\n---\n") {
+            // Skip \n---\n (5 chars) after the opening ---
+            3 + end + 5
+        } else {
+            // Skip \n--- (4 chars) at EOF
+            3 + end + 4
+        };
+        let body = content.get(body_start..).unwrap_or("").trim_start().to_string();
 
         let name = extract_frontmatter_field(frontmatter, "name")
             .unwrap_or_else(|| {

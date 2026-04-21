@@ -21,10 +21,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 // ── Error type ─────────────────────────────────────────────────────────────────
 
@@ -119,6 +120,7 @@ pub struct McpClient {
     pub server_name: String,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    child: Child,
     request_id: AtomicU64,
 }
 
@@ -158,6 +160,7 @@ impl McpClient {
             server_name: config.name.clone(),
             stdin,
             stdout,
+            child,
             request_id: AtomicU64::new(1),
         };
 
@@ -228,7 +231,15 @@ impl McpClient {
         Ok(parts.join("\n"))
     }
 
+    /// Kill the MCP server process and wait for it to exit.
+    pub async fn shutdown(&mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
+
     // ── Internal helpers ───────────────────────────────────────────────────────
+
+    const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
     async fn rpc(
         &mut self,
@@ -251,7 +262,12 @@ impl McpClient {
         let mut buf = String::new();
         loop {
             buf.clear();
-            let n = self.stdout.read_line(&mut buf).await?;
+            let n = tokio::time::timeout(Self::RPC_TIMEOUT, self.stdout.read_line(&mut buf))
+                .await
+                .map_err(|_| McpError::Protocol(format!(
+                    "[mcp] RPC timeout after {}s for method: {method}",
+                    Self::RPC_TIMEOUT.as_secs()
+                )))??;
             if n == 0 {
                 return Err(McpError::Protocol("server closed stdout".into()));
             }

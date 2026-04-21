@@ -128,6 +128,20 @@ pub fn classify_tool_action(tool_name: &str, args: &Value) -> Classification {
             reason: tool_name.to_string(),
         },
 
+        // spawn_agent can write files (same as write_file).
+        "spawn_agent" => Classification {
+            tool_class: ToolClass::Write,
+            paths: vec![],
+            reason: "spawn subagent".to_string(),
+        },
+
+        // Search / file-listing tools are read-only.
+        "search" | "grep_search" | "file_search" | "list_files" => Classification {
+            tool_class: ToolClass::Read,
+            paths: vec![],
+            reason: tool_name.to_string(),
+        },
+
         // Unknown tools default to exec
         _ => Classification {
             tool_class: ToolClass::Exec,

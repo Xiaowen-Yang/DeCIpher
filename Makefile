@@ -1,4 +1,4 @@
-.PHONY: demo test doctor verify verify-agent install smoke
+.PHONY: demo test doctor verify verify-agent install smoke release
 
 install:
 	pnpm install
@@ -56,3 +56,11 @@ verify-agent:
 
 smoke:
 	node bin/decipher demo scenarios/docker-copy-path-bug 2>&1 | grep -E 'Result:|Classification:' && echo "Smoke OK"
+
+# Build and sign the release binary (macOS quarantine fix for com.apple.provenance).
+# Prefer this binary over the debug build for faster startup.
+release:
+	cargo build --release --bin decipher-tui
+	xattr -cr target/release/decipher-tui
+	codesign -s - --force target/release/decipher-tui
+	@echo "Release binary ready: target/release/decipher-tui"

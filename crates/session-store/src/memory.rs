@@ -1,7 +1,7 @@
 //! Per-project persistent memory for DeCIpher.
 //!
 //! Memory is stored as `~/.decipher/memory/<project-hash>/memories.jsonl`
-//! where `project-hash` is the hex SHA-256 of the workspace path (first 16 chars).
+//! where `project-hash` is a 16-char hex hash (FNV-1a) of the workspace path.
 //!
 //! Each line is a JSON object:
 //! ```json
@@ -71,8 +71,10 @@ impl MemoryStore {
             if line.is_empty() {
                 continue;
             }
-            let entry: MemoryEntry = serde_json::from_str(line)?;
-            entries.push(entry);
+            match serde_json::from_str::<MemoryEntry>(line) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => eprintln!("[memory] skipping corrupt line: {e}"),
+            }
         }
         Ok(entries)
     }

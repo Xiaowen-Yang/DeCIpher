@@ -43,6 +43,9 @@ pub struct AgentConfig {
     pub mcp_tools: Vec<decipher_mcp::McpTool>,
     /// Live MCP client connections (shared, one per server).
     pub mcp_clients: Option<std::sync::Arc<Vec<std::sync::Arc<tokio::sync::Mutex<decipher_mcp::McpClient>>>>>,
+    /// Agent nesting depth: 0 = top-level, 1 = first subagent, etc.
+    /// Used to enforce MAX_DEPTH in spawn_agent.
+    pub depth: u8,
 }
 
 impl Default for AgentConfig {
@@ -57,7 +60,7 @@ impl Default for AgentConfig {
                 .to_string(),
             mission_goal: "Complete the requested task.".to_string(),
             plan_steps: Vec::new(),
-            max_turns: 20,
+            max_turns: 200,
             policy_mode: decipher_policy::PolicyMode::Auto,
             max_tokens: 8192,
             resume_from: None,
@@ -67,6 +70,7 @@ impl Default for AgentConfig {
             hook_config: HookConfig::default(),
             mcp_tools: Vec::new(),
             mcp_clients: None,
+            depth: 0,
         }
     }
 }

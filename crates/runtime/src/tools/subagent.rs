@@ -47,6 +47,25 @@ pub async fn spawn_agent(
         .unwrap_or(&ctx.workspace)
         .to_string();
 
+    // 4B: Validate workspace stays within parent boundary.
+    {
+        let parent_root = std::path::Path::new(&ctx.workspace);
+        let sub_root = std::path::Path::new(&workspace);
+        if let (Ok(parent_canonical), Ok(sub_canonical)) =
+            (parent_root.canonicalize(), sub_root.canonicalize())
+        {
+            if !sub_canonical.starts_with(&parent_canonical) {
+                return Ok(ToolOutput::err(
+                    "spawn_agent: workspace outside parent boundary",
+                    format!(
+                        "Error: subagent workspace {:?} is not within parent workspace {:?}",
+                        workspace, ctx.workspace
+                    ),
+                ));
+            }
+        }
+    }
+
     let max_turns = args
         .get("max_turns")
         .and_then(|v| v.as_u64())
@@ -75,7 +94,7 @@ pub async fn spawn_agent(
     // Create a channel to capture subagent events.
     let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<ServerMessage>(64);
 
-    // Build subagent config — inherit credentials, set higher depth.
+    // Build subagent config — inherit credentials, propagate depth and policy.
     let sub_cfg = AgentConfig {
         model: ctx.model.clone(),
         api_key: ctx.api_key.clone(),
@@ -83,7 +102,8 @@ pub async fn spawn_agent(
         workspace: workspace.clone(),
         mission_goal: task.clone(),
         max_turns,
-        // Subagent inherits depth+1 via ToolContext — not AgentConfig.
+        depth: ctx.depth + 1,
+        policy_mode: ctx.policy_mode,
         // MCP clients are not inherited (avoid re-sharing handles across tasks).
         ..Default::default()
     };
@@ -185,6 +205,7 @@ mod tests {
             base_url: None,
             event_tx: None,
             depth,
+            policy_mode: decipher_policy::PolicyMode::Auto,
         }
     }
 

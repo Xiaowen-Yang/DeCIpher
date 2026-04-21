@@ -74,8 +74,12 @@ pub async fn write(args: &Value, ctx: &ToolContext) -> Result<ToolOutput, crate:
 
     let path = resolve_path(&ctx.workspace, path_str);
 
-    // Check if file already exists (for the result message).
-    let previous_existed = path.exists();
+    // Read existing content for diff generation.
+    let old_content = if path.exists() {
+        fs::read_to_string(&path).await.ok()
+    } else {
+        None
+    };
 
     // Create parent directories as needed.
     if let Some(parent) = path.parent() {
@@ -93,19 +97,27 @@ pub async fn write(args: &Value, ctx: &ToolContext) -> Result<ToolOutput, crate:
 
     match fs::write(&path, &content).await {
         Ok(()) => {
-            let verb = if previous_existed {
+            let verb = if old_content.is_some() {
                 "overwritten"
             } else {
                 "created new"
             };
-            Ok(ToolOutput::ok(
+
+            // Generate a compact diff preview.
+            let diff_preview = generate_diff_preview(old_content.as_deref(), &content);
+
+            let mut out = ToolOutput::ok(
                 format!("Wrote {} ({})", path.display(), verb),
                 format!(
                     "[Tool result: write_file]\nWrote: {} ({})",
                     path.display(),
                     verb
                 ),
-            ))
+            );
+            if !diff_preview.is_empty() {
+                out.raw_output = Some(diff_preview);
+            }
+            Ok(out)
         }
         Err(e) => Ok(ToolOutput::err(
             format!("Error writing {}", path.display()),
@@ -179,6 +191,75 @@ pub async fn list(args: &Value, ctx: &ToolContext) -> Result<ToolOutput, crate::
     ))
 }
 
+/// Generate a compact diff preview between old and new file content.
+///
+/// Returns lines prefixed with `+` (added) and `-` (removed).
+/// For new files, shows the first few lines as `+` additions.
+fn generate_diff_preview(old: Option<&str>, new: &str) -> String {
+    match old {
+        None => {
+            // New file — show first lines as additions.
+            let lines: Vec<&str> = new.lines().collect();
+            let count = lines.len();
+            let show = count.min(8);
+            let mut out = format!("Added {count} lines\n");
+            for line in &lines[..show] {
+                out.push_str(&format!("+{line}\n"));
+            }
+            if count > show {
+                out.push_str(&format!("(+{} more lines)", count - show));
+            }
+            out.trim_end().to_string()
+        }
+        Some(old_text) => {
+            let old_lines: Vec<&str> = old_text.lines().collect();
+            let new_lines: Vec<&str> = new.lines().collect();
+
+            // Collect changed lines (simple line-by-line diff).
+            let mut added = 0usize;
+            let mut removed = 0usize;
+            let mut diff_lines: Vec<String> = Vec::new();
+            let max_len = old_lines.len().max(new_lines.len());
+            for i in 0..max_len {
+                let old_l = old_lines.get(i).copied();
+                let new_l = new_lines.get(i).copied();
+                match (old_l, new_l) {
+                    (Some(o), Some(n)) if o != n => {
+                        diff_lines.push(format!("-{o}"));
+                        diff_lines.push(format!("+{n}"));
+                        removed += 1;
+                        added += 1;
+                    }
+                    (Some(o), None) => {
+                        diff_lines.push(format!("-{o}"));
+                        removed += 1;
+                    }
+                    (None, Some(n)) => {
+                        diff_lines.push(format!("+{n}"));
+                        added += 1;
+                    }
+                    _ => {} // unchanged
+                }
+            }
+
+            if diff_lines.is_empty() {
+                return String::new(); // no changes
+            }
+
+            let mut out = format!("Added {added} lines, removed {removed} lines\n");
+            let show = diff_lines.len().min(12);
+            for line in &diff_lines[..show] {
+                out.push_str(line);
+                out.push('\n');
+            }
+            if diff_lines.len() > show {
+                out.push_str(&format!("({} more changes)", diff_lines.len() - show));
+            }
+            out.trim_end().to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +276,7 @@ mod tests {
             base_url: None,
             event_tx: None,
             depth: 0,
+            policy_mode: decipher_policy::PolicyMode::Auto,
         };
         (dir, ctx)
     }

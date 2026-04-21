@@ -311,10 +311,10 @@ impl App {
                 self.agent_phase = AgentPhase::WaitingForApproval;
             }
             ServerMessage::ToolStart { ref tool, ref args, .. } => {
+                self.agent_busy = true;
                 self.agent_phase = match tool.as_str() {
                     "write_file" | "apply_patch" => AgentPhase::ApplyingEdits,
                     "exec_command" => {
-                        // Try to map the specific command to a context-aware phase.
                         let cmd = args
                             .as_ref()
                             .and_then(|v| v.get("cmd"))
@@ -327,24 +327,41 @@ impl App {
                     _ => AgentPhase::Executing,
                 };
                 self.agent_phase_detail = Some(tool.clone());
+                if self.spinner_label.is_none() {
+                    self.spinner_started = Some(std::time::Instant::now());
+                }
+                self.spinner_label = Some(format!("→ {tool}"));
             }
             ServerMessage::ToolResult { .. } => {
                 self.agent_phase = AgentPhase::Thinking;
                 self.agent_phase_detail = None;
             }
-            ServerMessage::AgentMessage { .. } => {}
+            ServerMessage::AgentMessage { .. } => {
+                self.agent_busy = true;
+            }
             ServerMessage::AgentMessageDelta { .. } => {
                 if matches!(self.agent_phase, AgentPhase::Idle | AgentPhase::Thinking | AgentPhase::Planning) {
                     self.agent_phase = AgentPhase::Thinking;
                 }
             }
             ServerMessage::ExecOutputDelta { .. } => {}
-            ServerMessage::AgentStatus { turn, max_turns, tool_name, .. } => {
+            ServerMessage::AgentStatus { turn, max_turns, tool_name, phase, .. } => {
                 self.agent_turn = turn;
                 self.agent_max_turns = max_turns;
                 if let Some(name) = tool_name {
                     self.agent_phase_detail = Some(name);
                 }
+                // AgentStatus arriving means the agent loop IS running —
+                // activate busy/spinner state if not already active.
+                if !self.agent_busy {
+                    self.agent_busy = true;
+                    self.agent_phase = AgentPhase::Thinking;
+                    self.mission_started = Some(std::time::Instant::now());
+                }
+                if self.spinner_label.is_none() {
+                    self.spinner_started = Some(std::time::Instant::now());
+                }
+                self.spinner_label = Some(phase);
             }
             ServerMessage::MissionComplete { .. } => {
                 self.agent_busy = false;

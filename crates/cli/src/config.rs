@@ -11,6 +11,16 @@
 use decipher_policy::PolicyMode;
 use serde::Deserialize;
 
+/// Which provider protocol to use for LLM calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderType {
+    /// Anthropic /v1/messages protocol (x-api-key header).
+    Anthropic,
+    /// OpenAI /v1/chat/completions protocol (Bearer auth).
+    /// Also used for ZhiPu, Groq, Mistral, Together, Deepseek, vLLM, etc.
+    OpenAi,
+}
+
 /// Runtime configuration for the CLI.
 #[derive(Debug, Clone)]
 pub struct CliConfig {
@@ -23,6 +33,8 @@ pub struct CliConfig {
     pub policy_mode: PolicyMode,
     /// If true, start in plan mode (generate plan before executing).
     pub plan_mode_flag: bool,
+    /// Which provider protocol to use.
+    pub provider_type: ProviderType,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -31,6 +43,8 @@ struct ConfigFile {
     model: Option<String>,
     base_url: Option<String>,
     policy_mode: Option<String>,
+    /// Provider type: "anthropic", "openai", or "auto" (default).
+    provider: Option<String>,
 }
 
 impl CliConfig {
@@ -67,7 +81,18 @@ impl CliConfig {
         // --plan flag from CLI args.
         let plan_mode_flag = std::env::args().any(|a| a == "--plan");
 
-        Self { api_key, model, base_url, workspace, policy_mode, plan_mode_flag }
+        // Provider detection: explicit > env > auto-detect from base_url/model.
+        let provider_type = std::env::var("DECIPHER_PROVIDER")
+            .ok()
+            .or(file.provider)
+            .map(|s| match s.to_lowercase().as_str() {
+                "anthropic" => ProviderType::Anthropic,
+                "openai" => ProviderType::OpenAi,
+                _ => auto_detect_provider(base_url.as_deref(), &model),
+            })
+            .unwrap_or_else(|| auto_detect_provider(base_url.as_deref(), &model));
+
+        Self { api_key, model, base_url, workspace, policy_mode, plan_mode_flag, provider_type }
     }
 }
 
@@ -86,4 +111,33 @@ fn read_config_file() -> Option<ConfigFile> {
     let path = decipher_home().join("config.json");
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// Auto-detect provider from base_url and model name.
+///
+/// Default → Anthropic (native Claude). Custom base_url → OpenAI-compatible
+/// unless it's `api.anthropic.com`.
+fn auto_detect_provider(base_url: Option<&str>, model: &str) -> ProviderType {
+    // Explicit Anthropic endpoint or claude model with default endpoint.
+    match base_url {
+        None => {
+            // No custom URL. Anthropic if it looks like a Claude model, OpenAI otherwise.
+            if model.starts_with("claude-") {
+                ProviderType::Anthropic
+            } else if model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+                ProviderType::OpenAi
+            } else {
+                // Unknown model, no base_url — default Anthropic (the original behavior).
+                ProviderType::Anthropic
+            }
+        }
+        Some(url) => {
+            if url.contains("anthropic.com") {
+                ProviderType::Anthropic
+            } else {
+                // Any custom base URL → OpenAI-compatible protocol.
+                ProviderType::OpenAi
+            }
+        }
+    }
 }

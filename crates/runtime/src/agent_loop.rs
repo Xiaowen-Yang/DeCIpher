@@ -69,21 +69,17 @@ impl AgentLoop {
         let context_window = model_info.context_window;
 
         // Generate a session identifier for hooks.
-        let session_id = format!("session-{}", start.elapsed().subsec_nanos());
+        // Using SystemTime (milliseconds since epoch) gives a unique, monotonic id.
+        let session_id = format!(
+            "session-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
 
         // Fire session start hooks.
         fire_session_event(&config.hook_config.session_start).await;
-
-        // Announce the run.
-        let _ = event_tx
-            .send(ServerMessage::Banner {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                provider: "anthropic".to_string(),
-                model: config.model.clone(),
-                directory: config.workspace.clone(),
-                api_key_set: !config.api_key.is_empty(),
-            })
-            .await;
 
         // Build tool definitions for the LLM.
         // In plan_mode, no tools are provided so the LLM generates text only.
@@ -98,16 +94,25 @@ impl AgentLoop {
                     input_schema: Some(s.input_schema),
                 })
                 .collect();
-            // Merge MCP tools (prefixed with server name to avoid collisions).
+            // Merge MCP tools — prefixed as mcp__<server>_<tool> to avoid collisions
+            // with built-in tools (e.g. a server's "read_file" won't shadow the built-in).
             for mcp_tool in &config.mcp_tools {
                 tool_defs.push(ToolDefinition {
-                    name: mcp_tool.name.clone(),
+                    name: format!("mcp__{}_{}", mcp_tool.server_name, mcp_tool.name),
                     description: if mcp_tool.description.is_empty() {
                         None
                     } else {
                         Some(format!("[MCP:{}] {}", mcp_tool.server_name, mcp_tool.description))
                     },
-                    input_schema: Some(mcp_tool.input_schema.clone()),
+                    input_schema: {
+                        // 3D: validate schema is an object so the Anthropic API doesn't 400.
+                        let schema = &mcp_tool.input_schema;
+                        if schema.is_object() {
+                            Some(schema.clone())
+                        } else {
+                            Some(serde_json::json!({"type": "object", "properties": {}}))
+                        }
+                    },
                 });
             }
             tool_defs
@@ -133,7 +138,8 @@ impl AgentLoop {
             model: config.model.clone(),
             base_url: config.base_url.clone(),
             event_tx: Some(event_tx.clone()),
-            depth: 0,
+            depth: config.depth,
+            policy_mode: config.policy_mode,
         };
 
         let mut outcome = RunOutcome::Fail;
@@ -168,10 +174,28 @@ impl AgentLoop {
                 system: Some(system_prompt.clone()),
             };
 
-            let mut stream = provider.stream_message(request).await?;
+            let mut stream = match provider.stream_message(request).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[agent] provider error: {e}");
+                    let _ = event_tx.send(ServerMessage::Error {
+                        message: format!("Provider error: {e}"),
+                    }).await;
+                    return Err(e.into());
+                }
+            };
 
             // Collect streaming response.
-            let collected = collect_stream(&mut stream, &event_tx).await?;
+            let collected = match collect_stream(&mut stream, &event_tx).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[agent] stream error: {e}");
+                    let _ = event_tx.send(ServerMessage::Error {
+                        message: format!("Stream error: {e}"),
+                    }).await;
+                    return Err(e);
+                }
+            };
             last_prompt_tokens = collected.usage.input_tokens;
 
             // Emit the assembled assistant text as AgentMessage so the session
@@ -563,14 +587,7 @@ async fn execute_tool_and_emit(
             summary: tool_output.summary.clone(),
             elapsed_ms,
             exit_code: tool_output.exit_code,
-            output_preview: tool_output.raw_output.as_ref().and_then(|o| {
-                let lines: Vec<&str> = o.lines().collect();
-                if lines.len() > 8 {
-                    Some(lines[..8].join("\n"))
-                } else {
-                    None
-                }
-            }),
+            output_preview: tool_output.raw_output.clone(),
             output_lines_total: tool_output
                 .raw_output
                 .as_deref()
@@ -828,8 +845,8 @@ fn build_system_prompt(config: &AgentConfig) -> String {
         prompt.push_str(
             "## Instructions\n\
              You are in PLAN MODE. Generate a step-by-step plan for the mission. \
-             Do NOT call any tools — just describe your approach in numbered steps. \
-             When done, call the `done` tool with outcome PLAN and the plan as the summary.",
+             Do NOT call any tools. Describe your approach in numbered steps. \
+             Include what tools you would use at each step and what you expect to verify.",
         );
     } else {
         prompt.push_str(
