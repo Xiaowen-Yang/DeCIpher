@@ -840,6 +840,13 @@ fn build_system_prompt(config: &AgentConfig) -> String {
         os = std::env::consts::OS,
     );
 
+    // Inject project instructions (DECIPHER.md) if available.
+    let instructions_section = crate::instructions::format_instructions_section(&config.instructions);
+    if !instructions_section.is_empty() {
+        prompt.push_str(&instructions_section);
+        prompt.push_str("\n\n");
+    }
+
     // Inject memory context if available.
     if let Some(ref mem) = config.memory_context {
         if !mem.is_empty() {

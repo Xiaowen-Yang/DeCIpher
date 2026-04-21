@@ -4,6 +4,7 @@ use decipher_providers::types::Message;
 use serde::{Deserialize, Serialize};
 
 use crate::hooks::HookConfig;
+use crate::instructions::InstructionFiles;
 use crate::skills::Skill;
 
 /// Configuration for a single agent run.
@@ -33,6 +34,8 @@ pub struct AgentConfig {
     pub resume_from: Option<Vec<Message>>,
     /// Loaded skills to inject into the system prompt.
     pub skills: Vec<Skill>,
+    /// Loaded instruction files (DECIPHER.md) for system prompt injection.
+    pub instructions: InstructionFiles,
     /// Memory context string to inject into the system prompt.
     pub memory_context: Option<String>,
     /// If true, agent generates a plan without executing tools.
@@ -65,6 +68,7 @@ impl Default for AgentConfig {
             max_tokens: 8192,
             resume_from: None,
             skills: Vec::new(),
+            instructions: InstructionFiles::default(),
             memory_context: None,
             plan_mode: false,
             hook_config: HookConfig::default(),
