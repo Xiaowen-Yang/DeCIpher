@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use decipher_protocol::{ClientMessage, ServerMessage};
 use decipher_providers::anthropic::AnthropicProvider;
 use decipher_runtime::{AgentConfig, AgentLoop};
+use decipher_session_store::SessionStore;
 use decipher_tui::app::{self, App};
 use decipher_tui::bottom_pane::{self, BottomPane};
 
@@ -157,6 +158,12 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
     let model = cli_cfg.model.clone();
     let base_url = cli_cfg.base_url.clone();
     let policy_mode = cli_cfg.policy_mode;
+
+    // ── Session store ─────────────────────────────────────────────────────────
+    let decipher_home = config::decipher_home();
+    let mut session_store: Option<SessionStore> =
+        SessionStore::new(&decipher_home, &model, &workspace).await.ok();
+    let mut last_outcome: Option<String> = None;
 
     // ── TUI state ─────────────────────────────────────────────────────────────
     let mut app = App::new();
@@ -309,6 +316,14 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                     })?;
                 }
 
+                // Record to session JSONL before msg is consumed.
+                if let Some(ref ss) = session_store {
+                    ss.record(&msg);
+                }
+                if let ServerMessage::MissionComplete { ref outcome, .. } = msg {
+                    last_outcome = Some(outcome.clone());
+                }
+
                 fps.mark_drawn();
                 app.handle_server_message(msg);
                 need_redraw = true;
@@ -369,6 +384,10 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
             // Abort agent task if running.
             if let Some(h) = current_agent_task.take() {
                 h.abort();
+            }
+            // Flush and close the session JSONL.
+            if let Some(ss) = session_store.take() {
+                ss.close(last_outcome.clone()).await;
             }
             let lines = bottom_pane::goodbye_lines();
             let height = lines.len() as u16;

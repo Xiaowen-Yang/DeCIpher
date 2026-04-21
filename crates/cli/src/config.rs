@@ -66,12 +66,19 @@ impl CliConfig {
     }
 }
 
+/// Return the DeCIpher home directory (`$DECIPHER_CONFIG_DIR` or `~/.decipher`).
+pub fn decipher_home() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("DECIPHER_CONFIG_DIR") {
+        return dir.into();
+    }
+    std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".decipher"))
+        .unwrap_or_else(|_| std::path::PathBuf::from(".decipher"))
+}
+
 /// Read `~/.decipher/config.json` if it exists.
 fn read_config_file() -> Option<ConfigFile> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::PathBuf::from(home)
-        .join(".decipher")
-        .join("config.json");
+    let path = decipher_home().join("config.json");
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }

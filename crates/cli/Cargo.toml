@@ -10,12 +10,13 @@ name = "decipher-tui"
 path = "src/main.rs"
 
 [dependencies]
-decipher-protocol  = { workspace = true }
-decipher-tui       = { workspace = true }
-decipher-runtime   = { path = "../runtime" }
-decipher-providers = { path = "../providers" }
-decipher-policy    = { path = "../policy" }
-decipher-clipboard = { workspace = true }
+decipher-protocol      = { workspace = true }
+decipher-tui           = { workspace = true }
+decipher-runtime       = { path = "../runtime" }
+decipher-providers     = { path = "../providers" }
+decipher-policy        = { path = "../policy" }
+decipher-clipboard     = { workspace = true }
+decipher-session-store = { workspace = true }
 crossterm   = { workspace = true }
 tokio       = { workspace = true }
 serde       = { workspace = true }
