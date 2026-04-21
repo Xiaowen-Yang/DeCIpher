@@ -33,6 +33,9 @@ impl MarkdownStreamCollector {
 
     /// Set or update the terminal width.
     pub fn set_width(&mut self, width: u16) {
+        if self.width == Some(width) {
+            return;
+        }
         self.width = Some(width);
     }
 

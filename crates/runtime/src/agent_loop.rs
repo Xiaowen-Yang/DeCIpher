@@ -840,6 +840,18 @@ fn build_system_prompt(config: &AgentConfig) -> String {
         os = std::env::consts::OS,
     );
 
+    // Append git context to Environment section if available.
+    if let Some(ref git) = config.git_context {
+        let git_lines = crate::git_context::format_git_lines(git);
+        // The format! above ends with "Host OS: {os}\n\n". Insert git lines
+        // between the Host OS line and the section-closing blank line.
+        if prompt.ends_with("\n\n") {
+            prompt.truncate(prompt.len() - 1);
+            prompt.push_str(&git_lines);
+            prompt.push_str("\n\n");
+        }
+    }
+
     // Inject project instructions (DECIPHER.md) if available.
     let instructions_section = crate::instructions::format_instructions_section(&config.instructions);
     if !instructions_section.is_empty() {

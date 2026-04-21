@@ -28,6 +28,7 @@
 
 pub mod agent_loop;
 pub mod compaction;
+pub mod git_context;
 pub mod hooks;
 pub mod instructions;
 pub mod output_parser;
@@ -36,6 +37,7 @@ pub mod tools;
 pub mod types;
 
 pub use agent_loop::AgentLoop;
+pub use git_context::{GitContext, collect_git_context, format_git_lines};
 pub use hooks::{HookConfig, fire_session_event};
 pub use instructions::{InstructionFiles, load_instructions, format_instructions_section, generate_template};
 pub use skills::{Skill, format_skills_section, load_skills};

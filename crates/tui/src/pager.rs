@@ -19,7 +19,9 @@ use crate::app::App;
 
 /// Render the pager overlay. Takes over the full terminal.
 pub fn render_pager(o: &mut io::Stdout, app: &mut App) -> io::Result<()> {
-    let (width, height) = terminal::size().unwrap_or((80, 24));
+    // CURSOR-2: use cached width from app state as fallback so the pager
+    // never issues a blocking size query that can time out during active resize.
+    let (width, height) = terminal::size().unwrap_or((app.chat.width(), 24));
     let height = height as usize;
     let width = width as usize;
 

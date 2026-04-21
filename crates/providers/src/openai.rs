@@ -166,11 +166,15 @@ impl OpenAiProvider {
                 .collect()
         });
 
+        let use_completion_tokens =
+            crate::model_quirks::max_tokens_field_name(&request.model) == "max_completion_tokens";
+
         OpenAiRequest {
             model: request.model.clone(),
             messages,
             tools,
-            max_tokens: Some(request.max_tokens),
+            max_tokens: if use_completion_tokens { None } else { Some(request.max_tokens) },
+            max_completion_tokens: if use_completion_tokens { Some(request.max_tokens) } else { None },
             stream: request.stream,
             stream_options: if request.stream {
                 Some(StreamOptions { include_usage: true })
@@ -301,6 +305,8 @@ struct OpenAiRequest {
     tools: Option<Vec<OpenAiToolDef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,

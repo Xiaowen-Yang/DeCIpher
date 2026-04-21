@@ -12,6 +12,7 @@
 
 pub mod anthropic;
 pub mod model_info;
+pub mod model_quirks;
 pub mod openai;
 pub mod retry;
 pub mod types;

@@ -26,9 +26,6 @@ references/
 scenarios/
 tests/
 
-# agent contract docs (tracked separately from product code)
-decipher-agent-docs/
-
 # design docs and task tracking (local only)
 docs/
 

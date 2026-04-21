@@ -3,6 +3,7 @@
 use decipher_providers::types::Message;
 use serde::{Deserialize, Serialize};
 
+use crate::git_context::GitContext;
 use crate::hooks::HookConfig;
 use crate::instructions::InstructionFiles;
 use crate::skills::Skill;
@@ -36,6 +37,8 @@ pub struct AgentConfig {
     pub skills: Vec<Skill>,
     /// Loaded instruction files (DECIPHER.md) for system prompt injection.
     pub instructions: InstructionFiles,
+    /// Git context (branch, HEAD, dirty count) collected at session start.
+    pub git_context: Option<GitContext>,
     /// Memory context string to inject into the system prompt.
     pub memory_context: Option<String>,
     /// If true, agent generates a plan without executing tools.
@@ -69,6 +72,7 @@ impl Default for AgentConfig {
             resume_from: None,
             skills: Vec::new(),
             instructions: InstructionFiles::default(),
+            git_context: None,
             memory_context: None,
             plan_mode: false,
             hook_config: HookConfig::default(),
