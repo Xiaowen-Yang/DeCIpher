@@ -3,6 +3,9 @@
 use decipher_providers::types::Message;
 use serde::{Deserialize, Serialize};
 
+use crate::hooks::HookConfig;
+use crate::skills::Skill;
+
 /// Configuration for a single agent run.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -28,6 +31,18 @@ pub struct AgentConfig {
     /// When `Some`, the agent loop uses this as the initial history instead of
     /// building a fresh first user message from `mission_goal`.
     pub resume_from: Option<Vec<Message>>,
+    /// Loaded skills to inject into the system prompt.
+    pub skills: Vec<Skill>,
+    /// Memory context string to inject into the system prompt.
+    pub memory_context: Option<String>,
+    /// If true, agent generates a plan without executing tools.
+    pub plan_mode: bool,
+    /// Hook configuration (shell hooks that fire around tool calls).
+    pub hook_config: HookConfig,
+    /// MCP tools discovered from connected servers (for injection into tool list).
+    pub mcp_tools: Vec<decipher_mcp::McpTool>,
+    /// Live MCP client connections (shared, one per server).
+    pub mcp_clients: Option<std::sync::Arc<Vec<std::sync::Arc<tokio::sync::Mutex<decipher_mcp::McpClient>>>>>,
 }
 
 impl Default for AgentConfig {
@@ -46,6 +61,12 @@ impl Default for AgentConfig {
             policy_mode: decipher_policy::PolicyMode::Auto,
             max_tokens: 8192,
             resume_from: None,
+            skills: Vec::new(),
+            memory_context: None,
+            plan_mode: false,
+            hook_config: HookConfig::default(),
+            mcp_tools: Vec::new(),
+            mcp_clients: None,
         }
     }
 }

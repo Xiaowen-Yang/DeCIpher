@@ -17,6 +17,7 @@ decipher-providers     = { path = "../providers" }
 decipher-policy        = { path = "../policy" }
 decipher-clipboard     = { workspace = true }
 decipher-session-store = { workspace = true }
+decipher-mcp           = { workspace = true }
 crossterm   = { workspace = true }
 tokio       = { workspace = true }
 serde       = { workspace = true }

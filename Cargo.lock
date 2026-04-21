@@ -59,6 +59,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-recursion"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -301,6 +312,7 @@ version = "0.1.5"
 dependencies = [
  "crossterm",
  "decipher-clipboard",
+ "decipher-mcp",
  "decipher-policy",
  "decipher-protocol",
  "decipher-providers",
@@ -332,6 +344,18 @@ dependencies = [
  "crossterm",
  "pulldown-cmark",
  "syntect",
+]
+
+[[package]]
+name = "decipher-mcp"
+version = "0.1.5"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -379,7 +403,9 @@ dependencies = [
 name = "decipher-runtime"
 version = "0.1.5"
 dependencies = [
+ "async-recursion",
  "async-trait",
+ "decipher-mcp",
  "decipher-mock-provider",
  "decipher-policy",
  "decipher-protocol",
@@ -2075,8 +2101,12 @@ checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
+ "futures-util",
+ "hashbrown 0.15.5",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 

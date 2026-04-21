@@ -197,6 +197,22 @@ pub enum ServerMessage {
         output: String,
         success: bool,
     },
+
+    /// A subagent has started for a sub-mission.
+    #[serde(rename = "subagent_start")]
+    SubagentStart {
+        task: String,
+        depth: u8,
+    },
+
+    /// A subagent has completed its sub-mission.
+    #[serde(rename = "subagent_complete")]
+    SubagentComplete {
+        task: String,
+        outcome: String,
+        summary: String,
+        depth: u8,
+    },
 }
 
 /// A single file modification entry in a FilesModified event.

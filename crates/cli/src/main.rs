@@ -36,8 +36,9 @@ use tokio::sync::mpsc;
 
 use decipher_protocol::{ClientMessage, ServerMessage};
 use decipher_providers::anthropic::AnthropicProvider;
-use decipher_runtime::{AgentConfig, AgentLoop};
-use decipher_session_store::{load_session, list_sessions, SessionStore};
+use decipher_mcp::{McpConfig, McpClient};
+use decipher_runtime::{AgentConfig, AgentLoop, HookConfig, load_skills};
+use decipher_session_store::{load_session, list_sessions, MemoryStore, SessionStore};
 use decipher_tui::app::{self, App};
 use decipher_tui::bottom_pane::{self, BottomPane};
 
@@ -166,14 +167,22 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
     let base_url = cli_cfg.base_url.clone();
     let policy_mode = cli_cfg.policy_mode;
 
+    // ── MCP client initialization ─────────────────────────────────────────────
+    let decipher_home = config::decipher_home();
+    let (mcp_tools, mcp_clients_arc) = init_mcp_clients(&decipher_home).await;
+
     // ── Session store ─────────────────────────────────────────────────────────
     // No Drop impl on SessionStore: session_end is intentionally best-effort —
     // a crash will leave the JSONL without a final record, which is acceptable.
-    let decipher_home = config::decipher_home();
     // Session store is created per-mission (when UserInput is submitted) so that
     // mission_goal is known at creation time.
     let mut session_store: Option<SessionStore> = None;
     let mut last_outcome: Option<String> = None;
+
+    // ── Plan mode state ────────────────────────────────────────────────────────
+    // When Some, we received a PLAN MissionComplete and are waiting for yes/no.
+    let plan_mode_flag = cli_cfg.plan_mode_flag;
+    let mut pending_plan_execution: Option<AgentConfig> = None;
 
     // ── TUI state ─────────────────────────────────────────────────────────────
     let mut app = App::new();
@@ -187,6 +196,49 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
     let actual_width = terminal.size()?.width;
     if actual_width != app.chat.width() {
         app.chat.set_width(actual_width);
+    }
+
+    // ── Startup banner ───────────────────────────────────────────────────────
+    // Render the banner immediately at TUI startup, not via AgentLoop event.
+    // AgentLoop is only spawned when the user submits input, so waiting for
+    // a Banner ServerMessage would leave the screen empty.
+    {
+        let version = env!("CARGO_PKG_VERSION");
+        let provider = if cli_cfg.base_url.is_some() { "custom" } else { "anthropic" };
+        let api_key_set = !cli_cfg.api_key.is_empty();
+        let directory = std::env::current_dir()
+            .map(|p| {
+                if let Ok(home) = std::env::var("HOME") {
+                    if let Ok(rel) = p.strip_prefix(&home) {
+                        return format!("~/{}", rel.display());
+                    }
+                }
+                p.display().to_string()
+            })
+            .unwrap_or_else(|_| ".".into());
+
+        let mut stdout = io::stdout();
+        let _ = decipher_tui::render::set_terminal_title(
+            &mut stdout,
+            &format!("DeCIpher \u{2014} {}", model),
+        );
+
+        let banner = bottom_pane::banner_lines(version, provider, &model, &directory, api_key_set);
+        if !banner.is_empty() {
+            let h = banner.len() as u16;
+            terminal.insert_before(h, |buf| {
+                bottom_pane::render_lines_to_buffer(buf, &banner);
+            })?;
+        }
+
+        // Also set banner info in app state for status bar display.
+        app.banner = Some(app::BannerInfo {
+            version: version.to_string(),
+            provider: provider.to_string(),
+            model: model.clone(),
+            directory: directory.clone(),
+            api_key_set,
+        });
     }
 
     loop {
@@ -235,7 +287,163 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                                         }
 
                                         let text_trimmed = text.trim();
-                                        if text_trimmed == "/sessions"
+                                        if text_trimmed == "/mcp"
+                                            || text_trimmed.starts_with("/mcp ")
+                                        {
+                                            // ── /mcp ──────────────────────────────────────────
+                                            let cfg = McpConfig::load(&decipher_home);
+                                            let text = if cfg.servers.is_empty() {
+                                                "No MCP servers configured. Add servers to ~/.decipher/mcp.json".to_string()
+                                            } else {
+                                                let mut lines = format!("Configured MCP servers ({}):\n", cfg.servers.len());
+                                                for s in &cfg.servers {
+                                                    let tool_count = mcp_tools.iter()
+                                                        .filter(|t| t.server_name == s.name)
+                                                        .count();
+                                                    lines.push_str(&format!(
+                                                        "  {} — {} {} tool{}\n",
+                                                        s.name, s.command,
+                                                        tool_count,
+                                                        if tool_count == 1 { "" } else { "s" }
+                                                    ));
+                                                }
+                                                if !mcp_tools.is_empty() {
+                                                    lines.push_str("\nAvailable tools:\n");
+                                                    for t in &mcp_tools {
+                                                        lines.push_str(&format!("  [{}] {}", t.server_name, t.name));
+                                                        if !t.description.is_empty() {
+                                                            lines.push_str(&format!(" — {}", t.description));
+                                                        }
+                                                        lines.push('\n');
+                                                    }
+                                                }
+                                                lines.trim_end().to_string()
+                                            };
+                                            let _ = event_tx.try_send(ServerMessage::AgentMessage { text });
+                                        } else if text_trimmed == "/hooks"
+                                            || text_trimmed.starts_with("/hooks ")
+                                        {
+                                            // ── /hooks ────────────────────────────────────────
+                                            let hc = HookConfig::load(&decipher_home);
+                                            let total = hc.pre_tool_use.len()
+                                                + hc.post_tool_use.len()
+                                                + hc.session_start.len()
+                                                + hc.session_end.len();
+                                            let text = if total == 0 {
+                                                "No hooks configured. Add hooks.json to ~/.decipher/".to_string()
+                                            } else {
+                                                let mut lines = String::from("Configured hooks:\n");
+                                                if !hc.pre_tool_use.is_empty() {
+                                                    lines.push_str(&format!("  PreToolUse ({}):\n", hc.pre_tool_use.len()));
+                                                    for h in &hc.pre_tool_use { lines.push_str(&format!("    {}\n", h.command)); }
+                                                }
+                                                if !hc.post_tool_use.is_empty() {
+                                                    lines.push_str(&format!("  PostToolUse ({}):\n", hc.post_tool_use.len()));
+                                                    for h in &hc.post_tool_use { lines.push_str(&format!("    {}\n", h.command)); }
+                                                }
+                                                if !hc.session_start.is_empty() {
+                                                    lines.push_str(&format!("  SessionStart ({}):\n", hc.session_start.len()));
+                                                    for h in &hc.session_start { lines.push_str(&format!("    {}\n", h.command)); }
+                                                }
+                                                if !hc.session_end.is_empty() {
+                                                    lines.push_str(&format!("  SessionEnd ({}):\n", hc.session_end.len()));
+                                                    for h in &hc.session_end { lines.push_str(&format!("    {}\n", h.command)); }
+                                                }
+                                                lines.trim_end().to_string()
+                                            };
+                                            let _ = event_tx.try_send(ServerMessage::AgentMessage { text });
+                                        } else if text_trimmed == "/skills"
+                                            || text_trimmed.starts_with("/skills ")
+                                        {
+                                            // ── /skills ───────────────────────────────────────
+                                            let loaded = load_skills(
+                                                &decipher_home,
+                                                std::path::Path::new(&workspace),
+                                            );
+                                            let text = if loaded.is_empty() {
+                                                "No skills loaded. Add SKILL.md files to ~/.decipher/skills/<name>/ or .decipher/skills/<name>/.".to_string()
+                                            } else {
+                                                let mut lines = format!("Loaded skills ({}):\n", loaded.len());
+                                                for s in &loaded {
+                                                    if s.description.is_empty() {
+                                                        lines.push_str(&format!("  {}\n", s.name));
+                                                    } else {
+                                                        lines.push_str(&format!("  {} — {}\n", s.name, s.description));
+                                                    }
+                                                }
+                                                lines.trim_end().to_string()
+                                            };
+                                            let _ = event_tx.try_send(ServerMessage::AgentMessage { text });
+                                        } else if text_trimmed == "/memory"
+                                            || text_trimmed.starts_with("/memory ")
+                                        {
+                                            // ── /memory [list|add <text>|clear] ──────────────
+                                            let sub = text_trimmed["/memory".len()..].trim();
+                                            match MemoryStore::new(&decipher_home, &workspace) {
+                                                Err(e) => {
+                                                    let _ = event_tx.try_send(ServerMessage::Error {
+                                                        message: format!("memory: {e}"),
+                                                    });
+                                                }
+                                                Ok(mem_store) => {
+                                                    if sub.is_empty() || sub == "list" {
+                                                        match mem_store.list() {
+                                                            Ok(entries) if entries.is_empty() => {
+                                                                let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                                    text: "No memories stored. Use /memory add <text> to add one.".into(),
+                                                                });
+                                                            }
+                                                            Ok(entries) => {
+                                                                let mut lines = format!("Stored memories ({}):\n", entries.len());
+                                                                for e in &entries {
+                                                                    let short = &e.id[..e.id.len().min(8)];
+                                                                    lines.push_str(&format!("  [{short}] {}\n", e.content));
+                                                                }
+                                                                let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                                    text: lines.trim_end().to_string(),
+                                                                });
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = event_tx.try_send(ServerMessage::Error {
+                                                                    message: format!("memory list: {e}"),
+                                                                });
+                                                            }
+                                                        }
+                                                    } else if let Some(content) = sub.strip_prefix("add ") {
+                                                        match mem_store.add(content.trim()) {
+                                                            Ok(id) => {
+                                                                let short = &id[..id.len().min(8)];
+                                                                let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                                    text: format!("Memory saved [{short}]: {}", content.trim()),
+                                                                });
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = event_tx.try_send(ServerMessage::Error {
+                                                                    message: format!("memory add: {e}"),
+                                                                });
+                                                            }
+                                                        }
+                                                    } else if sub == "clear" {
+                                                        match mem_store.clear() {
+                                                            Ok(()) => {
+                                                                let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                                    text: "All memories cleared.".into(),
+                                                                });
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = event_tx.try_send(ServerMessage::Error {
+                                                                    message: format!("memory clear: {e}"),
+                                                                });
+                                                            }
+                                                        }
+                                                    } else {
+                                                        let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                            text: "Usage: /memory [list|add <text>|clear]".into(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        } else if text_trimmed == "/sessions"
                                             || text_trimmed.starts_with("/sessions ")
                                         {
                                             // ── /sessions ─────────────────────────────────────
@@ -345,6 +553,22 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                                                     }
                                                 },
                                             }
+                                        } else if let Some(exec_cfg) = pending_plan_execution.take() {
+                                            // ── Plan approval: yes/no ─────────────────────────
+                                            let answer = text_trimmed.to_lowercase();
+                                            if answer == "yes" || answer == "y" {
+                                                let (atx, arx) = mpsc::channel::<bool>(1);
+                                                current_approval_tx = Some(atx);
+                                                let tx = event_tx.clone();
+                                                let prov = provider.clone();
+                                                current_agent_task = Some(tokio::spawn(async move {
+                                                    let _ = AgentLoop::run(exec_cfg, &*prov, tx, Some(arx)).await;
+                                                }));
+                                            } else {
+                                                let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                                                    text: "Plan cancelled.".into(),
+                                                });
+                                            }
                                         } else {
                                             // ── Normal mission ───────────────────────────────
                                             // Close previous session; open one for this mission.
@@ -358,14 +582,22 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
 
                                             let (atx, arx) = mpsc::channel::<bool>(1);
                                             current_approval_tx = Some(atx);
-                                            let agent_cfg = build_agent_config(
+                                            let mut agent_cfg = build_agent_config(
                                                 text.clone(),
                                                 api_key.clone(),
                                                 model.clone(),
                                                 base_url.clone(),
                                                 workspace.clone(),
                                                 policy_mode,
+                                                &decipher_home,
+                                                None,
+                                                mcp_tools.clone(),
+                                                mcp_clients_arc.clone(),
                                             );
+                                            // Apply plan mode flag if set.
+                                            if plan_mode_flag {
+                                                agent_cfg.plan_mode = true;
+                                            }
                                             let tx = event_tx.clone();
                                             let prov = provider.clone();
                                             current_agent_task = Some(tokio::spawn(async move {
@@ -455,6 +687,36 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                     last_outcome = Some(outcome.clone());
                 }
 
+                // Handle PLAN outcome: save the execution config, prompt yes/no.
+                if let ServerMessage::MissionComplete { ref outcome, ref summary, .. } = msg {
+                    if outcome == "PLAN" && plan_mode_flag {
+                        // Build the execution config (plan_mode = false this time).
+                        let exec_cfg = build_agent_config(
+                            app.last_submitted.clone(),
+                            api_key.clone(),
+                            model.clone(),
+                            base_url.clone(),
+                            workspace.clone(),
+                            policy_mode,
+                            &decipher_home,
+                            None,
+                            mcp_tools.clone(),
+                            mcp_clients_arc.clone(),
+                        );
+                        pending_plan_execution = Some(exec_cfg);
+                        // Show the plan as an AgentMessage.
+                        let plan_display = format!(
+                            "{summary}\n\nPlan ready. Type 'yes' to execute, 'no' to cancel."
+                        );
+                        let _ = event_tx.try_send(ServerMessage::AgentMessage {
+                            text: plan_display,
+                        });
+                        need_redraw = true;
+                        // Don't forward the raw MissionComplete to TUI cells.
+                        continue;
+                    }
+                }
+
                 fps.mark_drawn();
                 app.handle_server_message(msg);
                 need_redraw = true;
@@ -510,6 +772,10 @@ async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
                         base_url.clone(),
                         workspace.clone(),
                         policy_mode,
+                        &decipher_home,
+                        None,
+                        mcp_tools.clone(),
+                        mcp_clients_arc.clone(),
                     );
                     let tx = event_tx.clone();
                     let prov = provider.clone();
@@ -594,6 +860,8 @@ async fn run_exec_mode(args: &[String], cli_cfg: config::CliConfig) -> i32 {
     // ── Run agent ─────────────────────────────────────────────────────────────
     let (event_tx, mut event_rx) = mpsc::channel::<ServerMessage>(128);
 
+    let decipher_home = config::decipher_home();
+    let (exec_mcp_tools, exec_mcp_clients) = init_mcp_clients(&decipher_home).await;
     let agent_cfg = build_agent_config(
         task.clone(),
         cli_cfg.api_key.clone(),
@@ -601,6 +869,10 @@ async fn run_exec_mode(args: &[String], cli_cfg: config::CliConfig) -> i32 {
         cli_cfg.base_url.clone(),
         cli_cfg.workspace.clone(),
         cli_cfg.policy_mode,
+        &decipher_home,
+        None,
+        exec_mcp_tools,
+        exec_mcp_clients,
     );
 
     let prov = provider.clone();
@@ -664,6 +936,7 @@ async fn run_exec_mode(args: &[String], cli_cfg: config::CliConfig) -> i32 {
 }
 
 /// Build an `AgentConfig` for a single mission run.
+#[allow(clippy::too_many_arguments)]
 fn build_agent_config(
     goal: String,
     api_key: String,
@@ -671,7 +944,20 @@ fn build_agent_config(
     base_url: Option<String>,
     workspace: String,
     policy_mode: decipher_policy::PolicyMode,
+    decipher_home: &std::path::Path,
+    memory_context: Option<String>,
+    mcp_tools: Vec<decipher_mcp::McpTool>,
+    mcp_clients: Option<std::sync::Arc<Vec<std::sync::Arc<tokio::sync::Mutex<McpClient>>>>>,
 ) -> AgentConfig {
+    let skills = load_skills(decipher_home, std::path::Path::new(&workspace));
+    let hook_config = HookConfig::load(decipher_home);
+    // Load memory context if not explicitly provided.
+    let memory_context = memory_context.or_else(|| {
+        MemoryStore::new(decipher_home, &workspace)
+            .ok()
+            .and_then(|m| m.load_all_for_injection().ok())
+            .filter(|s| !s.is_empty())
+    });
     AgentConfig {
         model,
         api_key,
@@ -679,6 +965,11 @@ fn build_agent_config(
         workspace,
         mission_goal: goal,
         policy_mode,
+        skills,
+        memory_context,
+        hook_config,
+        mcp_tools,
+        mcp_clients,
         ..Default::default()
     }
 }
@@ -1062,5 +1353,44 @@ fn open_editor(initial_text: &str) -> Option<String> {
             let _ = fs::remove_file(&tmp_path);
             None
         }
+    }
+}
+
+/// Initialize MCP clients from `~/.decipher/mcp.json`.
+///
+/// Returns the list of discovered tools and an Arc-wrapped client list.
+/// Servers that fail to connect are silently skipped.
+async fn init_mcp_clients(
+    decipher_home: &std::path::Path,
+) -> (
+    Vec<decipher_mcp::McpTool>,
+    Option<std::sync::Arc<Vec<std::sync::Arc<tokio::sync::Mutex<McpClient>>>>>,
+) {
+    let cfg = McpConfig::load(decipher_home);
+    if cfg.servers.is_empty() {
+        return (Vec::new(), None);
+    }
+
+    let mut all_tools: Vec<decipher_mcp::McpTool> = Vec::new();
+    let mut clients: Vec<std::sync::Arc<tokio::sync::Mutex<McpClient>>> = Vec::new();
+
+    for server_cfg in &cfg.servers {
+        match McpClient::connect(server_cfg).await {
+            Ok(mut client) => {
+                let tools = client.list_tools().await.unwrap_or_default();
+                all_tools.extend(tools);
+                clients.push(std::sync::Arc::new(tokio::sync::Mutex::new(client)));
+            }
+            Err(_) => {
+                // Server unavailable — skip silently (mcp.json may reference
+                // servers not installed in the current environment).
+            }
+        }
+    }
+
+    if clients.is_empty() {
+        (all_tools, None)
+    } else {
+        (all_tools, Some(std::sync::Arc::new(clients)))
     }
 }

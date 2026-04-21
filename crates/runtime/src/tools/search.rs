@@ -298,6 +298,12 @@ mod tests {
         ToolContext {
             workspace: std::env::temp_dir().to_string_lossy().to_string(),
             on_exec_output: None,
+            mcp_clients: None,
+            api_key: String::new(),
+            model: String::new(),
+            base_url: None,
+            event_tx: None,
+            depth: 0,
         }
     }
 
@@ -321,6 +327,12 @@ mod tests {
         let ctx = ToolContext {
             workspace: dir.path().to_string_lossy().to_string(),
             on_exec_output: None,
+            mcp_clients: None,
+            api_key: String::new(),
+            model: String::new(),
+            base_url: None,
+            event_tx: None,
+            depth: 0,
         };
         let args = serde_json::json!({
             "pattern": "*.txt",
@@ -340,6 +352,12 @@ mod tests {
         let ctx = ToolContext {
             workspace: dir.path().to_string_lossy().to_string(),
             on_exec_output: None,
+            mcp_clients: None,
+            api_key: String::new(),
+            model: String::new(),
+            base_url: None,
+            event_tx: None,
+            depth: 0,
         };
         let args = serde_json::json!({
             "pattern": "hello_world",

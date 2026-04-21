@@ -385,6 +385,12 @@ impl App {
                 }
                 let _ = completion_tokens;
             }
+            ServerMessage::SubagentStart { .. } => {
+                // Subagent events are rendered in chat.rs; no state change needed here.
+            }
+            ServerMessage::SubagentComplete { .. } => {
+                // Subagent events are rendered in chat.rs; no state change needed here.
+            }
         }
         self.scroll_offset = 0;
     }

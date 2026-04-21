@@ -28,9 +28,13 @@
 
 pub mod agent_loop;
 pub mod compaction;
+pub mod hooks;
 pub mod output_parser;
+pub mod skills;
 pub mod tools;
 pub mod types;
 
 pub use agent_loop::AgentLoop;
+pub use hooks::{HookConfig, fire_session_event};
+pub use skills::{Skill, format_skills_section, load_skills};
 pub use types::{AgentConfig, RunOutcome, RunResult, RuntimeError};

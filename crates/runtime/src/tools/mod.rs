@@ -11,6 +11,9 @@ pub mod exec;
 pub mod files;
 pub mod patch;
 pub mod search;
+pub mod subagent;
+
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -21,6 +24,18 @@ pub struct ToolContext {
     pub workspace: String,
     /// Optional callback receiving live output chunks from exec_command.
     pub on_exec_output: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// MCP clients — shared, each protected by a tokio Mutex.
+    pub mcp_clients: Option<Arc<Vec<Arc<tokio::sync::Mutex<decipher_mcp::McpClient>>>>>,
+    /// API key — needed for spawning subagents.
+    pub api_key: String,
+    /// Model name — needed for spawning subagents.
+    pub model: String,
+    /// Base URL override for API calls.
+    pub base_url: Option<String>,
+    /// Event channel — for forwarding subagent events to parent TUI.
+    pub event_tx: Option<tokio::sync::mpsc::Sender<decipher_protocol::ServerMessage>>,
+    /// Nesting depth: 0 = top-level agent, 1 = subagent, etc.
+    pub depth: u8,
 }
 
 /// Result from a single tool invocation.
@@ -100,12 +115,41 @@ pub async fn dispatch(
             // If it reaches here something is wrong — return a stub.
             Ok(ToolOutput::ok("Done", "[Tool result: done]\nMission complete."))
         }
-        unknown => Ok(ToolOutput::err(
-            format!("Unknown tool: {unknown}"),
-            format!(
-                "Error: Unknown tool \"{unknown}\". Available: exec_command, read_file, write_file, apply_patch, list_files, search, grep_search, file_search, done"
-            ),
-        )),
+        "spawn_agent" => subagent::spawn_agent(args, ctx).await,
+        unknown => {
+            // Try MCP clients if available.
+            if let Some(ref mcp_clients) = ctx.mcp_clients {
+                for client_arc in mcp_clients.as_ref() {
+                    let mut client = client_arc.lock().await;
+                    match client.call_tool(unknown, args.clone()).await {
+                        Ok(result) => {
+                            return Ok(ToolOutput::ok(
+                                format!("mcp:{}", client.server_name),
+                                format!("[Tool result: {unknown}]\n{result}"),
+                            ));
+                        }
+                        Err(decipher_mcp::McpError::Protocol(_))
+                        | Err(decipher_mcp::McpError::Rpc { .. }) => {
+                            // This server doesn't have the tool — try next.
+                            continue;
+                        }
+                        Err(e) => {
+                            return Ok(ToolOutput::err(
+                                format!("MCP error: {e}"),
+                                format!("Error calling MCP tool \"{unknown}\": {e}"),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            Ok(ToolOutput::err(
+                format!("Unknown tool: {unknown}"),
+                format!(
+                    "Error: Unknown tool \"{unknown}\". Available: exec_command, read_file, write_file, apply_patch, list_files, search, grep_search, file_search, done"
+                ),
+            ))
+        }
     }
 }
 
@@ -142,6 +186,12 @@ mod tests {
         let ctx = ToolContext {
             workspace: "/tmp".to_string(),
             on_exec_output: None,
+            mcp_clients: None,
+            api_key: String::new(),
+            model: String::new(),
+            base_url: None,
+            event_tx: None,
+            depth: 0,
         };
         let out = dispatch("nonexistent_tool", &serde_json::json!({}), &ctx)
             .await

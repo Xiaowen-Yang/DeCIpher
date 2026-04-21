@@ -610,6 +610,28 @@ impl ChatWidget {
                 lines
             }
 
+            // Subagent lifecycle events — rendered as AgentMessageCells.
+            ServerMessage::SubagentStart { task, depth } => {
+                let mut lines = self.flush_and_emit();
+                let label = format!("[{} Subagent@{depth}] {task}", '\u{2193}');
+                let cell = AgentMessageCell::from_text(&label);
+                lines.extend(cell.display_lines(w));
+                self.committed_cells.push(Box::new(cell));
+                lines
+            }
+            ServerMessage::SubagentComplete { task, outcome, summary, depth } => {
+                let mut lines = self.flush_and_emit();
+                let label = format!(
+                    "[{} Subagent@{depth} {outcome}] {task}: {}",
+                    '\u{2191}',
+                    summary.chars().take(80).collect::<String>()
+                );
+                let cell = AgentMessageCell::from_text(&label);
+                lines.extend(cell.display_lines(w));
+                self.committed_cells.push(Box::new(cell));
+                lines
+            }
+
             // Non-visual messages — no cells, no scrollback
             ServerMessage::Spinner { .. } => Vec::new(),
             ServerMessage::CommandList { .. } => Vec::new(),

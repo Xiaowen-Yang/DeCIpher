@@ -307,6 +307,12 @@ mod tests {
         ToolContext {
             workspace: std::env::temp_dir().to_string_lossy().to_string(),
             on_exec_output: None,
+            mcp_clients: None,
+            api_key: String::new(),
+            model: String::new(),
+            base_url: None,
+            event_tx: None,
+            depth: 0,
         }
     }
 

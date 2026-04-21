@@ -22,6 +22,8 @@ pub fn tool_class(name: ToolName) -> ToolClass {
         | ToolName::KubectlEvents
         | ToolName::UpdatePlan
         | ToolName::Done => ToolClass::Read,
+        // spawn_agent is write-class: it can modify files via its subagent.
+        ToolName::SpawnAgent => ToolClass::Write,
     }
 }
 
@@ -100,5 +102,18 @@ mod tests {
         assert!(!is_read_only_by_name("write_file"));
         // Unknown tools are not read-only (safe default)
         assert!(!is_read_only_by_name("unknown_tool"));
+    }
+
+    #[test]
+    fn spawn_agent_is_write_class() {
+        assert_eq!(tool_class(ToolName::SpawnAgent), ToolClass::Write);
+        assert!(is_write(ToolName::SpawnAgent));
+        assert!(!is_read_only(ToolName::SpawnAgent));
+        assert!(!is_exec(ToolName::SpawnAgent));
+    }
+
+    #[test]
+    fn spawn_agent_is_not_read_only_by_name() {
+        assert!(!is_read_only_by_name("spawn_agent"));
     }
 }

@@ -13,10 +13,12 @@ mod error;
 mod event;
 mod index;
 pub mod load;
+pub mod memory;
 mod store;
 
 pub use error::StoreError;
 pub use event::{SessionIndexEntry, SessionMeta};
 pub use index::list_sessions;
 pub use load::load_session;
+pub use memory::{MemoryEntry, MemoryStore};
 pub use store::SessionStore;

@@ -30,6 +30,8 @@ pub enum ToolName {
     // ── Internal / meta ─────────────────────────────────────
     UpdatePlan,
     Done,
+    // ── Subagents ────────────────────────────────────────────
+    SpawnAgent,
 }
 
 impl ToolName {
@@ -50,6 +52,7 @@ impl ToolName {
             Self::KubectlEvents => "kubectl_events",
             Self::UpdatePlan => "update_plan",
             Self::Done => "done",
+            Self::SpawnAgent => "spawn_agent",
         }
     }
 
@@ -70,6 +73,7 @@ impl ToolName {
             "kubectl_events" => Some(Self::KubectlEvents),
             "update_plan" => Some(Self::UpdatePlan),
             "done" => Some(Self::Done),
+            "spawn_agent" => Some(Self::SpawnAgent),
             _ => None,
         }
     }
@@ -93,6 +97,7 @@ impl ToolName {
             Self::KubectlEvents,
             Self::UpdatePlan,
             Self::Done,
+            Self::SpawnAgent,
         ]
     }
 
@@ -407,6 +412,32 @@ impl ToolName {
                         }
                     },
                     "required": ["summary", "outcome"]
+                }),
+            },
+
+            Self::SpawnAgent => ToolSpec {
+                name: self.as_str(),
+                description: "Spawn a subagent to handle a parallel or focused subtask. \
+                    The subagent runs to completion and returns its result. \
+                    Use for isolated sub-missions that do not depend on in-flight work.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "The mission goal for the subagent"
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": "Optional working directory override (default: current workspace)"
+                        },
+                        "max_turns": {
+                            "type": "integer",
+                            "description": "Maximum turns for the subagent (default: 20)",
+                            "default": 20
+                        }
+                    },
+                    "required": ["task"]
                 }),
             },
         }

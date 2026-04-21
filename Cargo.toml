@@ -11,6 +11,7 @@ members = [
     "crates/tools",
     "crates/runtime",
     "crates/session-store",
+    "crates/mcp",
 ]
 resolver = "2"
 
@@ -31,6 +32,7 @@ decipher-policy = { path = "crates/policy" }
 decipher-tools = { path = "crates/tools" }
 decipher-runtime = { path = "crates/runtime" }
 decipher-session-store = { path = "crates/session-store" }
+decipher-mcp           = { path = "crates/mcp" }
 
 # External
 crossterm = { version = "0.28", features = ["bracketed-paste", "event-stream"] }
@@ -49,6 +51,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
 thiserror = "2"
 async-trait = "0.1"
+async-recursion = "1"
 tokio-util = { version = "0.7", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }

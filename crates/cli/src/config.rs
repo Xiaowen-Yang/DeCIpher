@@ -21,6 +21,8 @@ pub struct CliConfig {
     /// Working directory — defaults to `$PWD`.
     pub workspace: String,
     pub policy_mode: PolicyMode,
+    /// If true, start in plan mode (generate plan before executing).
+    pub plan_mode_flag: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -62,7 +64,10 @@ impl CliConfig {
             .to_string_lossy()
             .to_string();
 
-        Self { api_key, model, base_url, workspace, policy_mode }
+        // --plan flag from CLI args.
+        let plan_mode_flag = std::env::args().any(|a| a == "--plan");
+
+        Self { api_key, model, base_url, workspace, policy_mode, plan_mode_flag }
     }
 }
 

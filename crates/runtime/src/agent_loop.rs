@@ -16,6 +16,7 @@
 
 use std::time::Instant;
 
+use async_recursion::async_recursion;
 use decipher_policy::{Decision, PermissionAmendments, evaluate_policy, record_approval};
 use decipher_protocol::ServerMessage;
 use decipher_providers::{
@@ -33,6 +34,8 @@ use tokio::sync::mpsc;
 use crate::{
     RuntimeError,
     compaction::{compact_messages, should_compact},
+    hooks::{HookConfig, fire_post_tool_use, fire_pre_tool_use, fire_session_event},
+    skills::format_skills_section,
     tools::{ToolContext, dispatch},
     types::{AgentConfig, RunOutcome, RunResult},
 };
@@ -51,6 +54,10 @@ impl AgentLoop {
     /// - `provider`: LLM provider (Anthropic or mock)
     /// - `event_tx`: channel for emitting `ServerMessage` events to the TUI
     /// - `approval_rx`: optional channel for receiving approval decisions
+    ///
+    /// This function is indirectly recursive via spawn_agent → AgentLoop::run.
+    /// The `#[async_recursion]` attribute boxes the future to break the cycle.
+    #[async_recursion]
     pub async fn run(
         config: AgentConfig,
         provider: &dyn Provider,
@@ -60,6 +67,12 @@ impl AgentLoop {
         let start = Instant::now();
         let model_info = provider.model_info();
         let context_window = model_info.context_window;
+
+        // Generate a session identifier for hooks.
+        let session_id = format!("session-{}", start.elapsed().subsec_nanos());
+
+        // Fire session start hooks.
+        fire_session_event(&config.hook_config.session_start).await;
 
         // Announce the run.
         let _ = event_tx
@@ -73,14 +86,32 @@ impl AgentLoop {
             .await;
 
         // Build tool definitions for the LLM.
-        let tools: Vec<ToolDefinition> = all_tool_specs()
-            .into_iter()
-            .map(|s| ToolDefinition {
-                name: s.name.to_string(),
-                description: Some(s.description.to_string()),
-                input_schema: Some(s.input_schema),
-            })
-            .collect();
+        // In plan_mode, no tools are provided so the LLM generates text only.
+        let tools: Vec<ToolDefinition> = if config.plan_mode {
+            Vec::new()
+        } else {
+            let mut tool_defs: Vec<ToolDefinition> = all_tool_specs()
+                .into_iter()
+                .map(|s| ToolDefinition {
+                    name: s.name.to_string(),
+                    description: Some(s.description.to_string()),
+                    input_schema: Some(s.input_schema),
+                })
+                .collect();
+            // Merge MCP tools (prefixed with server name to avoid collisions).
+            for mcp_tool in &config.mcp_tools {
+                tool_defs.push(ToolDefinition {
+                    name: mcp_tool.name.clone(),
+                    description: if mcp_tool.description.is_empty() {
+                        None
+                    } else {
+                        Some(format!("[MCP:{}] {}", mcp_tool.server_name, mcp_tool.description))
+                    },
+                    input_schema: Some(mcp_tool.input_schema.clone()),
+                });
+            }
+            tool_defs
+        };
 
         // Build the initial message history (or restore from a resumed session).
         let system_prompt = build_system_prompt(&config);
@@ -97,6 +128,12 @@ impl AgentLoop {
         let tool_ctx = ToolContext {
             workspace: config.workspace.clone(),
             on_exec_output: None,
+            mcp_clients: config.mcp_clients.clone(),
+            api_key: config.api_key.clone(),
+            model: config.model.clone(),
+            base_url: config.base_url.clone(),
+            event_tx: Some(event_tx.clone()),
+            depth: 0,
         };
 
         let mut outcome = RunOutcome::Fail;
@@ -125,7 +162,7 @@ impl AgentLoop {
             let request = MessageRequest {
                 model: config.model.clone(),
                 messages: messages.clone(),
-                tools: Some(tools.clone()),
+                tools: if config.plan_mode { None } else { Some(tools.clone()) },
                 max_tokens: config.max_tokens,
                 stream: true,
                 system: Some(system_prompt.clone()),
@@ -165,6 +202,28 @@ impl AgentLoop {
                 .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
 
             if !has_tools {
+                // In plan_mode, a text-only response IS the expected output.
+                if config.plan_mode {
+                    let plan_text =
+                        first_text(&collected.content).unwrap_or_else(|| "(no plan generated)".to_string());
+                    outcome = RunOutcome::Fail; // placeholder — CLI overrides for PLAN
+                    final_summary = plan_text.clone();
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    let _ = event_tx
+                        .send(ServerMessage::MissionComplete {
+                            outcome: "PLAN".to_string(),
+                            summary: plan_text,
+                            turns: turns_completed,
+                            elapsed_ms: elapsed,
+                            urls: Vec::new(),
+                            files_modified: Vec::new(),
+                            errors_encountered: Vec::new(),
+                            next_steps: Vec::new(),
+                        })
+                        .await;
+                    break;
+                }
+
                 consecutive_no_tools += 1;
                 if consecutive_no_tools >= MAX_NO_TOOL_CALLS {
                     final_summary = format!(
@@ -296,8 +355,10 @@ impl AgentLoop {
                         let input = t.input.clone();
                         let ctx = tool_ctx.clone();
                         let tx = event_tx.clone();
+                        let hc = config.hook_config.clone();
+                        let sid = session_id.clone();
                         async move {
-                            execute_tool_and_emit(&name, &id, &input, &ctx, &tx, start).await
+                            execute_tool_and_emit(&name, &id, &input, &ctx, &tx, start, &hc, &sid).await
                         }
                     });
                     let results = futures::future::join_all(futs).await;
@@ -369,6 +430,8 @@ impl AgentLoop {
                                 &tool_ctx,
                                 &event_tx,
                                 start,
+                                &config.hook_config,
+                                &session_id,
                             )
                             .await?;
                             tool_result_blocks.push(result_block);
@@ -385,6 +448,8 @@ impl AgentLoop {
                                 &tool_ctx,
                                 &event_tx,
                                 start,
+                                &config.hook_config,
+                                &session_id,
                             )
                             .await?;
                             tool_result_blocks.push(result_block);
@@ -416,6 +481,9 @@ impl AgentLoop {
         }
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        // Fire session end hooks.
+        fire_session_event(&config.hook_config.session_end).await;
 
         Ok(RunResult {
             outcome,
@@ -450,7 +518,39 @@ async fn execute_tool_and_emit(
     tool_ctx: &ToolContext,
     event_tx: &mpsc::Sender<ServerMessage>,
     loop_start: Instant,
+    hook_config: &HookConfig,
+    session_id: &str,
 ) -> Result<(ContentBlock, bool), RuntimeError> {
+    // Fire PreToolUse hooks — if blocked, return a synthetic error result.
+    let pre_result = fire_pre_tool_use(hook_config, name, input, session_id).await;
+    if pre_result.blocked {
+        let err_text = format!(
+            "Error: tool call blocked by PreToolUse hook: {}",
+            pre_result.reason
+        );
+        let block = ContentBlock::ToolResult {
+            tool_use_id: call_id.to_string(),
+            content: err_text.clone(),
+            is_error: true,
+        };
+        // Emit ToolResult for the TUI to display.
+        let _ = event_tx
+            .send(ServerMessage::ToolResult {
+                tool: name.to_string(),
+                success: false,
+                summary: format!("Blocked: {}", pre_result.reason),
+                elapsed_ms: 0,
+                exit_code: None,
+                output_preview: None,
+                output_lines_total: None,
+                call_id: Some(call_id.to_string()),
+                llm_text: Some(err_text),
+                parsed_output: None,
+            })
+            .await;
+        return Ok((block, false));
+    }
+
     let exec_start = Instant::now();
     let tool_output = dispatch(name, input, tool_ctx).await?;
     let elapsed_ms = exec_start.elapsed().as_millis() as u64;
@@ -511,6 +611,16 @@ async fn execute_tool_and_emit(
     }
 
     let _ = loop_start; // used for potential future timing
+
+    // Fire PostToolUse hooks (best-effort).
+    fire_post_tool_use(
+        hook_config,
+        name,
+        tool_output.success,
+        &tool_output.summary,
+        tool_output.exit_code,
+    )
+    .await;
 
     let is_error = !tool_output.success;
     let block = ContentBlock::ToolResult {
@@ -683,7 +793,7 @@ fn build_system_prompt(config: &AgentConfig) -> String {
             .join("\n")
     };
 
-    format!(
+    let mut prompt = format!(
         "You are DeCIpher, a mission-driven local execution agent.\n\n\
          ## Mission\n\
          Goal: {mission_goal}\n\
@@ -691,17 +801,47 @@ fn build_system_prompt(config: &AgentConfig) -> String {
          ## Plan\n\
          {steps}\n\n\
          ## Environment\n\
-         Host OS: {os}\n\n\
-         ## Instructions\n\
-         Use the available tools to accomplish the mission. \
-         Call `done` only when the user's goal is verified as satisfied.\n\
-         When you call `done`, set outcome to PASS if the goal was achieved, \
-         FAIL if it could not be, or PARTIAL if some steps succeeded but the goal is not fully met.",
+         Host OS: {os}\n\n",
         mission_goal = config.mission_goal,
         workspace = config.workspace,
         steps = steps_text,
         os = std::env::consts::OS,
-    )
+    );
+
+    // Inject memory context if available.
+    if let Some(ref mem) = config.memory_context {
+        if !mem.is_empty() {
+            prompt.push_str("## Memory\n");
+            prompt.push_str(mem);
+            prompt.push_str("\n\n");
+        }
+    }
+
+    // Inject skills if available.
+    let skills_section = format_skills_section(&config.skills);
+    if !skills_section.is_empty() {
+        prompt.push_str(&skills_section);
+        prompt.push_str("\n\n");
+    }
+
+    if config.plan_mode {
+        prompt.push_str(
+            "## Instructions\n\
+             You are in PLAN MODE. Generate a step-by-step plan for the mission. \
+             Do NOT call any tools — just describe your approach in numbered steps. \
+             When done, call the `done` tool with outcome PLAN and the plan as the summary.",
+        );
+    } else {
+        prompt.push_str(
+            "## Instructions\n\
+             Use the available tools to accomplish the mission. \
+             Call `done` only when the user's goal is verified as satisfied.\n\
+             When you call `done`, set outcome to PASS if the goal was achieved, \
+             FAIL if it could not be, or PARTIAL if some steps succeeded but the goal is not fully met.",
+        );
+    }
+
+    prompt
 }
 
 fn build_initial_user_message(config: &AgentConfig) -> String {
@@ -837,5 +977,56 @@ mod tests {
             tool_results >= 2,
             "expected at least 2 ToolResult events (one per parallel read_file), got {tool_results}"
         );
+    }
+
+    #[test]
+    fn plan_mode_system_prompt_has_plan_mode_instructions() {
+        let config = AgentConfig {
+            mission_goal: "Fix the CI pipeline".to_string(),
+            workspace: "/workspace".to_string(),
+            plan_mode: true,
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&config);
+        assert!(prompt.contains("PLAN MODE"));
+        assert!(prompt.contains("Do NOT call any tools"));
+    }
+
+    #[test]
+    fn normal_mode_system_prompt_has_tool_instructions() {
+        let config = AgentConfig {
+            mission_goal: "Fix the CI pipeline".to_string(),
+            workspace: "/workspace".to_string(),
+            plan_mode: false,
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&config);
+        assert!(!prompt.contains("PLAN MODE"));
+        assert!(prompt.contains("Call `done` only when"));
+    }
+
+    #[test]
+    fn system_prompt_injects_memory_context() {
+        let config = AgentConfig {
+            mission_goal: "Fix CI".to_string(),
+            workspace: "/workspace".to_string(),
+            memory_context: Some("Use multi-stage Docker builds.".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&config);
+        assert!(prompt.contains("## Memory"));
+        assert!(prompt.contains("Use multi-stage Docker builds."));
+    }
+
+    #[test]
+    fn system_prompt_no_memory_section_when_empty() {
+        let config = AgentConfig {
+            mission_goal: "Fix CI".to_string(),
+            workspace: "/workspace".to_string(),
+            memory_context: None,
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&config);
+        assert!(!prompt.contains("## Memory"));
     }
 }

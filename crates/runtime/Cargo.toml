@@ -9,6 +9,7 @@ decipher-protocol  = { path = "../protocol" }
 decipher-providers = { path = "../providers" }
 decipher-policy    = { path = "../policy" }
 decipher-tools     = { path = "../tools" }
+decipher-mcp       = { path = "../mcp" }
 
 tokio      = { workspace = true }
 serde      = { workspace = true }
@@ -16,6 +17,7 @@ serde_json = { workspace = true }
 futures    = { workspace = true }
 thiserror  = { workspace = true }
 async-trait = { workspace = true }
+async-recursion = { workspace = true }
 
 [dev-dependencies]
 decipher-mock-provider = { path = "../mock-provider" }
