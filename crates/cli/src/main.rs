@@ -1,17 +1,20 @@
 //! DeCIpher CLI — entry point.
 //!
-//! Spawns the Node.js agent via agent-bridge, sets up the ratatui terminal
-//! with inline viewport, and runs the TUI event loop.
+//! Wires the Rust-native AgentLoop into the ratatui TUI.  The previous
+//! Node.js subprocess model (agent-bridge) is replaced by an in-process
+//! tokio task that communicates with the event loop via mpsc channels.
 //!
-//! Key design choices (Codex/Claude Code parity):
+//! Key design choices:
 //! - ratatui inline viewport: buffer-diffed viewport at bottom, permanent scrollback above
 //! - crossterm `EventStream` for truly async event reading
 //! - 32ms tick rate (~30 FPS) for smooth spinner animation
 //! - Frame rate limiter (120 FPS cap) to prevent redundant redraws
 //! - No manual cursor tracking — structurally impossible cursor bugs
-//! - Phase 3: all server messages routed through ChatWidget for typed cells
+//! - All server messages routed through ChatWidget for typed cells
+//! - AgentLoop runs in a spawned tokio task; approval is a bidirectional channel
 
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -29,11 +32,15 @@ use ratatui::{
     backend::CrosstermBackend,
     Terminal, TerminalOptions, Viewport,
 };
+use tokio::sync::mpsc;
 
-use decipher_agent_bridge::AgentBridge;
 use decipher_protocol::{ClientMessage, ServerMessage};
+use decipher_providers::anthropic::AnthropicProvider;
+use decipher_runtime::{AgentConfig, AgentLoop};
 use decipher_tui::app::{self, App};
 use decipher_tui::bottom_pane::{self, BottomPane};
+
+mod config;
 
 /// Tick rate: 32ms ≈ 31.25 FPS — smooth spinner animation matching Codex.
 const TICK_RATE: Duration = Duration::from_millis(32);
@@ -42,10 +49,6 @@ const TICK_RATE: Duration = Duration::from_millis(32);
 const MIN_FRAME_INTERVAL: Duration = Duration::from_nanos(8_333_334);
 
 /// Create a fresh ratatui Terminal with an inline viewport of the given height.
-///
-/// Recreating the terminal is the only way to change the inline viewport height
-/// in standard ratatui — `Viewport::Inline(n)` fixes `n` at creation time.
-/// We do this sparingly: only when the desired pane height actually changes.
 fn make_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
@@ -57,15 +60,13 @@ fn make_terminal(height: u16) -> io::Result<Terminal<CrosstermBackend<io::Stdout
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let mut bridge = AgentBridge::spawn().await?;
+    let cli_cfg = config::CliConfig::load();
 
     // Push cursor to the terminal bottom BEFORE raw mode so that
     // Viewport::Inline anchors at the real bottom, not wherever the
     // shell prompt happened to leave the cursor.
     {
         let (_, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        // Print `rows` newlines in cooked mode — the terminal scrolls content
-        // up and leaves the cursor on the last row.
         print!("{}", "\n".repeat(rows as usize));
         io::stdout().flush()?;
     }
@@ -89,8 +90,7 @@ async fn main() -> io::Result<()> {
         )?;
     }
 
-    // Terminal is created and managed inside run_app (dynamic viewport height).
-    let result = run_app(&mut bridge).await;
+    let result = run_app(cli_cfg).await;
 
     let mut stdout = io::stdout();
     if has_keyboard_enhancement {
@@ -100,7 +100,6 @@ async fn main() -> io::Result<()> {
     execute!(stdout, DisableBracketedPaste, DisableFocusChange)?;
     println!();
 
-    bridge.shutdown().await;
     result
 }
 
@@ -132,29 +131,42 @@ impl FrameRateLimiter {
 
 /// Run the main event loop.
 ///
-/// The terminal is owned here — not passed from main — so we can recreate it
-/// whenever the viewport height needs to change.  ratatui's Viewport::Inline(n)
-/// fixes the height at creation time; the only correct way to change it is to
-/// drop and recreate the Terminal struct (cheap: no alternate screen).
-async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
+/// Owns the terminal and all channel state. The AgentLoop runs as a
+/// background tokio task; this loop receives `ServerMessage` events from
+/// it and sends approval decisions back via a separate channel.
+async fn run_app(cli_cfg: config::CliConfig) -> io::Result<()> {
+    // ── Provider ─────────────────────────────────────────────────────────────
+    let provider = {
+        let mut p = AnthropicProvider::new(&cli_cfg.api_key, &cli_cfg.model);
+        if let Some(ref url) = cli_cfg.base_url {
+            p = p.with_base_url(url);
+        }
+        Arc::new(p)
+    };
+
+    // ── Channels ─────────────────────────────────────────────────────────────
+    // event_tx  → agent task → event_rx (ServerMessage stream)
+    // approval_tx → main loop → approval_rx (bool, per agent run)
+    let (event_tx, mut event_rx) = mpsc::channel::<ServerMessage>(64);
+    let mut current_approval_tx: Option<mpsc::Sender<bool>> = None;
+    let mut current_agent_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Extract config fields used repeatedly in the loop.
+    let workspace = cli_cfg.workspace.clone();
+    let api_key = cli_cfg.api_key.clone();
+    let model = cli_cfg.model.clone();
+    let base_url = cli_cfg.base_url.clone();
+    let policy_mode = cli_cfg.policy_mode;
+
+    // ── TUI state ─────────────────────────────────────────────────────────────
     let mut app = App::new();
     let mut need_redraw = true;
     let mut fps = FrameRateLimiter::new();
     let mut events = EventStream::new();
 
-    // Bootstrap terminal with a fixed viewport height.
-    //
-    // We NEVER recreate the terminal after this point.  Recreating mid-session
-    // calls crossterm::cursor::position() (sends \x1b[6n, reads the CPR response
-    // from /dev/tty), but the async EventStream is also reading /dev/tty and
-    // will consume that response first → timeout → crash.
-    //
-    // Instead, the viewport is a fixed MAX_PANE_HEIGHT rows. BottomPane pads
-    // shorter content with blank lines at the top so the input box is always
-    // physically at the terminal bottom.
+    // Fixed viewport height — never recreated mid-session (see original comment).
     let viewport_height = bottom_pane::MAX_PANE_HEIGHT;
     let mut terminal = make_terminal(viewport_height)?;
-    // Sync chat width with actual terminal width (may differ from App::new() snapshot).
     let actual_width = terminal.size()?.width;
     if actual_width != app.chat.width() {
         app.chat.set_width(actual_width);
@@ -170,9 +182,6 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
                 terminal.draw(|frame| {
                     let area = frame.area();
                     frame.render_widget(BottomPane::new(&app), area);
-                    // Cursor position must be computed inside the draw closure so
-                    // it uses frame.area() — the actual terminal coordinates for
-                    // this inline viewport, not a viewport-relative (y=0) rect.
                     if let Some((x, y)) = BottomPane::new(&app).cursor_position(area) {
                         frame.set_cursor_position((x, y));
                     }
@@ -193,6 +202,7 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
                         match action {
                             KeyAction::Redraw => { need_redraw = true; }
                             KeyAction::Submit(msg) => {
+                                // insert_before for scrollback (mirrors previous bridge behavior)
                                 let lines = bottom_pane::user_input_lines(&app.last_submitted);
                                 let height = lines.len() as u16;
                                 terminal.insert_before(height, |buf| {
@@ -200,7 +210,43 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
                                 })?;
                                 fps.mark_drawn();
                                 need_redraw = true;
-                                bridge.send(&msg).await?;
+
+                                match msg {
+                                    ClientMessage::UserInput { ref text, .. } => {
+                                        // Abort any running agent task first.
+                                        if let Some(h) = current_agent_task.take() {
+                                            h.abort();
+                                        }
+                                        // Fresh approval channel for this run.
+                                        let (atx, arx) = mpsc::channel::<bool>(1);
+                                        current_approval_tx = Some(atx);
+
+                                        let agent_cfg = build_agent_config(
+                                            text.clone(),
+                                            api_key.clone(),
+                                            model.clone(),
+                                            base_url.clone(),
+                                            workspace.clone(),
+                                            policy_mode,
+                                        );
+                                        let tx = event_tx.clone();
+                                        let prov = provider.clone();
+                                        current_agent_task = Some(tokio::spawn(async move {
+                                            let _ = AgentLoop::run(agent_cfg, &*prov, tx, Some(arx)).await;
+                                        }));
+                                    }
+                                    ClientMessage::ApprovalResponse { approved } => {
+                                        if let Some(atx) = &current_approval_tx {
+                                            let _ = atx.try_send(approved);
+                                        }
+                                    }
+                                    ClientMessage::Interrupt => {
+                                        if let Some(h) = current_agent_task.take() {
+                                            h.abort();
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                             KeyAction::None => {}
                         }
@@ -212,12 +258,6 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
                     }
                     Ok(Event::Resize(cols, rows)) => {
                         app.chat.set_width(cols);
-                        // For Viewport::Inline(viewport_height), the viewport
-                        // occupies the bottom viewport_height rows of the
-                        // terminal. We must resize to that rect — NOT the full
-                        // terminal (0, 0, cols, rows) which would make ratatui
-                        // think it owns the entire screen, breaking
-                        // insert_before() scroll math and losing scrollback.
                         let vp_h = viewport_height.min(rows);
                         terminal.resize(ratatui::layout::Rect::new(
                             0,
@@ -234,9 +274,9 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
                 }
             }
 
-            // ── Server messages ───────────────────────────────────────────────
-            Some(msg) = bridge.rx.recv() => {
-                // Banner: render above scrollback + set terminal title
+            // ── Agent events (replaces bridge.rx.recv()) ─────────────────────
+            Some(msg) = event_rx.recv() => {
+                // Banner: render above scrollback + set terminal title.
                 if let ServerMessage::Banner { ref version, ref provider, ref model, ref directory, api_key_set } = msg {
                     let mut stdout = io::stdout();
                     decipher_tui::render::set_terminal_title(&mut stdout, &format!("DeCIpher \u{2014} {model}"))?;
@@ -249,7 +289,7 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
                     }
                 }
 
-                // Desktop notification on mission complete when unfocused
+                // Desktop notification on mission complete when unfocused.
                 if let ServerMessage::MissionComplete { ref outcome, ref summary, .. } = msg {
                     if !app.terminal_focused {
                         let mut stdout = io::stdout();
@@ -260,7 +300,7 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
                     }
                 }
 
-                // Route through ChatWidget → typed cells → scrollback lines
+                // Route through ChatWidget → typed cells → scrollback lines.
                 let scrollback_lines = app.chat.handle_server_message(&msg);
                 if !scrollback_lines.is_empty() {
                     let h = scrollback_lines.len() as u16;
@@ -273,10 +313,12 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
                 app.handle_server_message(msg);
                 need_redraw = true;
 
-                // Auto-approve if user pressed 'a' (always) earlier
+                // Auto-approve if user pressed 'a' (always) earlier.
                 if app.always_approve && app.mode == app::InputMode::ApprovalPending {
-                    let resp = app.respond_approval(true);
-                    bridge.send(&resp).await?;
+                    app.respond_approval(true);
+                    if let Some(atx) = &current_approval_tx {
+                        let _ = atx.try_send(true);
+                    }
                 }
             }
 
@@ -289,21 +331,45 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
             }
         }
 
-        // Dispatch queued message when agent becomes idle
+        // Dispatch queued message when agent becomes idle.
         if !app.agent_busy {
             if let Some(queued) = app.queued_message.take() {
-                let lines = bottom_pane::user_input_lines(&app.last_submitted);
-                let height = lines.len() as u16;
-                terminal.insert_before(height, |buf| {
-                    bottom_pane::render_lines_to_buffer(buf, &lines);
-                })?;
-                fps.mark_drawn();
-                need_redraw = true;
-                bridge.send(&queued).await?;
+                if let ClientMessage::UserInput { ref text, .. } = queued {
+                    let lines = bottom_pane::user_input_lines(&app.last_submitted);
+                    let height = lines.len() as u16;
+                    terminal.insert_before(height, |buf| {
+                        bottom_pane::render_lines_to_buffer(buf, &lines);
+                    })?;
+                    fps.mark_drawn();
+                    need_redraw = true;
+
+                    if let Some(h) = current_agent_task.take() {
+                        h.abort();
+                    }
+                    let (atx, arx) = mpsc::channel::<bool>(1);
+                    current_approval_tx = Some(atx);
+                    let agent_cfg = build_agent_config(
+                        text.clone(),
+                        api_key.clone(),
+                        model.clone(),
+                        base_url.clone(),
+                        workspace.clone(),
+                        policy_mode,
+                    );
+                    let tx = event_tx.clone();
+                    let prov = provider.clone();
+                    current_agent_task = Some(tokio::spawn(async move {
+                        let _ = AgentLoop::run(agent_cfg, &*prov, tx, Some(arx)).await;
+                    }));
+                }
             }
         }
 
         if app.should_quit {
+            // Abort agent task if running.
+            if let Some(h) = current_agent_task.take() {
+                h.abort();
+            }
             let lines = bottom_pane::goodbye_lines();
             let height = lines.len() as u16;
             terminal.insert_before(height, |buf| {
@@ -314,6 +380,26 @@ async fn run_app(bridge: &mut AgentBridge) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Build an `AgentConfig` for a single mission run.
+fn build_agent_config(
+    goal: String,
+    api_key: String,
+    model: String,
+    base_url: Option<String>,
+    workspace: String,
+    policy_mode: decipher_policy::PolicyMode,
+) -> AgentConfig {
+    AgentConfig {
+        model,
+        api_key,
+        base_url,
+        workspace,
+        mission_goal: goal,
+        policy_mode,
+        ..Default::default()
+    }
 }
 
 enum KeyAction {
@@ -575,10 +661,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
                     }
                     KeyCode::Char('v') => {
                         if let Some(img) = decipher_clipboard::paste_image() {
-                            // Insert [Image #N] token at cursor (Claude Code style).
-                            // The numbered token is visible in the input AND in the
-                            // scrollback after submit.  Actual image data is staged
-                            // in pending_images and sent with the next submission.
                             app.session_image_count += 1;
                             let token = format!("[Image #{}]", app.session_image_count);
                             app.input.insert_str(app.cursor, &token);

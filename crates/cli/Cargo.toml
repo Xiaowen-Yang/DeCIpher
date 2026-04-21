@@ -10,15 +10,18 @@ name = "decipher-tui"
 path = "src/main.rs"
 
 [dependencies]
-decipher-protocol = { workspace = true }
-decipher-tui = { workspace = true }
-decipher-agent-bridge = { workspace = true }
+decipher-protocol  = { workspace = true }
+decipher-tui       = { workspace = true }
+decipher-runtime   = { path = "../runtime" }
+decipher-providers = { path = "../providers" }
+decipher-policy    = { path = "../policy" }
 decipher-clipboard = { workspace = true }
-crossterm = { workspace = true }
-tokio = { workspace = true }
-serde_json = { workspace = true }
-futures = { workspace = true }
-ratatui = { workspace = true }
+crossterm   = { workspace = true }
+tokio       = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+futures     = { workspace = true }
+ratatui     = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

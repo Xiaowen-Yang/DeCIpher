@@ -286,13 +286,16 @@ name = "decipher-cli"
 version = "0.1.5"
 dependencies = [
  "crossterm",
- "decipher-agent-bridge",
  "decipher-clipboard",
+ "decipher-policy",
  "decipher-protocol",
+ "decipher-providers",
+ "decipher-runtime",
  "decipher-tui",
  "futures",
  "libc",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
 ]
