@@ -107,6 +107,11 @@ pub enum ServerMessage {
         /// Omitted from older session records — fall back to `summary` when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         llm_text: Option<String>,
+        /// JSON-serialized ParsedOutput for TUI smart-card rendering.
+        /// Present only for exec_command with non-Generic output.
+        /// Never sent to the LLM.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parsed_output: Option<String>,
     },
 
     #[serde(rename = "agent_message")]

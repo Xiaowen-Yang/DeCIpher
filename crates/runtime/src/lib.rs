@@ -28,6 +28,7 @@
 
 pub mod agent_loop;
 pub mod compaction;
+pub mod output_parser;
 pub mod tools;
 pub mod types;
 

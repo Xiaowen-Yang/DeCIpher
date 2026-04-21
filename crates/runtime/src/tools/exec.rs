@@ -3,6 +3,7 @@
 //! Port source: `agents/executor/tools.js` exec_command / kubectl_* handlers.
 
 use super::{resolve_path, ToolContext, ToolOutput};
+use crate::output_parser::{self, ParsedOutput};
 use serde_json::Value;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -69,12 +70,20 @@ pub async fn run(args: &Value, ctx: &ToolContext) -> Result<ToolOutput, crate::R
         format!("exit {} — {}", result.exit_code, truncate_summary(&output, 80))
     };
 
+    // Parse structured output for TUI smart-card rendering (display only, never sent to LLM).
+    let parsed = output_parser::parse_output(&cmd, &output, result.exit_code);
+    let parsed_output = match parsed {
+        ParsedOutput::Generic => None,
+        other => Some(other),
+    };
+
     Ok(ToolOutput {
         success,
         summary,
         llm_text,
         exit_code: Some(result.exit_code),
         raw_output: Some(output),
+        parsed_output,
     })
 }
 
@@ -277,6 +286,7 @@ async fn run_kubectl_cmd(cmd: &str, ctx: &ToolContext) -> Result<ToolOutput, cra
         llm_text,
         exit_code: Some(result.exit_code),
         raw_output: Some(result.output),
+        parsed_output: None,
     })
 }
 

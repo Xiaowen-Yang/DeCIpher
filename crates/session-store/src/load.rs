@@ -169,6 +169,7 @@ mod tests {
             output_lines_total: None,
             call_id: Some(call_id.into()),
             llm_text: Some(text.into()),
+            parsed_output: None,
         }
     }
 
@@ -281,6 +282,7 @@ mod tests {
             output_lines_total: None,
             call_id: Some("x1".into()),
             llm_text: None,
+            parsed_output: None,
         });
         store.close(None).await;
 

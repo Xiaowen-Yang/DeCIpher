@@ -35,6 +35,9 @@ pub struct ToolOutput {
     pub exit_code: Option<i32>,
     /// Raw output for streaming preview (exec_command / search).
     pub raw_output: Option<String>,
+    /// Structured parsed output for TUI smart-card rendering (exec_command only).
+    /// Never sent to the LLM — display layer only.
+    pub parsed_output: Option<crate::output_parser::ParsedOutput>,
 }
 
 impl ToolOutput {
@@ -45,6 +48,7 @@ impl ToolOutput {
             llm_text: llm_text.into(),
             exit_code: None,
             raw_output: None,
+            parsed_output: None,
         }
     }
 
@@ -55,6 +59,7 @@ impl ToolOutput {
             llm_text: llm_text.into(),
             exit_code: None,
             raw_output: None,
+            parsed_output: None,
         }
     }
 }

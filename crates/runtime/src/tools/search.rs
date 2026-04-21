@@ -73,6 +73,7 @@ pub async fn search(args: &Value, ctx: &ToolContext) -> Result<ToolOutput, crate
         llm_text,
         exit_code: Some(result.exit_code),
         raw_output: Some(result.output),
+        parsed_output: None,
     })
 }
 
@@ -137,6 +138,7 @@ pub async fn grep(args: &Value, ctx: &ToolContext) -> Result<ToolOutput, crate::
         llm_text,
         exit_code: Some(result.exit_code),
         raw_output: Some(result.output),
+        parsed_output: None,
     })
 }
 
@@ -192,6 +194,7 @@ pub async fn file_search(
         llm_text,
         exit_code: Some(result.exit_code),
         raw_output: Some(result.output),
+        parsed_output: None,
     })
 }
 

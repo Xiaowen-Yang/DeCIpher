@@ -28,6 +28,28 @@ pub enum AgentPhase {
     Verifying,
     /// Waiting for user approval before proceeding.
     WaitingForApproval,
+
+    // ── Phase D: context-aware exec phases ─────────────────────────────────
+    /// docker build in progress.
+    BuildingImage,
+    /// docker run / docker compose up in progress.
+    StartingContainer,
+    /// kubectl apply / rollout in progress.
+    Deploying,
+    /// kubectl logs / streaming logs.
+    TailingLogs,
+    /// kubectl get pods / watch pods.
+    WatchingPods,
+    /// npm ci / pip install / cargo build.
+    InstallingDeps,
+    /// cargo clippy / eslint / ruff.
+    Linting,
+    /// cargo test / npm test / pytest / go test.
+    RunningTests,
+    /// git commit / push / merge.
+    GitOp,
+    /// prisma migrate / diesel migration / alembic.
+    Migrating,
 }
 
 impl AgentPhase {
@@ -43,12 +65,59 @@ impl AgentPhase {
             Self::RunningChecks => "Running checks",
             Self::Verifying => "Reviewing changes",
             Self::WaitingForApproval => "Waiting for approval",
+            Self::BuildingImage => "Building image",
+            Self::StartingContainer => "Starting container",
+            Self::Deploying => "Deploying",
+            Self::TailingLogs => "Tailing logs",
+            Self::WatchingPods => "Watching pods",
+            Self::InstallingDeps => "Installing deps",
+            Self::Linting => "Linting",
+            Self::RunningTests => "Running tests",
+            Self::GitOp => "Git operation",
+            Self::Migrating => "Migrating",
         }
     }
 
     /// True when this phase should display the animated spinner.
     pub fn is_active(&self) -> bool {
         !matches!(self, Self::Idle)
+    }
+
+    /// Detect a specific phase from an exec_command's `cmd` string.
+    /// Returns None if no specific phase matches (caller falls back to RunningChecks).
+    pub fn from_exec_cmd(cmd: &str) -> Option<Self> {
+        if cmd.contains("docker build") { return Some(Self::BuildingImage); }
+        if cmd.contains("docker run") || cmd.contains("docker compose up") || cmd.contains("docker-compose up") {
+            return Some(Self::StartingContainer);
+        }
+        if cmd.contains("cargo test") || cmd.contains("npm test") || cmd.contains("pytest")
+            || cmd.contains("go test") || cmd.contains("npx jest") || cmd.contains("vitest") {
+            return Some(Self::RunningTests);
+        }
+        if cmd.contains("cargo clippy") || cmd.contains("eslint") || cmd.contains("ruff")
+            || (cmd.contains("prettier") && cmd.contains("--check")) {
+            return Some(Self::Linting);
+        }
+        if cmd.contains("npm ci") || cmd.contains("npm install") || cmd.contains("pip install")
+            || cmd.contains("pnpm install") || cmd.contains("yarn install") || cmd.contains("cargo build") {
+            return Some(Self::InstallingDeps);
+        }
+        if cmd.contains("git commit") || cmd.contains("git push") || cmd.contains("git merge")
+            || cmd.contains("git pull") || cmd.contains("git rebase") {
+            return Some(Self::GitOp);
+        }
+        if cmd.contains("kubectl apply") || cmd.contains("kubectl rollout") || cmd.contains("kubectl create") {
+            return Some(Self::Deploying);
+        }
+        if cmd.contains("kubectl logs") { return Some(Self::TailingLogs); }
+        if cmd.contains("kubectl get pod") || cmd.contains("kubectl watch") {
+            return Some(Self::WatchingPods);
+        }
+        if cmd.contains("prisma migrate") || cmd.contains("diesel migration") || cmd.contains("alembic")
+            || cmd.contains("db:migrate") {
+            return Some(Self::Migrating);
+        }
+        None
     }
 }
 
@@ -241,10 +310,19 @@ impl App {
                 self.mode = InputMode::ApprovalPending;
                 self.agent_phase = AgentPhase::WaitingForApproval;
             }
-            ServerMessage::ToolStart { ref tool, .. } => {
+            ServerMessage::ToolStart { ref tool, ref args, .. } => {
                 self.agent_phase = match tool.as_str() {
                     "write_file" | "apply_patch" => AgentPhase::ApplyingEdits,
-                    "exec_command" | "kubectl_exec" | "kubectl_apply" | "kubectl_delete" => AgentPhase::RunningChecks,
+                    "exec_command" => {
+                        // Try to map the specific command to a context-aware phase.
+                        let cmd = args
+                            .as_ref()
+                            .and_then(|v| v.get("cmd"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        AgentPhase::from_exec_cmd(cmd).unwrap_or(AgentPhase::RunningChecks)
+                    }
+                    "kubectl_exec" | "kubectl_apply" | "kubectl_delete" => AgentPhase::RunningChecks,
                     "read_file" | "list_files" | "search" | "grep_search" | "file_search" => AgentPhase::Thinking,
                     _ => AgentPhase::Executing,
                 };

@@ -409,6 +409,9 @@ async fn execute_tool_and_emit(
             call_id: Some(call_id.to_string()),
             // Store full LLM-facing text for lossless session resume reconstruction.
             llm_text: Some(tool_output.llm_text.clone()),
+            // JSON-serialized smart-card data for TUI rendering (display only).
+            parsed_output: tool_output.parsed_output.as_ref()
+                .and_then(|p| serde_json::to_string(p).ok()),
         })
         .await;
 

@@ -328,7 +328,7 @@ impl ChatWidget {
                 lines
             }
 
-            ServerMessage::ToolResult { tool, success, summary, elapsed_ms, exit_code, output_preview, output_lines_total, call_id, .. } => {
+            ServerMessage::ToolResult { tool, success, summary, elapsed_ms, exit_code, output_preview, output_lines_total, call_id, parsed_output, .. } => {
                 let mut lines = Vec::new();
                 if let Some(ref mut cell) = self.active_cell {
                     if let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() {
@@ -343,55 +343,72 @@ impl ChatWidget {
                         // Emit scrollback only for NON-read-only tools.
                         // Read-only tools will emit a compact TaskCard summary when flushed.
                         if !is_read_only_tool(tool) {
-                            let completed_call = exec_cell.calls.iter().rev()
-                                .find(|c| c.tool == *tool && c.success.is_some());
-                            if let Some(call) = completed_call {
-                                let display = format_tool_display(
-                                    &call.tool,
-                                    call.args.as_ref(),
-                                    call.output.as_deref().unwrap_or(""),
-                                );
-                                let icon = if *success {
-                                    ratatui::text::Span::styled("\u{2713}", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
+                            // Try smart card rendering first (Phase C).
+                            let smart_emitted = if let Some(ref json_str) = parsed_output {
+                                if let Some(smart_lines) = render_smart_card_lines(json_str, *success, *elapsed_ms) {
+                                    exec_cell.smart_summary = Some(smart_lines.clone());
+                                    self.active_cell_revision += 1;
+                                    lines.extend(smart_lines);
+                                    true
                                 } else {
-                                    ratatui::text::Span::styled("\u{2717}", ratatui::style::Style::default().fg(ratatui::style::Color::Red))
-                                };
-                                let s = *elapsed_ms as f64 / 1000.0;
-                                let exit_info = if !success {
-                                    exit_code.map(|c| format!(" [exit {c}]")).unwrap_or_default()
-                                } else {
-                                    String::new()
-                                };
-                                lines.push(Line::from(vec![
-                                    ratatui::text::Span::raw("  "),
-                                    icon,
-                                    ratatui::text::Span::raw(format!(" {display}{exit_info} ")),
-                                    ratatui::text::Span::styled(
-                                        format!("({s:.1}s)"),
-                                        ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
-                                    ),
-                                ]));
-                                // Show error output preview for failed commands
-                                if !success {
-                                    if let Some(ref preview) = output_preview {
-                                        let preview_lines: Vec<&str> = preview.lines().collect();
-                                        let show = preview_lines.len().min(5);
-                                        let start = preview_lines.len().saturating_sub(show);
-                                        for (i, line_text) in preview_lines[start..].iter().enumerate() {
-                                            let is_last = i == show - 1;
-                                            let pfx = if is_last { "\u{2514}" } else { "\u{2502}" };
-                                            let truncated: String = line_text.chars().take(100).collect();
-                                            lines.push(Line::from(vec![
-                                                ratatui::text::Span::raw("    "),
-                                                ratatui::text::Span::styled(
-                                                    format!("{pfx} "),
-                                                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
-                                                ),
-                                                ratatui::text::Span::styled(
-                                                    truncated,
-                                                    ratatui::style::Style::default().fg(ratatui::style::Color::Red).add_modifier(ratatui::style::Modifier::DIM),
-                                                ),
-                                            ]));
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            // Fall back to generic completion line when no smart card.
+                            if !smart_emitted {
+                                let completed_call = exec_cell.calls.iter().rev()
+                                    .find(|c| c.tool == *tool && c.success.is_some());
+                                if let Some(call) = completed_call {
+                                    let display = format_tool_display(
+                                        &call.tool,
+                                        call.args.as_ref(),
+                                        call.output.as_deref().unwrap_or(""),
+                                    );
+                                    let icon = if *success {
+                                        ratatui::text::Span::styled("\u{2713}", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
+                                    } else {
+                                        ratatui::text::Span::styled("\u{2717}", ratatui::style::Style::default().fg(ratatui::style::Color::Red))
+                                    };
+                                    let s = *elapsed_ms as f64 / 1000.0;
+                                    let exit_info = if !success {
+                                        exit_code.map(|c| format!(" [exit {c}]")).unwrap_or_default()
+                                    } else {
+                                        String::new()
+                                    };
+                                    lines.push(Line::from(vec![
+                                        ratatui::text::Span::raw("  "),
+                                        icon,
+                                        ratatui::text::Span::raw(format!(" {display}{exit_info} ")),
+                                        ratatui::text::Span::styled(
+                                            format!("({s:.1}s)"),
+                                            ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                                        ),
+                                    ]));
+                                    // Show error output preview for failed commands
+                                    if !success {
+                                        if let Some(ref preview) = output_preview {
+                                            let preview_lines: Vec<&str> = preview.lines().collect();
+                                            let show = preview_lines.len().min(5);
+                                            let start = preview_lines.len().saturating_sub(show);
+                                            for (i, line_text) in preview_lines[start..].iter().enumerate() {
+                                                let is_last = i == show - 1;
+                                                let pfx = if is_last { "\u{2514}" } else { "\u{2502}" };
+                                                let truncated: String = line_text.chars().take(100).collect();
+                                                lines.push(Line::from(vec![
+                                                    ratatui::text::Span::raw("    "),
+                                                    ratatui::text::Span::styled(
+                                                        format!("{pfx} "),
+                                                        ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::DIM),
+                                                    ),
+                                                    ratatui::text::Span::styled(
+                                                        truncated,
+                                                        ratatui::style::Style::default().fg(ratatui::style::Color::Red).add_modifier(ratatui::style::Modifier::DIM),
+                                                    ),
+                                                ]));
+                                            }
                                         }
                                     }
                                 }
@@ -682,6 +699,7 @@ mod tests {
             output_lines_total: None,
             call_id: None,
             llm_text: None,
+            parsed_output: None,
         });
         assert!(!lines.is_empty());
         assert_eq!(widget.committed_cells.len(), 1);
@@ -898,6 +916,7 @@ mod tests {
             output_lines_total: None,
             call_id: None,
             llm_text: None,
+            parsed_output: None,
         });
         assert!(!lines.is_empty(), "read_file ToolResult should emit the compact result line");
     }

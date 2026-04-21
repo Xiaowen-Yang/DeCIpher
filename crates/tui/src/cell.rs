@@ -273,6 +273,9 @@ pub struct ExecCell {
     pub calls: Vec<ExecCall>,
     /// Accumulated streaming output from exec_command (real-time).
     pub streaming_output: String,
+    /// Pre-rendered smart card lines (set when parsed_output is present).
+    /// When Some, display_lines() emits these instead of the generic per-call lines.
+    pub smart_summary: Option<Vec<Line<'static>>>,
 }
 
 /// Max lines of streaming output to show in the cell.
@@ -281,6 +284,7 @@ const EXEC_OUTPUT_PREVIEW_LINES: usize = 5;
 impl ExecCell {
     pub fn new(tool: String, reasoning: String, args: Option<serde_json::Value>, call_id: Option<String>) -> Self {
         Self {
+            smart_summary: None,
             calls: vec![ExecCall {
                 tool,
                 output: Some(reasoning),
@@ -413,6 +417,14 @@ impl Cell for ExecCell {
     }
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        // Use smart card rendering when all calls are complete and smart summary is set.
+        let all_done = self.calls.iter().all(|c| c.success.is_some());
+        if all_done {
+            if let Some(ref smart) = self.smart_summary {
+                return smart.clone();
+            }
+        }
+
         let mut lines = Vec::new();
         for call in &self.calls {
             let display = format_tool_display(
@@ -1185,6 +1197,401 @@ impl Cell for ApprovalCell {
         lines.push(Line::from(Span::styled(format!("  \u{2514}{}\u{2500}", bar), DIM)));
         lines
     }
+}
+
+// ── Smart card rendering ───────────────────────────────────────────────────────
+
+/// Render parsed exec output as styled summary lines for the chat history.
+///
+/// Called from `chat.rs` when `ToolResult.parsed_output` is present.
+/// Returns `None` for `Generic` or unrecognized type — caller falls back to
+/// generic ExecCell completion line.
+pub fn render_smart_card_lines(
+    parsed_json: &str,
+    success: bool,
+    elapsed_ms: u64,
+) -> Option<Vec<Line<'static>>> {
+    let v: serde_json::Value = serde_json::from_str(parsed_json).ok()?;
+    let kind = v.get("type").and_then(|t| t.as_str())?;
+    let secs = elapsed_ms as f64 / 1000.0;
+
+    let (icon, icon_style) = if success {
+        ("\u{2713}", GREEN)     // ✓
+    } else {
+        ("\u{2717}", RED)       // ✗
+    };
+
+    match kind {
+        "test_suite" => render_test_suite(&v, icon, icon_style, secs),
+        "docker_build" => render_docker_build(&v, icon, icon_style, secs),
+        "docker_run" => render_docker_run(&v, icon, icon_style, secs),
+        "compose" => render_compose(&v, icon, icon_style, secs),
+        "git_op" => render_git_op(&v, icon, icon_style, secs),
+        "lint" => render_lint(&v, icon, icon_style, secs),
+        "kube_pod" => render_kube_pod(&v, icon, icon_style, secs),
+        "kube_log" => render_kube_log(&v, icon, icon_style, secs),
+        "kube_event" => render_kube_event(&v, icon, icon_style, secs),
+        "ci" => render_ci(&v, icon, icon_style, secs),
+        "env_setup" => render_env_setup(&v, icon, icon_style, secs),
+        "migration" => render_migration(&v, icon, icon_style, secs),
+        _ => None,
+    }
+}
+
+fn str_field<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+fn u32_field(v: &serde_json::Value, key: &str) -> u32 {
+    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0) as u32
+}
+
+fn header_line(icon: &'static str, style: Style, title: String, secs: f64) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{icon} "), style),
+        Span::styled(title, Style::default()),
+        Span::styled(format!(" ({secs:.1}s)"), DIM),
+    ])
+}
+
+fn detail_line(detail: String) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("    "),
+        Span::styled("\u{25cf} ", DIM),   // ●
+        Span::styled(detail, DIM),
+    ])
+}
+
+fn render_test_suite(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let runner = str_field(v, "runner");
+    let passed = u32_field(v, "passed");
+    let failed = u32_field(v, "failed");
+    let skipped = u32_field(v, "skipped");
+
+    let title = if failed > 0 {
+        format!("Tests failed \u{00b7} {runner}")   // ·
+    } else {
+        format!("Tests passed \u{00b7} {runner}")
+    };
+
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    let mut detail = format!("{passed} passed \u{00b7} {failed} failed");
+    if skipped > 0 { detail.push_str(&format!(" \u{00b7} {skipped} skipped")); }
+    if let Some(cov) = v.get("coverage").and_then(|c| c.as_f64()) {
+        detail.push_str(&format!(" \u{00b7} {:.1}% cov", cov));
+    }
+    lines.push(detail_line(detail));
+
+    // Show up to 3 failure names
+    if let Some(failures) = v.get("failures").and_then(|f| f.as_array()) {
+        for fail in failures.iter().take(3) {
+            let name = fail.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if !name.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("\u{2514} ", DIM),
+                    Span::styled(name.to_string(), Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+                ]));
+            }
+        }
+    }
+
+    Some(lines)
+}
+
+fn render_docker_build(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let image = str_field(v, "image");
+    let steps_total = u32_field(v, "steps_total");
+    let steps_done = u32_field(v, "steps_done");
+    let cached = v.get("cached").and_then(|c| c.as_bool()).unwrap_or(false);
+
+    let title = if image.is_empty() { "Docker build".to_string() } else { format!("Built {image}") };
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    let mut detail = if steps_total > 0 {
+        format!("{steps_done}/{steps_total} steps")
+    } else {
+        String::new()
+    };
+    if let Some(stages) = v.get("stages").and_then(|s| s.as_array()) {
+        if !stages.is_empty() {
+            if !detail.is_empty() { detail.push_str(" \u{00b7} "); }
+            detail.push_str(&format!("{} stage{}", stages.len(), if stages.len() == 1 { "" } else { "s" }));
+        }
+    }
+    if let Some(mb) = v.get("size_mb").and_then(|s| s.as_f64()) {
+        if !detail.is_empty() { detail.push_str(" \u{00b7} "); }
+        detail.push_str(&format!("{mb:.0}MB"));
+    }
+    if cached {
+        if !detail.is_empty() { detail.push_str(" \u{00b7} "); }
+        detail.push_str("CACHED");
+    }
+    if !detail.is_empty() { lines.push(detail_line(detail)); }
+
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        if !err.is_empty() {
+            let truncated: String = err.chars().take(100).collect();
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("\u{2514} ", DIM),
+                Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+            ]));
+        }
+    }
+
+    Some(lines)
+}
+
+fn render_docker_run(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let container = str_field(v, "container");
+    let title = if container.is_empty() { "Docker run".to_string() } else { format!("Container {container}") };
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    if let Some(ports) = v.get("ports").and_then(|p| p.as_array()) {
+        if !ports.is_empty() {
+            let port_str = ports.iter()
+                .take(3)
+                .filter_map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(" \u{00b7} ");
+            lines.push(detail_line(port_str));
+        }
+    }
+    if let Some(health) = v.get("health").and_then(|h| h.as_str()) {
+        if !health.is_empty() {
+            lines.push(detail_line(health.to_string()));
+        }
+    }
+
+    Some(lines)
+}
+
+fn render_compose(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let title = "Compose up".to_string();
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    if let Some(services) = v.get("services").and_then(|s| s.as_array()) {
+        let svc_str: String = services.iter().take(5).filter_map(|s| {
+            let name = s.get("name").and_then(|n| n.as_str())?;
+            let status = s.get("status").and_then(|st| st.as_str()).unwrap_or("?");
+            let icon = if status == "up" { "\u{2713}" } else { "\u{2717}" };
+            Some(format!("{icon} {name}"))
+        }).collect::<Vec<_>>().join(" \u{00b7} ");
+        if !svc_str.is_empty() { lines.push(detail_line(svc_str)); }
+    }
+
+    Some(lines)
+}
+
+fn render_git_op(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let op = str_field(v, "op");
+    let branch = v.get("branch").and_then(|b| b.as_str()).unwrap_or("");
+    let files = u32_field(v, "files_changed");
+    let adds = u32_field(v, "additions");
+    let dels = u32_field(v, "deletions");
+
+    let mut title = format!("Git {op}");
+    if !branch.is_empty() { title.push_str(&format!(" \u{00b7} {branch}")); }
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    if let Some(msg) = v.get("commit_msg").and_then(|m| m.as_str()) {
+        if !msg.is_empty() {
+            let truncated: String = msg.chars().take(60).collect();
+            lines.push(detail_line(truncated));
+        }
+    }
+    if files > 0 {
+        let detail = format!("{files} file{} \u{00b7} +{adds} \u{2212}{dels}", if files == 1 { "" } else { "s" });
+        lines.push(detail_line(detail));
+    }
+    if let Some(conflicts) = v.get("conflicts").and_then(|c| c.as_array()) {
+        if !conflicts.is_empty() {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("\u{2514} ", DIM),
+                Span::styled(format!("{} conflict{}", conflicts.len(), if conflicts.len() == 1 { "" } else { "s" }),
+                    Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+            ]));
+        }
+    }
+
+    Some(lines)
+}
+
+fn render_lint(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let tool = str_field(v, "tool");
+    let warnings = u32_field(v, "warnings");
+    let errors = u32_field(v, "errors");
+
+    let title = if errors > 0 || warnings > 0 {
+        format!("Lint \u{00b7} {tool}")
+    } else {
+        format!("Lint passed \u{00b7} {tool}")
+    };
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    let detail = if errors == 0 && warnings == 0 {
+        "0 warnings \u{00b7} 0 errors".to_string()
+    } else {
+        format!("{errors} error{} \u{00b7} {warnings} warning{}", if errors == 1 { "" } else { "s" }, if warnings == 1 { "" } else { "s" })
+    };
+    lines.push(detail_line(detail));
+
+    // Show first lint item
+    if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
+        if let Some(first) = items.first() {
+            let msg = first.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            if !msg.is_empty() {
+                let truncated: String = msg.chars().take(80).collect();
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("\u{2514} ", DIM),
+                    Span::styled(truncated, DIM),
+                ]));
+            }
+        }
+    }
+
+    Some(lines)
+}
+
+fn render_kube_pod(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let resource = str_field(v, "resource");
+    let title = format!("kubectl {resource}");
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    if let Some(pods) = v.get("pods").and_then(|p| p.as_array()) {
+        let pod_str: String = pods.iter().take(4).filter_map(|p| {
+            let name = p.get("name").and_then(|n| n.as_str())?;
+            let status = p.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+            let ready = p.get("ready").and_then(|r| r.as_str()).unwrap_or("?");
+            Some(format!("{name}: {ready} {status}"))
+        }).collect::<Vec<_>>().join(" \u{00b7} ");
+        if !pod_str.is_empty() { lines.push(detail_line(pod_str)); }
+    }
+
+    Some(lines)
+}
+
+fn render_kube_log(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let pod = str_field(v, "pod");
+    let errors = u32_field(v, "errors");
+    let warnings = u32_field(v, "warnings");
+    let total = u32_field(v, "lines_total");
+
+    let mut title = if pod.is_empty() { "kubectl logs".to_string() } else { format!("kubectl logs {pod}") };
+    if errors > 0 { title.push_str(" \u{00b7} errors found"); }
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    lines.push(detail_line(format!("{total} lines \u{00b7} {errors} error{} \u{00b7} {warnings} warning{}",
+        if errors == 1 { "" } else { "s" }, if warnings == 1 { "" } else { "s" })));
+
+    if let Some(cause) = v.get("root_cause").and_then(|c| c.as_str()) {
+        if !cause.is_empty() {
+            let truncated: String = cause.chars().take(100).collect();
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("\u{2514} ", DIM),
+                Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+            ]));
+        }
+    }
+
+    Some(lines)
+}
+
+fn render_kube_event(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let ns = str_field(v, "namespace");
+    let title = format!("kubectl events \u{00b7} {ns}");
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    if let Some(events) = v.get("events").and_then(|e| e.as_array()) {
+        let warn_count = events.iter().filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("Warning")).count();
+        lines.push(detail_line(format!("{} event{} \u{00b7} {} Warning{}",
+            events.len(), if events.len() == 1 { "" } else { "s" },
+            warn_count, if warn_count == 1 { "" } else { "s" })));
+    }
+
+    Some(lines)
+}
+
+fn render_ci(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let pid = v.get("pipeline_id").and_then(|p| p.as_str());
+    let title = if let Some(pid) = pid {
+        format!("CI run #{pid}")
+    } else {
+        "CI".to_string()
+    };
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    if let Some(stages) = v.get("stages").and_then(|s| s.as_array()) {
+        let stage_str: String = stages.iter().take(6).filter_map(|s| {
+            let name = s.get("name").and_then(|n| n.as_str())?;
+            let status = s.get("status").and_then(|st| st.as_str()).unwrap_or("?");
+            let i = match status { "success" => "\u{2713}", "failure" => "\u{2717}", _ => "\u{25cf}" };
+            Some(format!("{i} {name}"))
+        }).collect::<Vec<_>>().join(" \u{00b7} ");
+        if !stage_str.is_empty() { lines.push(detail_line(stage_str)); }
+    }
+
+    Some(lines)
+}
+
+fn render_env_setup(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let manager = str_field(v, "manager");
+    let packages = u32_field(v, "packages");
+    let vulns = u32_field(v, "vulnerabilities");
+
+    let title = if packages > 0 { format!("Deps installed \u{00b7} {manager}") } else { format!("Build \u{00b7} {manager}") };
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    let mut detail = if packages > 0 { format!("{packages} package{}",  if packages == 1 { "" } else { "s" }) } else { String::new() };
+    if vulns > 0 {
+        if !detail.is_empty() { detail.push_str(" \u{00b7} "); }
+        detail.push_str(&format!("{vulns} vulnerabilit{}", if vulns == 1 { "y" } else { "ies" }));
+    }
+    if !detail.is_empty() { lines.push(detail_line(detail)); }
+
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        if !err.is_empty() {
+            let truncated: String = err.chars().take(100).collect();
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("\u{2514} ", DIM),
+                Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+            ]));
+        }
+    }
+
+    Some(lines)
+}
+
+fn render_migration(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
+    let applied = u32_field(v, "applied");
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+
+    let title = if applied > 0 { "Migration applied".to_string() } else { "Migration".to_string() };
+    let mut lines = vec![header_line(icon, style, title, secs)];
+
+    let mut detail = format!("{applied} applied");
+    if !name.is_empty() { detail.push_str(&format!(" \u{00b7} {name}")); }
+    lines.push(detail_line(detail));
+
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        if !err.is_empty() {
+            let truncated: String = err.chars().take(100).collect();
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("\u{2514} ", DIM),
+                Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+            ]));
+        }
+    }
+
+    Some(lines)
 }
 
 #[cfg(test)]
