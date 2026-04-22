@@ -8,6 +8,7 @@
 //! (e.g., a code fence split across two deltas) while keeping the
 //! streaming cost low (only delta lines sent to the UI).
 
+use crate::wrapping::wrap_text;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -153,11 +154,44 @@ impl MarkdownStreamCollector {
             }
             // Bullet list
             else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-                lines.push(Line::from(vec![
-                    Span::raw(indent.to_string()),
-                    Span::styled("\u{2022} ", Style::default().fg(Color::Rgb(232, 163, 23))),
-                    Span::raw(trimmed[2..].to_string()),
-                ]));
+                let effective_width = self.width.unwrap_or(80) as usize;
+                // indent (2) + bullet "• " (2) = 4 chars before body text
+                let bullet_prefix_len = indent.len() + 2;
+                let content_width = effective_width.saturating_sub(bullet_prefix_len);
+                let body = &trimmed[2..];
+                if content_width > 0 && body.len() > content_width {
+                    let segments = wrap_text(body, content_width);
+                    for (i, segment) in segments.iter().enumerate() {
+                        if i == 0 {
+                            // First line: indent + bullet + body
+                            let mut line_spans = vec![
+                                Span::raw(indent.to_string()),
+                                Span::styled(
+                                    "\u{2022} ",
+                                    Style::default().fg(Color::Rgb(232, 163, 23)),
+                                ),
+                            ];
+                            line_spans.extend(parse_inline_markdown(segment));
+                            lines.push(Line::from(line_spans));
+                        } else {
+                            // Continuation lines: aligned under the body text
+                            let continuation_indent = "    "; // indent(2) + "  "(2)
+                            let mut line_spans =
+                                vec![Span::raw(continuation_indent.to_string())];
+                            line_spans.extend(parse_inline_markdown(segment));
+                            lines.push(Line::from(line_spans));
+                        }
+                    }
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.to_string()),
+                        Span::styled(
+                            "\u{2022} ",
+                            Style::default().fg(Color::Rgb(232, 163, 23)),
+                        ),
+                        Span::raw(body.to_string()),
+                    ]));
+                }
             }
             // Numbered list
             else if trimmed.len() > 2
@@ -207,10 +241,21 @@ impl MarkdownStreamCollector {
             }
             // Regular text — apply inline formatting
             else {
-                let spans = parse_inline_markdown(trimmed);
-                let mut line_spans = vec![Span::raw(indent.to_string())];
-                line_spans.extend(spans);
-                lines.push(Line::from(line_spans));
+                let effective_width = self.width.unwrap_or(80) as usize;
+                let content_width = effective_width.saturating_sub(indent.len());
+                if content_width > 0 && trimmed.len() > content_width {
+                    let segments = wrap_text(trimmed, content_width);
+                    for segment in &segments {
+                        let mut line_spans = vec![Span::raw(indent.to_string())];
+                        line_spans.extend(parse_inline_markdown(segment));
+                        lines.push(Line::from(line_spans));
+                    }
+                } else {
+                    let spans = parse_inline_markdown(trimmed);
+                    let mut line_spans = vec![Span::raw(indent.to_string())];
+                    line_spans.extend(spans);
+                    lines.push(Line::from(line_spans));
+                }
             }
         }
 
@@ -387,5 +432,25 @@ mod tests {
         let mut collector = MarkdownStreamCollector::new(Some(80));
         assert!(collector.commit_complete_lines().is_empty());
         assert!(collector.finalize_and_drain().is_empty());
+    }
+
+    #[test]
+    fn long_line_wraps_to_width() {
+        let mut collector = MarkdownStreamCollector::new(Some(30));
+        collector.push_delta("This is a long line that should wrap at narrow terminal widths ok\n");
+        let lines = collector.commit_complete_lines();
+        assert!(lines.len() > 1, "long line should wrap at width 30, got {} lines", lines.len());
+    }
+
+    #[test]
+    fn width_change_affects_new_lines() {
+        let mut collector = MarkdownStreamCollector::new(Some(120));
+        collector.push_delta("Short line\n");
+        let lines1 = collector.commit_complete_lines();
+        assert_eq!(lines1.len(), 1);
+        collector.set_width(20);
+        collector.push_delta("Another long line that should definitely wrap at twenty columns\n");
+        let lines2 = collector.commit_complete_lines();
+        assert!(lines2.len() > 1, "narrow width should cause wrapping");
     }
 }
