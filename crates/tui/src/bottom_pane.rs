@@ -13,16 +13,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use crate::app::{App, InputMode};
-// shimmer removed — activity bar now uses a clean blinking dot (Claude Code style).
+// High-Visibility Palette — see docs/v4/UI-v2.md §2.4.
 
-const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+const DIM: Style = Style::new().fg(Color::Rgb(85, 85, 85));
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
-const CYAN: Style = Style::new().fg(Color::Cyan);
-const BOLD_CYAN: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-const YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23));
-const BOLD_YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23)).add_modifier(Modifier::BOLD);
-const GREEN: Style = Style::new().fg(Color::Green);
-const RED: Style = Style::new().fg(Color::Red);
+const WHITE: Style = Style::new().fg(Color::Rgb(255, 255, 255));
+const CYAN: Style = Style::new().fg(Color::Rgb(0, 229, 255));
+const BOLD_CYAN: Style = Style::new().fg(Color::Rgb(0, 229, 255)).add_modifier(Modifier::BOLD);
+const YELLOW: Style = Style::new().fg(Color::Rgb(255, 176, 0));
+const BOLD_YELLOW: Style = Style::new().fg(Color::Rgb(255, 176, 0)).add_modifier(Modifier::BOLD);
+const GREEN: Style = Style::new().fg(Color::Rgb(57, 255, 20));
+const RED: Style = Style::new().fg(Color::Rgb(255, 51, 51));
 
 /// Gear spinner frames for the activity indicator (Industrial ASCII style).
 /// Cycles through |, /, -, \ at 100ms per frame.
@@ -72,7 +73,7 @@ impl<'a> BottomPane<'a> {
         if self.app.chat.is_streaming() {
             let partial = self.app.chat.partial_line();
             // Blink cursor: on/off every 8 spinner frames (~256ms at 32ms/frame).
-            let cursor = if (self.app.spinner_frame / 8) % 2 == 0 { "\u{258c}" } else { " " };
+            let cursor = if (self.app.spinner_frame / 8) % 2 == 0 { "_" } else { " " };
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::raw(partial.to_string()),
@@ -150,7 +151,7 @@ impl<'a> BottomPane<'a> {
         let max_show = filtered.len().min(10);
         for (i, cmd) in filtered.iter().take(max_show).enumerate() {
             let (name_style, desc_style) = if i == self.app.popup_index {
-                (BOLD_CYAN, Style::default().fg(Color::White))
+                (BOLD_CYAN, WHITE)
             } else {
                 (CYAN, DIM)
             };
@@ -185,7 +186,7 @@ impl<'a> BottomPane<'a> {
         for (i, (key, label, desc)) in options.iter().enumerate() {
             let selected = i == self.app.approval_index;
             let (marker, key_style, label_style, desc_style) = if selected {
-                ("> ", BOLD_CYAN, BOLD_CYAN, Style::default().fg(Color::White))
+                ("> ", BOLD_CYAN, BOLD_CYAN, WHITE)
             } else {
                 ("  ", DIM, DIM, DIM)
             };
@@ -202,9 +203,9 @@ impl<'a> BottomPane<'a> {
         let max_show = self.app.file_search_results.len().min(10);
         for (i, result) in self.app.file_search_results.iter().take(max_show).enumerate() {
             let icon = if result.is_dir {
-                "\u{1f4c1}"
+                "D/"  // directory indicator (no emoji)
             } else if result.is_image {
-                "\u{1f5bc}"
+                "I "  // image indicator (no emoji)
             } else {
                 "  "
             };
@@ -285,15 +286,15 @@ impl<'a> BottomPane<'a> {
 
         let is_approval = *phase == crate::app::AgentPhase::WaitingForApproval;
         let gear_style = if is_approval {
-            Style::default().fg(Color::Yellow)
+            YELLOW
         } else {
-            Style::default().fg(Color::Cyan)
+            CYAN
         };
 
         let mut spans = vec![
             Span::styled(format!("{gear}"), gear_style),
             Span::raw(" "),
-            Span::styled(display_label.to_string(), Style::default().fg(Color::White)),
+            Span::styled(display_label.to_string(), WHITE),
         ];
 
         // Inline detail: > separator + context
@@ -399,11 +400,11 @@ impl<'a> BottomPane<'a> {
                     let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
                     let empty = bar_width.saturating_sub(filled);
                     let bar_color = if pct > 80.0 {
-                        Style::default().fg(Color::Red)
+                        RED
                     } else if pct > 60.0 {
-                        Style::default().fg(Color::Yellow)
+                        YELLOW
                     } else {
-                        Style::default().fg(Color::Green)
+                        GREEN
                     };
                     vec![
                         Span::styled(
@@ -506,7 +507,7 @@ impl<'a> BottomPane<'a> {
         // Find cursor position within input
         let (cursor_line, cursor_col) = cursor_position_in_multiline(&self.app.input, self.app.cursor);
         let y = area.y + input_row_start + cursor_line as u16;
-        let x = area.x + cursor_col as u16 + 4; // 4 = "│ ❯ " prefix width
+        let x = area.x + cursor_col as u16 + 4; // 4 = "  > " prefix width
 
         if y < area.y + MAX_PANE_HEIGHT {
             Some((x.min(area.x + area.width - 1), y))
@@ -596,7 +597,7 @@ pub fn banner_lines(
     lines.push(Line::from(vec![
         Span::styled("\u{2503}              ", DIM),  // ┃
         Span::styled("[DIR] ", DIM),
-        Span::styled(directory.to_string(), Style::default().fg(Color::White)),
+        Span::styled(directory.to_string(), WHITE),
     ]));
     if let Some(instr) = instructions_display {
         lines.push(Line::from(vec![

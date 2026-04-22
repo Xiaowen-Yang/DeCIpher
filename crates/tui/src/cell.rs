@@ -24,6 +24,13 @@ fn blink_tick() -> u64 {
     blink_start().elapsed().as_millis() as u64 / 500
 }
 
+/// Radar sweep animation: [>---] [->--] [-->-] [--->] cycling at 200ms.
+fn radar_sweep() -> &'static str {
+    const FRAMES: [&str; 4] = ["[>---]", "[->--]", "[-->-]", "[--->]"];
+    let idx = (blink_start().elapsed().as_millis() / 200) as usize % 4;
+    FRAMES[idx]
+}
+
 // ── Content sanitization ──────────────────────────────────────────────────
 
 /// Strip ANSI escape sequences (CSI, OSC), OSC 8 hyperlink fragments,
@@ -90,15 +97,25 @@ pub fn is_read_only_tool(tool: &str) -> bool {
     )
 }
 
-// ── Theme constants ────────────────────────────────────────────────────────
+// ── High-Visibility Palette ────────────────────────────────────────────────
+//
+// Every color has one exact value.  See docs/v4/UI-v2.md §2.4.
+//   DIM     #555555   Rgb(85,85,85)     pipes, timestamps, secondary
+//   WHITE   #FFFFFF   Rgb(255,255,255)  primary text, tool names
+//   CYAN    #00E5FF   Rgb(0,229,255)    active [-], spinner, progress
+//   GREEN   #39FF14   Rgb(57,255,20)    success [*], diff +, PASS
+//   RED     #FF3333   Rgb(255,51,51)    fail [x], diff -, errors
+//   YELLOW  #FFB000   Rgb(255,176,0)    prompt >, warnings, [!]
 
-const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+const DIM: Style = Style::new().fg(Color::Rgb(85, 85, 85));
 const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
-const GREEN: Style = Style::new().fg(Color::Green);
-const RED: Style = Style::new().fg(Color::Red);
-const CYAN: Style = Style::new().fg(Color::Cyan);
-const YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23));
-const BOLD_YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23)).add_modifier(Modifier::BOLD);
+const WHITE: Style = Style::new().fg(Color::Rgb(255, 255, 255));
+const GREEN: Style = Style::new().fg(Color::Rgb(57, 255, 20));
+const RED: Style = Style::new().fg(Color::Rgb(255, 51, 51));
+const CYAN: Style = Style::new().fg(Color::Rgb(0, 229, 255));
+const YELLOW: Style = Style::new().fg(Color::Rgb(255, 176, 0));
+const BOLD_YELLOW: Style = Style::new().fg(Color::Rgb(255, 176, 0)).add_modifier(Modifier::BOLD);
+const DIM_RED: Style = Style::new().fg(Color::Rgb(255, 51, 51)).add_modifier(Modifier::DIM);
 
 // ── Cell trait ─────────────────────────────────────────────────────────────
 
@@ -160,19 +177,21 @@ impl Cell for UserCell {
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        // Rule 1: empty line before ┏━ top-level card
+        lines.push(Line::from(""));
         for (i, line) in self.text.lines().enumerate() {
             if i == 0 {
                 // ┏━ > user text
                 lines.push(Line::from(vec![
                     Span::styled("\u{250f}\u{2501} ", DIM),  // ┏━
                     Span::styled("> ", YELLOW),
-                    Span::styled(line.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(line.to_string(), WHITE.add_modifier(Modifier::BOLD)),
                 ]));
             } else {
                 // ┃ continuation
                 lines.push(Line::from(vec![
                     Span::styled("\u{2503} ", DIM),  // ┃
-                    Span::styled(line.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(line.to_string(), WHITE.add_modifier(Modifier::BOLD)),
                 ]));
             }
         }
@@ -234,7 +253,7 @@ impl Cell for MissionCell {
         lines.push(Line::from(vec![
             Span::styled("\u{2503}  ", DIM),  // ┃
             Span::styled("Understood: ", DIM),
-            Span::styled(self.understood.clone(), Style::default().fg(Color::White)),
+            Span::styled(self.understood.clone(), WHITE),
         ]));
         if let Some(ref target) = self.target {
             lines.push(Line::from(vec![
@@ -451,10 +470,15 @@ impl Cell for ExecCell {
 
             match call.success {
                 None => {
-                    // In-progress: [-] state switch
+                    // In-progress: radar sweep for read-only, [-] for others
+                    let switch = if is_read_only {
+                        Span::styled(format!("{} ", radar_sweep()), CYAN)
+                    } else {
+                        Span::styled("[-] ", CYAN)
+                    };
                     lines.push(Line::from(vec![
                         Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
-                        Span::styled("[-] ", CYAN),
+                        switch,
                         Span::styled(display, DIM),
                     ]));
                 }
@@ -472,7 +496,7 @@ impl Cell for ExecCell {
                     } else {
                         String::new()
                     };
-                    let text_style = if is_read_only && success { DIM } else { Style::default().fg(Color::White) };
+                    let text_style = if is_read_only && success { DIM } else { WHITE };
                     lines.push(Line::from(vec![
                         Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
                         switch,
@@ -487,7 +511,7 @@ impl Cell for ExecCell {
                         let style = if success {
                             DIM
                         } else {
-                            Style::new().fg(Color::Red).add_modifier(Modifier::DIM)
+                            DIM_RED
                         };
 
                         if !success {
@@ -715,7 +739,7 @@ impl Cell for ErrorCell {
         let msg_lines: Vec<&str> = self.message.lines().collect();
         if let Some(first) = msg_lines.first() {
             let truncated: String = first.chars().take(100).collect();
-            header_spans.push(Span::styled(truncated, Style::new().fg(Color::Red).add_modifier(Modifier::DIM)));
+            header_spans.push(Span::styled(truncated, DIM_RED));
         }
         lines.push(Line::from(header_spans));
 
@@ -731,7 +755,7 @@ impl Cell for ErrorCell {
             };
             lines.push(Line::from(vec![
                 Span::styled(prefix, DIM),
-                Span::styled(truncated, Style::new().fg(Color::Red).add_modifier(Modifier::DIM)),
+                Span::styled(truncated, DIM_RED),
             ]));
         }
         if msg_lines.len() > 5 {
@@ -1047,6 +1071,8 @@ impl Cell for ResultCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let secs = self.elapsed_ms as f64 / 1000.0;
         let mut lines = Vec::new();
+        // Rule 1: empty line before ┏━ top-level card
+        lines.push(Line::from(""));
 
         // ┏━ [*] RESULT: PASS  (12.4s)
         let (switch, label, outcome_style) = match self.outcome.as_str() {
@@ -1068,7 +1094,7 @@ impl Cell for ResultCell {
             let truncated: String = first.chars().take(120).collect();
             lines.push(Line::from(vec![
                 Span::styled("\u{2503}  ", DIM),  // ┃
-                Span::styled(truncated, Style::default().fg(Color::White)),
+                Span::styled(truncated, WHITE),
             ]));
         }
 
@@ -1118,7 +1144,7 @@ impl Cell for ClarificationCell {
             Line::from(vec![
                 Span::styled("\u{2503}  ", DIM),  // ┃
                 Span::styled("DeCIpher asks: ", BOLD_YELLOW),
-                Span::styled(self.question.clone(), Style::default().fg(Color::White)),
+                Span::styled(self.question.clone(), WHITE),
             ]),
             Line::from(vec![
                 Span::styled("\u{2503}  ", DIM),  // ┃
@@ -1295,15 +1321,20 @@ fn render_test_suite(v: &serde_json::Value, icon: &'static str, style: Style, se
     }
     lines.push(detail_line(detail));
 
-    // Show up to 3 failure names
+    // Show up to 3 failure names with ┇ internal segmentation (Rule 3)
     if let Some(failures) = v.get("failures").and_then(|f| f.as_array()) {
-        for fail in failures.iter().take(3) {
-            let name = fail.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if !name.is_empty() {
+        let fail_names: Vec<&str> = failures.iter().take(3)
+            .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
+            .filter(|n| !n.is_empty())
+            .collect();
+        if !fail_names.is_empty() {
+            // Rule 3: ┇ spacer between summary and failure details
+            lines.push(Line::from(Span::styled("\u{2507}", DIM)));
+            for (i, name) in fail_names.iter().enumerate() {
+                let pipe = if i == fail_names.len() - 1 { "\u{2570}  " } else { "\u{2503}  " };
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("\u{2570}  ", DIM),  // ╰
-                    Span::styled(name.to_string(), Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+                    Span::styled(pipe, DIM),
+                    Span::styled(name.to_string(), DIM_RED),
                 ]));
             }
         }
@@ -1348,7 +1379,7 @@ fn render_docker_build(v: &serde_json::Value, icon: &'static str, style: Style, 
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled("\u{2570}  ", DIM),  // ╰
-                Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+                Span::styled(truncated, DIM_RED),
             ]));
         }
     }
@@ -1381,17 +1412,35 @@ fn render_docker_run(v: &serde_json::Value, icon: &'static str, style: Style, se
 }
 
 fn render_compose(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
-    let title = "Compose up".to_string();
+    let svc_count = v.get("services").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0);
+    let title = format!("COMPOSE_UP ({svc_count} services)");
     let mut lines = vec![header_line(icon, style, title, secs)];
 
+    // Multi-line switch matrix — one service per line
     if let Some(services) = v.get("services").and_then(|s| s.as_array()) {
-        let svc_str: String = services.iter().take(5).filter_map(|s| {
-            let name = s.get("name").and_then(|n| n.as_str())?;
+        let svcs: Vec<_> = services.iter().take(6).collect();
+        let last_idx = svcs.len().saturating_sub(1);
+        for (i, s) in svcs.iter().enumerate() {
+            let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+            let image = s.get("image").and_then(|im| im.as_str()).unwrap_or("");
+            let port = s.get("port").and_then(|p| p.as_str()).unwrap_or("--");
             let status = s.get("status").and_then(|st| st.as_str()).unwrap_or("?");
-            let switch = if status == "up" { "[*]" } else { "[x]" };
-            Some(format!("{switch} {name}"))
-        }).collect::<Vec<_>>().join(" \u{00b7} ");
-        if !svc_str.is_empty() { lines.push(detail_line(svc_str)); }
+            let health = s.get("health").and_then(|h| h.as_str()).unwrap_or("");
+
+            let (switch, sw_style) = if status == "up" { ("[*]", GREEN) } else { ("[x]", RED) };
+            let pipe = if i == last_idx { "\u{2570}  " } else { "\u{2503}  " };
+
+            let mut detail = format!("{name:<10}");
+            if !image.is_empty() { detail.push_str(&format!("{image:<18}")); }
+            detail.push_str(&format!("{port:<6}"));
+            if !health.is_empty() { detail.push_str(health); }
+
+            lines.push(Line::from(vec![
+                Span::styled(pipe, DIM),
+                Span::styled(format!("{switch} "), sw_style),
+                Span::styled(detail, DIM),
+            ]));
+        }
     }
 
     Some(lines)
@@ -1424,7 +1473,7 @@ fn render_git_op(v: &serde_json::Value, icon: &'static str, style: Style, secs: 
                 Span::raw("    "),
                 Span::styled("\u{2570}  ", DIM),  // ╰
                 Span::styled(format!("{} conflict{}", conflicts.len(), if conflicts.len() == 1 { "" } else { "s" }),
-                    Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+                    DIM_RED),
             ]));
         }
     }
@@ -1471,17 +1520,35 @@ fn render_lint(v: &serde_json::Value, icon: &'static str, style: Style, secs: f6
 
 fn render_kube_pod(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
     let resource = str_field(v, "resource");
-    let title = format!("kubectl {resource}");
+    let title = format!("ROLLOUT: {resource}");
     let mut lines = vec![header_line(icon, style, title, secs)];
 
+    // Multi-line switch matrix — one pod per line
     if let Some(pods) = v.get("pods").and_then(|p| p.as_array()) {
-        let pod_str: String = pods.iter().take(4).filter_map(|p| {
-            let name = p.get("name").and_then(|n| n.as_str())?;
+        let pod_list: Vec<_> = pods.iter().take(6).collect();
+        let last_idx = pod_list.len().saturating_sub(1);
+        for (i, p) in pod_list.iter().enumerate() {
+            let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("?");
             let status = p.get("status").and_then(|s| s.as_str()).unwrap_or("?");
             let ready = p.get("ready").and_then(|r| r.as_str()).unwrap_or("?");
-            Some(format!("{name}: {ready} {status}"))
-        }).collect::<Vec<_>>().join(" \u{00b7} ");
-        if !pod_str.is_empty() { lines.push(detail_line(pod_str)); }
+            let restarts = p.get("restarts").and_then(|r| r.as_u64()).unwrap_or(0);
+
+            let (switch, sw_style) = match status {
+                "Running" => ("[*]", GREEN),
+                "CrashLoopBackOff" | "Error" | "OOMKilled" => ("[x]", RED),
+                "Pending" | "ContainerCreating" => ("[-]", CYAN),
+                _ => ("[ ]", DIM),
+            };
+            let pipe = if i == last_idx { "\u{2570}  " } else { "\u{2503}  " };
+
+            let text = format!("{name:<24}{ready:<8}{status:<16}{restarts}");
+
+            lines.push(Line::from(vec![
+                Span::styled(pipe, DIM),
+                Span::styled(format!("{switch} "), sw_style),
+                Span::styled(text, DIM),
+            ]));
+        }
     }
 
     Some(lines)
@@ -1506,7 +1573,7 @@ fn render_kube_log(v: &serde_json::Value, icon: &'static str, style: Style, secs
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled("\u{2570}  ", DIM),  // ╰
-                Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+                Span::styled(truncated, DIM_RED),
             ]));
         }
     }
@@ -1532,20 +1599,39 @@ fn render_kube_event(v: &serde_json::Value, icon: &'static str, style: Style, se
 fn render_ci(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
     let pid = v.get("pipeline_id").and_then(|p| p.as_str());
     let title = if let Some(pid) = pid {
-        format!("CI run #{pid}")
+        format!("PIPELINE #{pid}")
     } else {
-        "CI".to_string()
+        "PIPELINE".to_string()
     };
     let mut lines = vec![header_line(icon, style, title, secs)];
 
+    // Multi-line switch matrix — one stage per line
     if let Some(stages) = v.get("stages").and_then(|s| s.as_array()) {
-        let stage_str: String = stages.iter().take(6).filter_map(|s| {
-            let name = s.get("name").and_then(|n| n.as_str())?;
-            let status = s.get("status").and_then(|st| st.as_str()).unwrap_or("?");
-            let switch = match status { "success" => "[*]", "failure" => "[x]", _ => "[-]" };
-            Some(format!("{switch} {name}"))
-        }).collect::<Vec<_>>().join(" \u{00b7} ");
-        if !stage_str.is_empty() { lines.push(detail_line(stage_str)); }
+        let stgs: Vec<_> = stages.iter().take(8).collect();
+        let last_idx = stgs.len().saturating_sub(1);
+        for (i, s) in stgs.iter().enumerate() {
+            let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+            let status = s.get("status").and_then(|st| st.as_str()).unwrap_or("pending");
+            let elapsed = s.get("elapsed").and_then(|e| e.as_str()).unwrap_or("--");
+            let detail = s.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+
+            let (switch, sw_style) = match status {
+                "success" => ("[*]", GREEN),
+                "failure" => ("[x]", RED),
+                "running" => ("[-]", CYAN),
+                _ => ("[ ]", DIM),
+            };
+            let pipe = if i == last_idx { "\u{2570}  " } else { "\u{2503}  " };
+
+            let mut text = format!("{name:<12}{elapsed:<8}");
+            if !detail.is_empty() { text.push_str(detail); }
+
+            lines.push(Line::from(vec![
+                Span::styled(pipe, DIM),
+                Span::styled(format!("{switch} "), sw_style),
+                Span::styled(text, DIM),
+            ]));
+        }
     }
 
     Some(lines)
@@ -1572,7 +1658,7 @@ fn render_env_setup(v: &serde_json::Value, icon: &'static str, style: Style, sec
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled("\u{2570}  ", DIM),  // ╰
-                Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+                Span::styled(truncated, DIM_RED),
             ]));
         }
     }
@@ -1597,7 +1683,7 @@ fn render_migration(v: &serde_json::Value, icon: &'static str, style: Style, sec
             lines.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled("\u{2570}  ", DIM),  // ╰
-                Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
+                Span::styled(truncated, DIM_RED),
             ]));
         }
     }
@@ -1613,20 +1699,23 @@ mod tests {
     fn user_cell_basic() {
         let cell = UserCell::new("hello world".into(), vec![]);
         let lines = cell.display_lines(80);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(cell.desired_height(80), 1);
+        // empty (Rule 1) + ┏━ > text = 2
+        assert_eq!(lines.len(), 2);
+        assert_eq!(cell.desired_height(80), 2);
     }
 
     #[test]
     fn user_cell_multiline() {
         let cell = UserCell::new("line one\nline two\nline three".into(), vec![]);
-        assert_eq!(cell.desired_height(80), 3);
+        // empty (Rule 1) + 3 text lines = 4
+        assert_eq!(cell.desired_height(80), 4);
     }
 
     #[test]
     fn user_cell_with_images() {
         let cell = UserCell::new("hello".into(), vec!["img1".into(), "img2".into()]);
-        assert_eq!(cell.desired_height(80), 2); // text + image count
+        // empty (Rule 1) + text + image count = 3
+        assert_eq!(cell.desired_height(80), 3);
     }
 
     #[test]
@@ -1713,8 +1802,8 @@ mod tests {
     fn result_cell_success() {
         let cell = ResultCell::new("PASS".into(), "All tests pass".into(), 5, 12000, vec![], vec![], vec![]);
         let lines = cell.display_lines(80);
-        // ┏━ [*] RESULT: PASS + ┃ summary = 2 lines
-        assert!(lines.len() >= 2, "Expected >= 2 lines, got {}", lines.len());
+        // empty (Rule 1) + ┏━ [*] RESULT: PASS + ┃ summary = 3 lines
+        assert!(lines.len() >= 3, "Expected >= 3 lines, got {}", lines.len());
         let all_text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>().join("");
