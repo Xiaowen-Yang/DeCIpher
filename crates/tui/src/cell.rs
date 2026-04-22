@@ -616,37 +616,40 @@ impl Cell for ExecCell {
 
 // ── AgentMessageCell ───────────────────────────────────────────────────────
 
-/// Agent markdown response — pre-rendered lines.
+/// Agent markdown response — stores raw text, re-renders at requested width.
 #[derive(Debug)]
 pub struct AgentMessageCell {
-    /// Pre-rendered lines from the markdown stream collector.
-    pub rendered_lines: Vec<Line<'static>>,
+    /// Raw markdown text accumulated from the stream.
+    pub raw_text: String,
     /// Whether this is the first message in a sequence (adds top padding).
     pub is_first_line: bool,
 }
 
 impl AgentMessageCell {
-    pub fn new(rendered_lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
-        Self { rendered_lines, is_first_line }
+    pub fn new(raw_text: String, is_first_line: bool) -> Self {
+        Self { raw_text, is_first_line }
     }
 
     /// Create from raw markdown text (for non-streamed messages).
     pub fn from_text(text: &str) -> Self {
-        // Sanitize ANSI/OSC before rendering.
         let clean = sanitize_display_text(text);
-        let rendered_lines = clean
-            .lines()
-            .map(|line| Line::from(format!("  {}", line)))
-            .collect();
         Self {
-            rendered_lines,
+            raw_text: clean,
             is_first_line: true,
         }
     }
 
-    /// Append additional rendered lines (from streaming).
-    pub fn append_lines(&mut self, lines: Vec<Line<'static>>) {
-        self.rendered_lines.extend(lines);
+    /// Append raw markdown text (from streaming).
+    pub fn append_raw(&mut self, text: &str) {
+        self.raw_text.push_str(text);
+    }
+
+    /// Render raw text at the given width using MarkdownStreamCollector.
+    fn render_at_width(&self, width: u16) -> Vec<Line<'static>> {
+        use crate::markdown_stream::MarkdownStreamCollector;
+        let mut collector = MarkdownStreamCollector::new(Some(width));
+        collector.push_delta(&self.raw_text);
+        collector.finalize_and_drain()
     }
 }
 
@@ -654,8 +657,8 @@ impl Cell for AgentMessageCell {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        self.rendered_lines.clone()
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.render_at_width(width)
     }
 
     fn is_continuation(&self) -> bool {
@@ -1936,7 +1939,7 @@ mod tests {
 
     #[test]
     fn agent_message_continuation() {
-        let cell = AgentMessageCell::new(vec![], false);
+        let cell = AgentMessageCell::new(String::new(), false);
         assert!(cell.is_continuation());
     }
 

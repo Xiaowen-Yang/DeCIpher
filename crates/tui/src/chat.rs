@@ -32,6 +32,10 @@ pub struct ChatWidget {
     /// Set when a write/exec ToolCard was flushed since the last GroupDivider.
     /// Used to decide whether to insert a divider before the next TaskCard.
     had_write_exec_since_divider: bool,
+    /// Set when the last non-read-only exec completion had output preview (multi-line body).
+    /// Used to insert Rule 2 empty-line spacing between consecutive multi-line exec blocks.
+    /// Reset when the next agent reasoning turn begins (AgentMessage delta).
+    last_exec_had_preview: bool,
     /// Files modified by write_file / apply_patch during the current task group.
     /// Cleared when a DiffCard is emitted.
     files_modified_pending: Vec<String>,
@@ -47,6 +51,7 @@ impl ChatWidget {
             streaming: false,
             width,
             had_write_exec_since_divider: false,
+            last_exec_had_preview: false,
             files_modified_pending: Vec::new(),
         }
     }
@@ -84,20 +89,25 @@ impl ChatWidget {
     pub fn push_delta(&mut self, delta: &str) -> Vec<Line<'static>> {
         let flush_lines = if !self.streaming {
             self.streaming = true;
+            self.last_exec_had_preview = false; // Rule 2: reset between agent reasoning turns
             let is_first = self.active_cell.is_none();
             let flushed = self.flush_and_emit();
-            self.active_cell = Some(Box::new(AgentMessageCell::new(vec![], is_first)));
+            self.active_cell = Some(Box::new(AgentMessageCell::new(String::new(), is_first)));
             flushed
         } else {
             Vec::new()
         };
 
+        // Snapshot committed position before pushing new delta.
+        let prev_len = self.stream_collector.committed_raw().len();
         self.stream_collector.push_delta(delta);
         let new_lines = self.stream_collector.commit_complete_lines();
         if !new_lines.is_empty() {
+            // Extract newly committed raw text.
+            let new_raw = self.stream_collector.committed_raw()[prev_len..].to_string();
             if let Some(ref mut cell) = self.active_cell {
                 if let Some(agent_cell) = cell.as_any_mut().downcast_mut::<AgentMessageCell>() {
-                    agent_cell.append_lines(new_lines.clone());
+                    agent_cell.append_raw(&new_raw);
                 }
             }
             self.active_cell_revision += 1;
@@ -186,11 +196,12 @@ impl ChatWidget {
         if !self.streaming {
             return Vec::new();
         }
+        let partial_raw = self.stream_collector.partial_line().to_string();
         let remaining = self.stream_collector.finalize_and_drain();
         if !remaining.is_empty() {
             if let Some(ref mut cell) = self.active_cell {
                 if let Some(agent_cell) = cell.as_any_mut().downcast_mut::<AgentMessageCell>() {
-                    agent_cell.append_lines(remaining.clone());
+                    agent_cell.append_raw(&partial_raw);
                 }
             }
         }
@@ -374,6 +385,11 @@ impl ChatWidget {
                                 let completed_call = exec_cell.calls.iter().rev()
                                     .find(|c| c.tool == *tool && c.success.is_some());
                                 if let Some(call) = completed_call {
+                                    // Rule 2: empty line between consecutive multi-line exec blocks.
+                                    let has_preview = output_preview.as_ref().map_or(false, |p: &String| !p.is_empty());
+                                    if self.last_exec_had_preview && has_preview {
+                                        lines.push(Line::from(""));
+                                    }
                                     let display = format_tool_display(
                                         &call.tool,
                                         call.args.as_ref(),
@@ -489,6 +505,8 @@ impl ChatWidget {
                                             }
                                         }
                                     }
+                                    // Update Rule 2 spacing state for the next emission.
+                                    self.last_exec_had_preview = output_preview.as_ref().map_or(false, |p: &String| !p.is_empty());
                                 }
                             }
                         }
@@ -1139,5 +1157,19 @@ mod tests {
             c.as_any().downcast_ref::<crate::cell::ResultCell>().is_some()
         }).unwrap();
         assert!(diff_pos < result_pos, "DiffCard must appear before ResultCell");
+    }
+
+    #[test]
+    fn agent_message_reflows_on_width_change() {
+        // Text is short enough to fit on one line at width 200 (including 2-char indent),
+        // but long enough to wrap at width 30.
+        let mut widget = ChatWidget::new(200);
+        let long_text = "Agent message that should reflow when the terminal width changes\n";
+        let lines_wide = widget.push_delta(long_text);
+        assert_eq!(lines_wide.len(), 1, "should be 1 line at width 200");
+        widget.end_stream();
+        // Transcript at narrow width must wrap
+        let narrow_lines = widget.transcript_lines(30);
+        assert!(narrow_lines.len() > 1, "should wrap at width 30, got {} lines", narrow_lines.len());
     }
 }

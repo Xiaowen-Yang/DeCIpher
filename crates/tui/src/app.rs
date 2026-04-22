@@ -482,16 +482,8 @@ impl App {
         let last = self.chat.committed_cells.iter().rev()
             .find_map(|cell| cell.as_any().downcast_ref::<AgentMessageCell>());
         if let Some(agent_cell) = last {
-            // Extract raw text from rendered lines
-            let text: String = agent_cell.rendered_lines.iter()
-                .map(|line| {
-                    let raw: String = line.spans.iter()
-                        .map(|s| s.content.as_ref())
-                        .collect();
-                    raw.trim_start_matches("  ").to_string()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            // Use raw text directly — no need to re-extract from rendered lines.
+            let text = agent_cell.raw_text.clone();
             if let Ok(mut clipboard) = arboard::Clipboard::new() {
                 let _ = clipboard.set_text(&text);
             }
