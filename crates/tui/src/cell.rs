@@ -11,6 +11,8 @@ use std::time::Instant;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::wrapping::wrap_text;
+
 // ── Blink animation ──────────────────────────────────────────────────────
 
 /// Process start time for blink animation (deterministic across restarts).
@@ -175,24 +177,31 @@ impl Cell for UserCell {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        // 5 chars for "┏━ > " prefix (2 + 2 + space)
+        let content_width = (width as usize).saturating_sub(5).max(10);
         let mut lines = Vec::new();
         // Rule 1: empty line before ┏━ top-level card
         lines.push(Line::from(""));
-        for (i, line) in self.text.lines().enumerate() {
-            if i == 0 {
-                // ┏━ > user text
-                lines.push(Line::from(vec![
-                    Span::styled("\u{250f}\u{2501} ", DIM),  // ┏━
-                    Span::styled("> ", YELLOW),
-                    Span::styled(line.to_string(), WHITE.add_modifier(Modifier::BOLD)),
-                ]));
-            } else {
-                // ┃ continuation
-                lines.push(Line::from(vec![
-                    Span::styled("\u{2503} ", DIM),  // ┃
-                    Span::styled(line.to_string(), WHITE.add_modifier(Modifier::BOLD)),
-                ]));
+        let mut first_segment = true;
+        for input_line in self.text.lines() {
+            let wrapped = wrap_text(input_line, content_width);
+            for segment in wrapped {
+                if first_segment {
+                    // ┏━ > user text
+                    lines.push(Line::from(vec![
+                        Span::styled("\u{250f}\u{2501} ", DIM),  // ┏━
+                        Span::styled("> ", YELLOW),
+                        Span::styled(segment, WHITE.add_modifier(Modifier::BOLD)),
+                    ]));
+                    first_segment = false;
+                } else {
+                    // ┃ continuation
+                    lines.push(Line::from(vec![
+                        Span::styled("\u{2503} ", DIM),  // ┃
+                        Span::styled(segment, WHITE.add_modifier(Modifier::BOLD)),
+                    ]));
+                }
             }
         }
         if !self.images.is_empty() {
@@ -242,19 +251,36 @@ impl Cell for MissionCell {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        // 15 chars for "┃  Understood: " prefix
+        let understood_width = (width as usize).saturating_sub(15).max(10);
+        // 12 chars for "┇    N. " prefix
+        let step_width = (width as usize).saturating_sub(12).max(10);
+
         let mut lines = Vec::new();
         // ┣━ [MISSION]
         lines.push(Line::from(vec![
             Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
             Span::styled("[MISSION]", CYAN),
         ]));
-        // ┃  Understood: ...
-        lines.push(Line::from(vec![
-            Span::styled("\u{2503}  ", DIM),  // ┃
-            Span::styled("Understood: ", DIM),
-            Span::styled(self.understood.clone(), WHITE),
-        ]));
+        // ┃  Understood: ... (wrapped)
+        let understood_wrapped = wrap_text(&self.understood, understood_width);
+        for (i, seg) in understood_wrapped.iter().enumerate() {
+            if i == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("\u{2503}  ", DIM),  // ┃
+                    Span::styled("Understood: ", DIM),
+                    Span::styled(seg.clone(), WHITE),
+                ]));
+            } else {
+                // Align continuation with the text after "Understood: " (12 chars)
+                lines.push(Line::from(vec![
+                    Span::styled("\u{2503}  ", DIM),  // ┃
+                    Span::raw("            "),         // 12-space alignment
+                    Span::styled(seg.clone(), WHITE),
+                ]));
+            }
+        }
         if let Some(ref target) = self.target {
             lines.push(Line::from(vec![
                 Span::styled("\u{2503}  ", DIM),  // ┃
@@ -270,11 +296,23 @@ impl Cell for MissionCell {
             let last_idx = self.steps.len() - 1;
             for (i, step) in self.steps.iter().enumerate() {
                 let pipe = if i == last_idx { "\u{2507}  " } else { "\u{2507}  " };  // ┇
-                lines.push(Line::from(vec![
-                    Span::styled(pipe, DIM),
-                    Span::styled(format!("  {}. ", i + 1), DIM),
-                    Span::raw(step.clone()),
-                ]));
+                let step_wrapped = wrap_text(step, step_width);
+                for (j, seg) in step_wrapped.iter().enumerate() {
+                    if j == 0 {
+                        lines.push(Line::from(vec![
+                            Span::styled(pipe, DIM),
+                            Span::styled(format!("  {}. ", i + 1), DIM),
+                            Span::raw(seg.clone()),
+                        ]));
+                    } else {
+                        // Align continuation with step text (pipe + "  N. " padding)
+                        lines.push(Line::from(vec![
+                            Span::styled(pipe, DIM),
+                            Span::raw("      "),  // 6-space alignment for "  N. "
+                            Span::raw(seg.clone()),
+                        ]));
+                    }
+                }
             }
         }
         lines
@@ -716,7 +754,9 @@ impl Cell for ErrorCell {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        // 6 chars for "┣━ [x] " or "┃  " prefix overhead
+        let body_width = (width as usize).saturating_sub(6);
         let mut lines = Vec::new();
 
         // Category label
@@ -741,7 +781,7 @@ impl Cell for ErrorCell {
         // First line of error message on same line as label
         let msg_lines: Vec<&str> = self.message.lines().collect();
         if let Some(first) = msg_lines.first() {
-            let truncated: String = first.chars().take(100).collect();
+            let truncated: String = first.chars().take(body_width).collect();
             header_spans.push(Span::styled(truncated, DIM_RED));
         }
         lines.push(Line::from(header_spans));
@@ -750,7 +790,7 @@ impl Cell for ErrorCell {
         let extra = msg_lines.iter().skip(1).take(4).collect::<Vec<_>>();
         let extra_len = extra.len();
         for (i, line_text) in extra.iter().enumerate() {
-            let truncated: String = line_text.chars().take(100).collect();
+            let truncated: String = line_text.chars().take(body_width).collect();
             let prefix = if i == extra_len - 1 && msg_lines.len() <= 5 {
                 "\u{2570}  "  // ╰
             } else {
@@ -1071,7 +1111,9 @@ impl Cell for ResultCell {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        // 4 chars for "┃  " prefix overhead
+        let summary_width = (width as usize).saturating_sub(4).max(10);
         let secs = self.elapsed_ms as f64 / 1000.0;
         let mut lines = Vec::new();
         // Rule 1: empty line before ┏━ top-level card
@@ -1091,14 +1133,22 @@ impl Cell for ResultCell {
             Span::styled(format!("  ({secs:.1}s)"), DIM),
         ]));
 
-        // ┃  summary line
+        // ┃  summary lines (wrapped, up to 4)
         if !self.summary.is_empty() {
-            let first = self.summary.lines().next().unwrap_or(&self.summary);
-            let truncated: String = first.chars().take(120).collect();
-            lines.push(Line::from(vec![
-                Span::styled("\u{2503}  ", DIM),  // ┃
-                Span::styled(truncated, WHITE),
-            ]));
+            let wrapped = wrap_text(&self.summary, summary_width);
+            let total = wrapped.len();
+            for seg in wrapped.iter().take(4) {
+                lines.push(Line::from(vec![
+                    Span::styled("\u{2503}  ", DIM),  // ┃
+                    Span::styled(seg.clone(), WHITE),
+                ]));
+            }
+            if total > 4 {
+                lines.push(Line::from(vec![
+                    Span::styled("\u{2503}  ", DIM),  // ┃
+                    Span::styled(format!("... ({} more lines)", total - 4), DIM),
+                ]));
+            }
         }
 
         // ┇  Next: hint for non-pass outcomes

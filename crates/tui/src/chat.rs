@@ -1201,4 +1201,15 @@ mod tests {
         let narrow = widget.rebuild_scrollback(40);
         assert!(narrow.len() >= wide.len(), "narrow ({}) should have >= lines than wide ({})", narrow.len(), wide.len());
     }
+
+    #[test]
+    fn user_cell_wraps_at_narrow_width() {
+        let cell = crate::cell::UserCell::new(
+            "This is a very long user message that should definitely wrap when the terminal is narrow enough to require it".into(),
+            vec![],
+        );
+        let wide = cell.display_lines(120);
+        let narrow = cell.display_lines(40);
+        assert!(narrow.len() > wide.len(), "narrow ({}) should have more lines than wide ({})", narrow.len(), wide.len());
+    }
 }
