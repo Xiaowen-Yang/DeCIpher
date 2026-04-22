@@ -24,14 +24,13 @@ use crossterm::{
         EnableFocusChange, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers,
     },
-    execute, queue,
+    execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
     layout::Rect,
-    text::Line,
     Terminal, TerminalOptions, Viewport,
 };
 use tokio::sync::mpsc;
@@ -47,6 +46,7 @@ use decipher_tui::app::{self, App};
 use decipher_tui::bottom_pane::{self, BottomPane};
 
 mod config;
+mod insert_history;
 
 /// Tick rate: 32ms ≈ 31.25 FPS — smooth spinner animation matching Codex.
 const TICK_RATE: Duration = Duration::from_millis(32);
@@ -197,12 +197,12 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
     // Fixed viewport height. The terminal is recreated on resize (cheap —
     // just recreates the ratatui buffer) with the updated position.
     let viewport_height = bottom_pane::MAX_PANE_HEIGHT;
-    // vp_y: 0-based row index of the viewport top. Updated on resize.
+    // vp_y: dynamic 0-based row of viewport top. Shifts down as history is
+    // inserted via Reverse Index. Adjusted on resize via cursor delta.
     let mut vp_y = initial_rows.saturating_sub(viewport_height);
-    // Clear the entire visible screen so no stale shell content shows
-    // through.  The prior \n.repeat(rows) pushed the shell prompt into
-    // scrollback, but the visible rows may still contain artefacts.
-    let _ = execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All));
+    let mut screen_rows = initial_rows;
+    // Clear the viewport area so no stale shell content shows through.
+    let _ = execute!(io::stdout(), cursor::MoveTo(0, vp_y), Clear(ClearType::FromCursorDown));
     let mut terminal = make_terminal(viewport_height, initial_cols, vp_y)?;
 
     if initial_cols != app.chat.width() {
@@ -212,15 +212,11 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
     // pending_resize: coalesces rapid resize events — only the last per tick is applied.
     let mut pending_resize: Option<(u16, u16)> = None;
 
-    // Scrollback history: all lines ever inserted above the viewport.
-    // On resize, terminal emulators reposition DECSTBM content unpredictably,
-    // so we re-render the tail of this buffer to restore scrollback.
-    let mut scrollback_history: Vec<Line<'static>> = Vec::new();
-
     // ── Startup banner ───────────────────────────────────────────────────────
     // Render the banner immediately at TUI startup, not via AgentLoop event.
-    // AgentLoop is only spawned when the user submits input, so waiting for
-    // a Banner ServerMessage would leave the screen empty.
+    // Uses Codex-style Reverse Index + DECSTBM to insert content above the
+    // viewport and push the viewport down. The terminal's native scrollback
+    // owns this content — immune to resize artifacts.
     {
         let version = env!("CARGO_PKG_VERSION");
         let provider = match cli_cfg.provider_type {
@@ -251,23 +247,12 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
         let instr_display = instr_files.loaded_paths_display();
         let banner = bottom_pane::banner_lines(version, provider, &model, &directory, api_key_set, instr_display.as_deref());
         if !banner.is_empty() {
-            scrollback_history.extend_from_slice(&banner);
-            // Use direct cursor positioning for the startup banner instead
-            // of DECSTBM.  After \n.repeat(rows) the terminal's internal
-            // state makes DECSTBM unreliable — Codex solves this with a
-            // two-pass Reverse-Index approach, but absolute MoveTo is
-            // simpler and equally correct for a one-shot initial render.
-            // Later DECSTBM inserts (conversation content) work fine
-            // because the terminal state has stabilised by then.
-            let n = banner.len().min(vp_y as usize);
-            let start_y = vp_y.saturating_sub(n as u16);
-            let mut bstdout = io::stdout();
-            for (i, line) in banner.iter().take(n).enumerate() {
-                queue!(bstdout, cursor::MoveTo(0, start_y + i as u16))?;
-                write_scrollback_line(&mut bstdout, line, initial_cols)?;
+            let shift = insert_history::insert_history_lines(&banner, vp_y, screen_rows, initial_cols)?;
+            if shift > 0 {
+                vp_y += shift;
+                let _ = execute!(io::stdout(), cursor::MoveTo(0, vp_y), Clear(ClearType::FromCursorDown));
+                terminal = make_terminal(viewport_height, initial_cols, vp_y)?;
             }
-            queue!(bstdout, cursor::MoveTo(0, vp_y))?;
-            bstdout.flush()?;
         }
 
         // Also set banner info in app state for status bar display.
@@ -289,17 +274,22 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
         if let Some((cols, rows)) = pending_resize.take() {
             app.chat.set_width(cols);
             let vp_h = viewport_height.min(rows);
-            vp_y = rows.saturating_sub(vp_h);
+            let old_vp_y = vp_y;
 
-            // Clear the entire visible screen.  We intentionally do NOT
-            // re-render scrollback history — the terminal emulator pulls
-            // content from its scrollback buffer during resize, and any
-            // re-render we paint becomes a ghost on the next resize.
-            // Scrollback content is still in the terminal's native buffer
-            // (scroll up to see it); new conversation output flows normally.
-            let _ = execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::All));
+            // Adjust vp_y: keep it at the same distance from the bottom.
+            let max_vp_y = rows.saturating_sub(vp_h);
+            if rows != screen_rows {
+                let from_bottom = screen_rows.saturating_sub(vp_y);
+                vp_y = rows.saturating_sub(from_bottom).min(max_vp_y);
+            }
+            vp_y = vp_y.min(max_vp_y);
+            screen_rows = rows;
 
-            // Recreate terminal for the viewport at the new position.
+            // Clear from the HIGHER of old/new viewport positions down.
+            // When the terminal grows, the old viewport position is above
+            // the new one — its separator lines would ghost if not cleared.
+            let clear_from = old_vp_y.min(vp_y);
+            let _ = execute!(io::stdout(), cursor::MoveTo(0, clear_from), Clear(ClearType::FromCursorDown));
             terminal = make_terminal(vp_h, cols, vp_y)?;
             need_redraw = true;
         }
@@ -335,8 +325,12 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
                             KeyAction::Submit(msg) => {
                                 // Push submitted user input into scrollback.
                                 let lines = bottom_pane::user_input_lines(&app.last_submitted);
-                                scrollback_history.extend_from_slice(&lines);
-                                insert_scrollback_lines(&lines, vp_y, app.chat.width())?;
+                                let shift = insert_history::insert_history_lines(&lines, vp_y, screen_rows, app.chat.width())?;
+                                if shift > 0 {
+                                    vp_y += shift;
+                                    let _ = execute!(io::stdout(), cursor::MoveTo(0, vp_y), Clear(ClearType::FromCursorDown));
+                                    terminal = make_terminal(viewport_height, app.chat.width(), vp_y)?;
+                                }
                                 fps.mark_drawn();
                                 need_redraw = true;
 
@@ -831,8 +825,12 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
                     decipher_tui::render::set_terminal_title(&mut stdout, &format!("DeCIpher \u{2014} {model}"))?;
                     let banner = bottom_pane::banner_lines(version, provider, model, directory, api_key_set, None);
                     if !banner.is_empty() {
-                        scrollback_history.extend_from_slice(&banner);
-                        insert_scrollback_lines(&banner, vp_y, app.chat.width())?;
+                        let shift = insert_history::insert_history_lines(&banner, vp_y, screen_rows, app.chat.width())?;
+                        if shift > 0 {
+                            vp_y += shift;
+                            let _ = execute!(io::stdout(), cursor::MoveTo(0, vp_y), Clear(ClearType::FromCursorDown));
+                            terminal = make_terminal(viewport_height, app.chat.width(), vp_y)?;
+                        }
                     }
                 }
 
@@ -850,8 +848,12 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
                 // Route through ChatWidget → typed cells → scrollback lines.
                 let scrollback_lines = app.chat.handle_server_message(&msg);
                 if !scrollback_lines.is_empty() {
-                    scrollback_history.extend_from_slice(&scrollback_lines);
-                    insert_scrollback_lines(&scrollback_lines, vp_y, app.chat.width())?;
+                    let shift = insert_history::insert_history_lines(&scrollback_lines, vp_y, screen_rows, app.chat.width())?;
+                    if shift > 0 {
+                        vp_y += shift;
+                        let _ = execute!(io::stdout(), cursor::MoveTo(0, vp_y), Clear(ClearType::FromCursorDown));
+                        terminal = make_terminal(viewport_height, app.chat.width(), vp_y)?;
+                    }
                 }
 
                 // Record to session JSONL before msg is consumed.
@@ -924,8 +926,12 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
             if let Some(queued) = app.queued_message.take() {
                 if let ClientMessage::UserInput { ref text, .. } = queued {
                     let lines = bottom_pane::user_input_lines(&app.last_submitted);
-                    scrollback_history.extend_from_slice(&lines);
-                    insert_scrollback_lines(&lines, vp_y, app.chat.width())?;
+                    let shift = insert_history::insert_history_lines(&lines, vp_y, screen_rows, app.chat.width())?;
+                    if shift > 0 {
+                        vp_y += shift;
+                        let _ = execute!(io::stdout(), cursor::MoveTo(0, vp_y), Clear(ClearType::FromCursorDown));
+                        terminal = make_terminal(viewport_height, app.chat.width(), vp_y)?;
+                    }
                     fps.mark_drawn();
                     need_redraw = true;
 
@@ -987,7 +993,7 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
                 ss.close(last_outcome.clone()).await;
             }
             let lines = bottom_pane::goodbye_lines();
-            insert_scrollback_lines(&lines, vp_y, app.chat.width())?;
+            let _ = insert_history::insert_history_lines(&lines, vp_y, screen_rows, app.chat.width());
             break;
         }
     }
@@ -1553,140 +1559,6 @@ fn open_editor(initial_text: &str) -> Option<String> {
             let _ = fs::remove_file(&tmp_path);
             None
         }
-    }
-}
-
-/// Insert history lines above the fixed viewport using DECSTBM scroll regions.
-///
-/// Sets the ANSI scroll region to the rows above `vp_y`, moves the cursor to
-/// the bottom of that region, and for each line emits `\r\n` (scrolls the
-/// region up by one, pushing the topmost row into the terminal's scrollback
-/// buffer) then writes the styled line content. The viewport rows at
-/// `[vp_y..]` are never touched — ghost lines are structurally impossible.
-///
-/// Lines appear in order: `lines[0]` ends up farthest from the viewport,
-/// `lines[last]` directly above it.
-fn insert_scrollback_lines(lines: &[Line<'static>], vp_y: u16, width: u16) -> io::Result<()> {
-    if lines.is_empty() {
-        return Ok(());
-    }
-
-    let mut stdout = io::stdout();
-
-    if vp_y == 0 {
-        // No space above viewport — print directly, terminal will scroll naturally.
-        for line in lines {
-            write_scrollback_line(&mut stdout, line, width)?;
-            queue!(stdout, crossterm::style::Print("\r\n"))?;
-        }
-        return stdout.flush();
-    }
-
-    // Set scroll region to 1-based rows 1..vp_y (= 0-based rows 0..vp_y-1).
-    // \x1b[top;bottom r — DECSTBM (set scrolling region).
-    queue!(stdout, crossterm::style::Print(format!("\x1b[1;{}r", vp_y)))?;
-
-    // Move to the bottom of the scroll region (0-based: vp_y - 1).
-    queue!(stdout, cursor::MoveTo(0, vp_y.saturating_sub(1)))?;
-
-    for line in lines {
-        // \r\n at the bottom of the scroll region: shifts the entire region
-        // up by one row (top row → terminal scrollback), clears the bottom row,
-        // and keeps the cursor at the bottom of the region.
-        queue!(stdout, crossterm::style::Print("\r\n"))?;
-        write_scrollback_line(&mut stdout, line, width)?;
-    }
-
-    // Reset scroll region to full screen (\x1b[r).
-    queue!(stdout, crossterm::style::Print("\x1b[r"))?;
-
-    // Restore cursor to the viewport area. ratatui uses absolute MoveTo on
-    // the next draw(), so the exact position here doesn't matter much, but
-    // keeping it inside the viewport avoids visual artifacts.
-    queue!(stdout, cursor::MoveTo(0, vp_y))?;
-
-    stdout.flush()
-}
-
-/// Write a single styled `Line<'static>` to raw stdout for scrollback output.
-///
-/// Clears the current terminal line first, then emits each span with its
-/// foreground/background color and text modifiers (bold, italic, dim, underline).
-fn write_scrollback_line(stdout: &mut io::Stdout, line: &Line<'static>, width: u16) -> io::Result<()> {
-    use crossterm::style::{Attribute, Colors, SetAttribute, SetColors};
-    use unicode_width::UnicodeWidthChar;
-
-    // Clear from cursor to end of line before writing styled content.
-    queue!(stdout, Clear(ClearType::UntilNewLine))?;
-
-    let line_fg = line.style.fg;
-    let line_bg = line.style.bg;
-    let line_mod = line.style.add_modifier;
-    let mut col: u16 = 0;
-
-    'outer: for span in &line.spans {
-        // Merge line-level style into each span (line style is lower priority).
-        let fg = span.style.fg.or(line_fg).unwrap_or(ratatui::style::Color::Reset);
-        let bg = span.style.bg.or(line_bg).unwrap_or(ratatui::style::Color::Reset);
-        let modifier = span.style.add_modifier | line_mod;
-
-        queue!(stdout, SetColors(Colors::new(scrollback_color(fg), scrollback_color(bg))))?;
-
-        if modifier.contains(ratatui::style::Modifier::BOLD) {
-            queue!(stdout, SetAttribute(Attribute::Bold))?;
-        }
-        if modifier.contains(ratatui::style::Modifier::ITALIC) {
-            queue!(stdout, SetAttribute(Attribute::Italic))?;
-        }
-        if modifier.contains(ratatui::style::Modifier::DIM) {
-            queue!(stdout, SetAttribute(Attribute::Dim))?;
-        }
-        if modifier.contains(ratatui::style::Modifier::UNDERLINED) {
-            queue!(stdout, SetAttribute(Attribute::Underlined))?;
-        }
-
-        for ch in span.content.chars() {
-            let ch_width = ch.width().unwrap_or(0) as u16;
-            if col + ch_width > width {
-                break 'outer;
-            }
-            queue!(stdout, crossterm::style::Print(ch))?;
-            col += ch_width;
-        }
-    }
-
-    // Reset all attributes after each line.
-    queue!(stdout, SetAttribute(Attribute::Reset))?;
-    queue!(stdout, crossterm::style::SetColors(Colors::new(
-        crossterm::style::Color::Reset,
-        crossterm::style::Color::Reset,
-    )))
-}
-
-/// Convert a ratatui `Color` to a crossterm `Color`.
-fn scrollback_color(c: ratatui::style::Color) -> crossterm::style::Color {
-    use ratatui::style::Color as RC;
-    use crossterm::style::Color as CC;
-    match c {
-        RC::Reset     => CC::Reset,
-        RC::Black     => CC::Black,
-        RC::Red       => CC::DarkRed,
-        RC::Green     => CC::DarkGreen,
-        RC::Yellow    => CC::DarkYellow,
-        RC::Blue      => CC::DarkBlue,
-        RC::Magenta   => CC::DarkMagenta,
-        RC::Cyan      => CC::DarkCyan,
-        RC::Gray      => CC::Grey,
-        RC::DarkGray  => CC::DarkGrey,
-        RC::LightRed  => CC::Red,
-        RC::LightGreen  => CC::Green,
-        RC::LightYellow => CC::Yellow,
-        RC::LightBlue   => CC::Blue,
-        RC::LightMagenta => CC::Magenta,
-        RC::LightCyan   => CC::Cyan,
-        RC::White       => CC::White,
-        RC::Rgb(r, g, b) => CC::Rgb { r, g, b },
-        RC::Indexed(i)   => CC::AnsiValue(i),
     }
 }
 
