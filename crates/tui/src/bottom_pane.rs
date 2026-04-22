@@ -24,10 +24,9 @@ const BOLD_YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23)).add_modifie
 const GREEN: Style = Style::new().fg(Color::Green);
 const RED: Style = Style::new().fg(Color::Red);
 
-/// Blinking dot glyphs for the activity indicator (Claude Code style).
-/// Alternates between filled ● and empty ○ on a 500ms period.
-const DOT_FILLED: &str = "\u{25cf}"; // ●
-const DOT_EMPTY: &str = "\u{25cb}";  // ○
+/// Gear spinner frames for the activity indicator (Industrial ASCII style).
+/// Cycles through |, /, -, \ at 100ms per frame.
+const GEAR_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 
 /// Viewport height — the terminal is created ONCE with this height.
 ///
@@ -104,9 +103,9 @@ impl<'a> BottomPane<'a> {
         // Queued message indicator
         if self.app.queued_message.is_some() {
             lines.push(Line::from(vec![
-                Span::styled("  ", DIM),
-                Span::styled("\u{23f3} ", YELLOW),
-                Span::styled("Message queued \u{2014} will send when agent finishes", DIM),
+                Span::styled("\u{2507}  ", DIM),  // ┇
+                Span::styled("[WAIT] ", YELLOW),
+                Span::styled("Message queued -- will send when agent finishes", DIM),
             ]));
         }
 
@@ -173,11 +172,11 @@ impl<'a> BottomPane<'a> {
         // Tool action being requested.
         if let Some(ref action) = self.app.pending_approval_action {
             lines.push(Line::from(vec![
-                Span::styled("  ", DIM),
+                Span::raw("  "),
                 Span::styled(action.clone(), BOLD_YELLOW),
             ]));
         }
-        // Selectable options.
+        // Selectable options with > prefix and [y]/[a]/[n] switches.
         let options = [
             ("y", "Approve", "allow this action"),
             ("a", "Always", "approve all future actions"),
@@ -186,13 +185,13 @@ impl<'a> BottomPane<'a> {
         for (i, (key, label, desc)) in options.iter().enumerate() {
             let selected = i == self.app.approval_index;
             let (marker, key_style, label_style, desc_style) = if selected {
-                ("\u{25b8} ", BOLD_CYAN, BOLD_CYAN, Style::default().fg(Color::White))
+                ("> ", BOLD_CYAN, BOLD_CYAN, Style::default().fg(Color::White))
             } else {
-                ("  ", CYAN, DIM, DIM)
+                ("  ", DIM, DIM, DIM)
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {marker}"), if selected { BOLD_CYAN } else { DIM }),
-                Span::styled(format!("{key} "), key_style),
+                Span::styled(marker, if selected { BOLD_CYAN } else { DIM }),
+                Span::styled(format!("[{key}] "), key_style),
                 Span::styled(format!("{label:<8}"), label_style),
                 Span::styled(desc.to_string(), desc_style),
             ]));
@@ -231,17 +230,17 @@ impl<'a> BottomPane<'a> {
 
     fn build_input_lines(&self, lines: &mut Vec<Line<'static>>) {
         let w = self.app.chat.width() as usize;
-        let rule = "\u{2500}".repeat(w); // ──────...  full-width horizontal rule
+        let rule = "\u{2501}".repeat(w); // ━━━━━━...  heavy horizontal rule
 
         // Top rule
         lines.push(Line::from(Span::styled(rule.clone(), DIM)));
 
-        // Content lines: "  ❯ text" (no side border)
+        // Content lines: "  > text" (no side border)
         // [Image #N] tokens are highlighted in cyan.
         let input_lines: Vec<&str> = self.app.input.split('\n').collect();
         for (i, line) in input_lines.iter().enumerate() {
             let mut spans: Vec<Span<'static>> = if i == 0 {
-                vec![Span::styled("  ", DIM), Span::styled("\u{276f} ", BOLD_YELLOW)]
+                vec![Span::styled("  ", DIM), Span::styled("> ", YELLOW)]
             } else {
                 vec![Span::styled("    ", DIM)]
             };
@@ -269,11 +268,11 @@ impl<'a> BottomPane<'a> {
     }
 
     fn build_spinner(&self, label: &str, lines: &mut Vec<Line<'static>>) {
-        // Blinking dot: ● / ○ on 500ms period (Claude Code style).
-        let blink_on = self.app.spinner_started
-            .map(|t| (t.elapsed().as_millis() / 500) % 2 == 0)
-            .unwrap_or(true);
-        let dot = if blink_on { DOT_FILLED } else { DOT_EMPTY };
+        // Gear spinner: cycles |, /, -, \ (Industrial ASCII style).
+        let frame_idx = self.app.spinner_started
+            .map(|t| (t.elapsed().as_millis() / 100) as usize % 4)
+            .unwrap_or(0);
+        let gear = GEAR_FRAMES[frame_idx];
 
         let phase = &self.app.agent_phase;
 
@@ -285,26 +284,25 @@ impl<'a> BottomPane<'a> {
         };
 
         let is_approval = *phase == crate::app::AgentPhase::WaitingForApproval;
-        let dot_style = if is_approval {
+        let gear_style = if is_approval {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::Cyan)
         };
 
         let mut spans = vec![
-            Span::raw("  "),
-            Span::styled(dot, dot_style),
+            Span::styled(format!("{gear}"), gear_style),
             Span::raw(" "),
             Span::styled(display_label.to_string(), Style::default().fg(Color::White)),
         ];
 
-        // Inline detail: tool name/file for action phases.
+        // Inline detail: > separator + context
         if let Some(ref detail) = self.app.agent_phase_detail {
             let truncated: String = detail.chars().take(40).collect();
-            spans.push(Span::styled(format!(" \u{00b7} {truncated}"), DIM));
+            spans.push(Span::styled(format!(" > {truncated}"), DIM));
         }
 
-        // Turn counter (no max shown — agent runs until done or interrupted).
+        // Turn counter
         if self.app.agent_turn > 0 {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
@@ -348,8 +346,7 @@ impl<'a> BottomPane<'a> {
         if is_approval {
             spans.push(Span::styled("  y/n to decide", YELLOW));
         } else {
-            spans.push(Span::styled(" \u{00b7} ", DIM));
-            spans.push(Span::styled("esc to interrupt", DIM));
+            spans.push(Span::styled("  esc to interrupt", DIM));
         }
 
         lines.push(Line::from(spans));
@@ -462,18 +459,18 @@ impl<'a> BottomPane<'a> {
             ("? (empty)", "toggle this overlay"),
         ];
         lines.push(Line::from(Span::styled(
-            "  \u{250c} SHORTCUTS \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{250f}\u{2501}\u{2501} SHORTCUTS \u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}",
             DIM,
         )));
         for (key, desc) in &shortcuts {
             lines.push(Line::from(vec![
-                Span::styled("  \u{2502} ", DIM),
+                Span::styled("\u{2503}  ", DIM),  // ┃
                 Span::styled(format!("{:<16}", key), CYAN),
                 Span::styled(*desc, DIM),
             ]));
         }
         lines.push(Line::from(Span::styled(
-            "  \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{2517}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}",
             DIM,
         )));
     }
@@ -493,13 +490,13 @@ impl<'a> BottomPane<'a> {
         // ensuring truncation and padding are accounted for identically.
         let lines = self.build_lines();
 
-        // The input line is the one starting with "│ ❯" or "  ❯".
+        // The input line is the one starting with "> " prompt.
         // Find its index from the bottom (it's always near the end,
         // followed by bottom-rule + hints + optional shortcuts).
         let mut input_row: Option<u16> = None;
         for (i, line) in lines.iter().enumerate() {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            if text.contains('\u{276f}') || text.contains("❯") {
+            if text.contains("> ") && !text.contains("[>") {
                 input_row = Some(i as u16);
                 break;
             }
@@ -574,66 +571,62 @@ pub fn banner_lines(
     instructions_display: Option<&str>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::from(""));
+    // ┏━ DeCIpher v0.2.0 [SYS_READY]
     lines.push(Line::from(vec![
-        Span::raw("    "),
-        Span::styled("/\\_/\\", BOLD_YELLOW),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw("   "),
-        Span::styled("( \u{2022}\u{1d25}\u{2022} )", BOLD_YELLOW),
-        Span::raw("  "),
+        Span::styled("\u{250f}\u{2501} ", DIM),  // ┏━
         Span::styled("DeCIpher", BOLD_CYAN),
         Span::raw(" "),
         Span::styled(format!("v{}", version), DIM),
+        Span::raw(" "),
+        Span::styled("[SYS_READY]", DIM),
     ]));
-    lines.push(Line::from(""));
+    // Mascot + config matrix
     lines.push(Line::from(vec![
-        Span::styled("  provider   ", DIM),
+        Span::styled("\u{2503}    ", DIM),  // ┃
+        Span::styled("/\\_/\\", BOLD_YELLOW),
+        Span::styled("     [PRV] ", DIM),
         Span::styled(provider.to_string(), CYAN),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  model      ", DIM),
+        Span::styled("\u{2503}   ", DIM),  // ┃
+        Span::styled("( \u{2022}\u{1d25}\u{2022} )", BOLD_YELLOW),
+        Span::styled("    [MOD] ", DIM),
         Span::styled(model.to_string(), CYAN),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  directory  ", DIM),
+        Span::styled("\u{2503}              ", DIM),  // ┃
+        Span::styled("[DIR] ", DIM),
         Span::styled(directory.to_string(), Style::default().fg(Color::White)),
     ]));
     if let Some(instr) = instructions_display {
         lines.push(Line::from(vec![
-            Span::styled("  instruct.  ", DIM),
+            Span::styled("\u{2503}              ", DIM),  // ┃
+            Span::styled("[INS] ", DIM),
             Span::styled(instr.to_string(), CYAN),
         ]));
     }
-    lines.push(Line::from(vec![
-        Span::styled("  approval   ", DIM),
-        Span::styled("on-request", CYAN),
-        Span::styled("  last: ", DIM),
-        Span::styled("idle", DIM),
-    ]));
-    let api_key_line = if api_key_set {
-        Line::from(vec![
-            Span::styled("  api key    ", DIM),
-            Span::styled("\u{25cf}", GREEN),
-            Span::styled(" configured", DIM),
-        ])
+    let api_switch = if api_key_set {
+        Span::styled("[*]", GREEN)
     } else {
-        Line::from(vec![
-            Span::styled("  api key    ", DIM),
-            Span::styled("\u{25cb}", RED),
-            Span::styled(" not set", RED),
-        ])
+        Span::styled("[x]", RED)
     };
-    lines.push(api_key_line);
-    lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  Type a mission, paste a path, or ", DIM),
+        Span::styled("\u{2503}   ", DIM),  // ┃
+        api_switch,
+        Span::styled(" API    ", DIM),
+        Span::styled("[AUT] ", DIM),
+        Span::styled("on-request", CYAN),
+    ]));
+    lines.push(Line::from(Span::styled("\u{2503}", DIM)));
+    lines.push(Line::from(vec![
+        Span::styled("\u{2503}  ", DIM),  // ┃
+        Span::styled("Type a mission, paste a path, or ", DIM),
         Span::styled("/help", CYAN),
         Span::styled(" for commands.", DIM),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  ctrl+r", DIM),
+        Span::styled("\u{2503}  ", DIM),  // ┃
+        Span::styled("ctrl+r", DIM),
         Span::styled(" history  ", DIM),
         Span::styled("ctrl+t", DIM),
         Span::styled(" transcript  ", DIM),
@@ -652,9 +645,14 @@ pub fn user_input_lines(text: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::with_capacity(input_lines.len() + 1);
     for (i, line) in input_lines.iter().enumerate() {
         let prefix: Vec<Span<'static>> = if i == 0 {
-            vec![Span::styled("  ", DIM), Span::styled("\u{276f} ", BOLD_YELLOW)]
+            // ┏━ > user text
+            vec![
+                Span::styled("\u{250f}\u{2501} ", DIM),  // ┏━
+                Span::styled("> ", YELLOW),
+            ]
         } else {
-            vec![Span::styled("    ", DIM)]
+            // ┃ continuation
+            vec![Span::styled("\u{2503} ", DIM)]
         };
         let mut spans = prefix;
         // Split on [Image #N] tokens and style them distinctly.

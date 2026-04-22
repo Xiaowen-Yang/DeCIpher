@@ -19,11 +19,6 @@ fn blink_start() -> Instant {
     *START.get_or_init(Instant::now)
 }
 
-/// Returns true when the blink state is "on" (filled dot), alternating every 500ms.
-fn blink_on() -> bool {
-    (blink_start().elapsed().as_millis() / 500) % 2 == 0
-}
-
 /// Current blink tick (changes every 500ms) — used for cache invalidation.
 fn blink_tick() -> u64 {
     blink_start().elapsed().as_millis() as u64 / 500
@@ -102,7 +97,6 @@ const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 const GREEN: Style = Style::new().fg(Color::Green);
 const RED: Style = Style::new().fg(Color::Red);
 const CYAN: Style = Style::new().fg(Color::Cyan);
-const BOLD_CYAN: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23));
 const BOLD_YELLOW: Style = Style::new().fg(Color::Rgb(232, 163, 23)).add_modifier(Modifier::BOLD);
 
@@ -166,17 +160,37 @@ impl Cell for UserCell {
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        for line in self.text.lines() {
-            lines.push(Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::styled(line.to_string(), BOLD),
-            ]));
+        for (i, line) in self.text.lines().enumerate() {
+            if i == 0 {
+                // ┏━ > user text
+                lines.push(Line::from(vec![
+                    Span::styled("\u{250f}\u{2501} ", DIM),  // ┏━
+                    Span::styled("> ", YELLOW),
+                    Span::styled(line.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]));
+            } else {
+                // ┃ continuation
+                lines.push(Line::from(vec![
+                    Span::styled("\u{2503} ", DIM),  // ┃
+                    Span::styled(line.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]));
+            }
         }
         if !self.images.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  [{} image(s) attached]", self.images.len()),
-                DIM,
-            )));
+            let token = if self.images.len() == 1 {
+                "[IMG:1]".to_string()
+            } else {
+                format!("[IMG:1..{}]", self.images.len())
+            };
+            lines.push(Line::from(vec![
+                Span::styled("\u{2507}  ", DIM),  // ┇
+                Span::styled(
+                    format!("{} image attached", self.images.len()),
+                    DIM,
+                ),
+                Span::raw(" "),
+                Span::styled(token, CYAN),
+            ]));
         }
         if lines.is_empty() {
             lines.push(Line::from(""));
@@ -211,38 +225,39 @@ impl Cell for MissionCell {
 
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        lines.push(Line::from(""));
+        // ┣━ [MISSION]
         lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("Mission", BOLD_CYAN),
+            Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
+            Span::styled("[MISSION]", CYAN),
         ]));
+        // ┃  Understood: ...
         lines.push(Line::from(vec![
-            Span::raw("  "),
+            Span::styled("\u{2503}  ", DIM),  // ┃
             Span::styled("Understood: ", DIM),
-            Span::styled(self.understood.clone(), Style::default()),
+            Span::styled(self.understood.clone(), Style::default().fg(Color::White)),
         ]));
         if let Some(ref target) = self.target {
             lines.push(Line::from(vec![
-                Span::raw("  "),
+                Span::styled("\u{2503}  ", DIM),  // ┃
                 Span::styled("Target: ", DIM),
                 Span::styled(target.clone(), CYAN),
             ]));
         }
         if !self.steps.is_empty() {
-            lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::raw("  "),
+                Span::styled("\u{2503}  ", DIM),  // ┃
                 Span::styled("Plan:", DIM),
             ]));
+            let last_idx = self.steps.len() - 1;
             for (i, step) in self.steps.iter().enumerate() {
+                let pipe = if i == last_idx { "\u{2507}  " } else { "\u{2507}  " };  // ┇
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(format!("{}. ", i + 1), DIM),
+                    Span::styled(pipe, DIM),
+                    Span::styled(format!("  {}. ", i + 1), DIM),
                     Span::raw(step.clone()),
                 ]));
             }
         }
-        lines.push(Line::from(""));
         lines
     }
 }
@@ -436,38 +451,32 @@ impl Cell for ExecCell {
 
             match call.success {
                 None => {
-                    // In-progress: blinking ●/○ indicator
-                    let icon = if blink_on() {
-                        Span::styled("\u{25CF}", BOLD_CYAN) // ● filled
-                    } else {
-                        Span::styled("\u{25CB}", CYAN)      // ○ hollow
-                    };
+                    // In-progress: [-] state switch
                     lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        icon,
-                        Span::raw(" "),
+                        Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
+                        Span::styled("[-] ", CYAN),
                         Span::styled(display, DIM),
                     ]));
                 }
                 Some(success) => {
-                    let icon = if success {
-                        Span::styled("\u{2713}", if is_read_only { DIM } else { GREEN })
+                    let switch = if success {
+                        Span::styled("[*] ", if is_read_only { DIM } else { GREEN })
                     } else {
-                        Span::styled("\u{2717}", RED)
+                        Span::styled("[x] ", RED)
                     };
                     let elapsed = call.elapsed_ms
-                        .map(|ms| format!(" ({:.1}s)", ms as f64 / 1000.0))
+                        .map(|ms| format!("  ({:.1}s)", ms as f64 / 1000.0))
                         .unwrap_or_default();
                     let exit_info = if !success {
-                        call.exit_code.map(|c| format!(" [exit {}]", c)).unwrap_or_default()
+                        call.exit_code.map(|c| format!(" [EXIT:{}]", c)).unwrap_or_default()
                     } else {
                         String::new()
                     };
-                    let text_style = if is_read_only && success { DIM } else { Style::default() };
+                    let text_style = if is_read_only && success { DIM } else { Style::default().fg(Color::White) };
                     lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        icon,
-                        Span::styled(format!(" {display}{exit_info} "), text_style),
+                        Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
+                        switch,
+                        Span::styled(format!("{display}{exit_info}"), text_style),
                         Span::styled(elapsed, DIM),
                     ]));
 
@@ -476,49 +485,46 @@ impl Cell for ExecCell {
                         let preview_lines: Vec<&str> = preview.lines().collect();
                         let total_lines = call.output_lines_total.unwrap_or(preview_lines.len() as u32);
                         let style = if success {
-                            DIM // dimmed for successful output
+                            DIM
                         } else {
                             Style::new().fg(Color::Red).add_modifier(Modifier::DIM)
                         };
 
                         if !success {
-                            // Error: show last few lines
+                            // Error: show last few lines with ┃/╰ pipe
                             let show = preview_lines.len().min(5);
                             let start = preview_lines.len().saturating_sub(show);
                             for (i, line_text) in preview_lines[start..].iter().enumerate() {
                                 let is_last = i == show - 1;
-                                let prefix = if is_last { "\u{2514}" } else { "\u{2502}" };
+                                let prefix = if is_last { "\u{2570}  " } else { "\u{2503}  " };
                                 let truncated: String = line_text.chars().take(100).collect();
                                 lines.push(Line::from(vec![
-                                    Span::raw("    "),
-                                    Span::styled(format!("{prefix} "), DIM),
+                                    Span::styled(prefix, DIM),
                                     Span::styled(truncated, style),
                                 ]));
                             }
                         } else if total_lines > 8 {
-                            // Success with long output: show head(3) + ... + tail(2)
+                            // Success with long output: head(3) + ... + tail(2)
                             let head: Vec<&str> = preview_lines.iter().take(3).copied().collect();
                             let tail: Vec<&str> = preview_lines.iter().rev().take(2).rev().copied().collect();
                             for line_text in &head {
                                 let truncated: String = line_text.chars().take(100).collect();
                                 lines.push(Line::from(vec![
-                                    Span::raw("    "),
-                                    Span::styled("\u{2502} ", DIM),
+                                    Span::styled("\u{2503}  ", DIM),  // ┃
                                     Span::styled(truncated, style),
                                 ]));
                             }
                             let hidden = total_lines.saturating_sub(5);
                             lines.push(Line::from(vec![
-                                Span::raw("    "),
-                                Span::styled(format!("\u{2502} \u{2026} ({hidden} lines hidden)"), DIM),
+                                Span::styled("\u{2503}  ", DIM),  // ┃
+                                Span::styled(format!("... ({hidden} lines)"), DIM),
                             ]));
                             for (i, line_text) in tail.iter().enumerate() {
                                 let is_last = i == tail.len() - 1;
-                                let prefix = if is_last { "\u{2514}" } else { "\u{2502}" };
+                                let prefix = if is_last { "\u{2570}  " } else { "\u{2503}  " };
                                 let truncated: String = line_text.chars().take(100).collect();
                                 lines.push(Line::from(vec![
-                                    Span::raw("    "),
-                                    Span::styled(format!("{prefix} "), DIM),
+                                    Span::styled(prefix, DIM),
                                     Span::styled(truncated, style),
                                 ]));
                             }
@@ -527,8 +533,8 @@ impl Cell for ExecCell {
                         if total_lines > 8 || !success {
                             if total_lines > 5 && !success {
                                 lines.push(Line::from(vec![
-                                    Span::raw("    "),
-                                    Span::styled(format!("  ({total_lines} lines total)"), DIM),
+                                    Span::styled("\u{2507}  ", DIM),  // ┇
+                                    Span::styled(format!("({total_lines} lines total)"), DIM),
                                 ]));
                             }
                         }
@@ -536,26 +542,22 @@ impl Cell for ExecCell {
                 }
             }
         }
-        // Show streaming output preview (last N lines, dimmed, with tree prefix)
+        // Show streaming output preview (last N lines, dimmed, with pipe prefix)
         if !self.streaming_output.is_empty() {
             let output_lines: Vec<&str> = self.streaming_output.lines().collect();
             let total = output_lines.len();
             let start = total.saturating_sub(EXEC_OUTPUT_PREVIEW_LINES);
             if start > 0 {
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(
-                        format!("\u{2502} \u{2026} +{} lines", start),
-                        DIM,
-                    ),
+                    Span::styled("\u{2503}  ", DIM),  // ┃
+                    Span::styled(format!("... +{} lines", start), DIM),
                 ]));
             }
             for (i, line_text) in output_lines[start..].iter().enumerate() {
                 let is_last = i == output_lines[start..].len() - 1;
-                let prefix = if is_last { "\u{2514} " } else { "\u{2502} " };
+                let prefix = if is_last { "\u{2570}  " } else { "\u{2503}  " };
                 let truncated: String = line_text.chars().take(100).collect();
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
                     Span::styled(prefix, DIM),
                     Span::styled(truncated, DIM),
                 ]));
@@ -567,24 +569,17 @@ impl Cell for ExecCell {
     /// Pager view: same header as display_lines but shows ALL streaming output.
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = self.display_lines(width);
-        // Replace the truncated streaming tail with the full output.
-        // display_lines already emits up to EXEC_OUTPUT_PREVIEW_LINES; if there
-        // are more, append the rest here.
         if !self.streaming_output.is_empty() {
             let output_lines: Vec<&str> = self.streaming_output.lines().collect();
             let total = output_lines.len();
             if total > EXEC_OUTPUT_PREVIEW_LINES {
-                // display_lines shows a "… +N lines" header then the last N lines.
-                // Re-emit everything so the pager has the complete output.
-                // Strip the trailing preview block (1 ellipsis line + N preview lines).
                 let strip = 1 + EXEC_OUTPUT_PREVIEW_LINES.min(total);
                 lines.truncate(lines.len().saturating_sub(strip));
                 for (i, line_text) in output_lines.iter().enumerate() {
                     let is_last = i == total - 1;
-                    let prefix = if is_last { "\u{2514} " } else { "\u{2502} " };
+                    let prefix = if is_last { "\u{2570}  " } else { "\u{2503}  " };
                     let safe = sanitize_display_text(line_text);
                     lines.push(Line::from(vec![
-                        Span::raw("    "),
                         Span::styled(prefix, DIM),
                         Span::styled(safe, DIM),
                     ]));
@@ -699,14 +694,15 @@ impl Cell for ErrorCell {
 
         // Category label
         let cat_label = match self.category {
-            ErrorCategory::Api => "API Error",
-            ErrorCategory::Parse => "Parse Error",
-            ErrorCategory::Execution => "Execution Error",
-            ErrorCategory::Generic => "Error",
+            ErrorCategory::Api => "API_ERROR",
+            ErrorCategory::Parse => "PARSE_ERROR",
+            ErrorCategory::Execution => "EXEC_ERROR",
+            ErrorCategory::Generic => "ERROR",
         };
 
         let mut header_spans = vec![
-            Span::raw("  "),
+            Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
+            Span::styled("[x] ", RED),
             Span::styled(format!("{cat_label}: "), RED),
         ];
 
@@ -723,17 +719,24 @@ impl Cell for ErrorCell {
         }
         lines.push(Line::from(header_spans));
 
-        // Additional lines indented (up to 4 more lines, capping card at 6 total)
-        for line_text in msg_lines.iter().skip(1).take(4) {
+        // Additional lines with pipe prefix (up to 4 more, capping card at 6 total)
+        let extra = msg_lines.iter().skip(1).take(4).collect::<Vec<_>>();
+        let extra_len = extra.len();
+        for (i, line_text) in extra.iter().enumerate() {
             let truncated: String = line_text.chars().take(100).collect();
+            let prefix = if i == extra_len - 1 && msg_lines.len() <= 5 {
+                "\u{2570}  "  // ╰
+            } else {
+                "\u{2503}  "  // ┃
+            };
             lines.push(Line::from(vec![
-                Span::raw("    "),
+                Span::styled(prefix, DIM),
                 Span::styled(truncated, Style::new().fg(Color::Red).add_modifier(Modifier::DIM)),
             ]));
         }
         if msg_lines.len() > 5 {
             lines.push(Line::from(vec![
-                Span::raw("    "),
+                Span::styled("\u{2570}  ", DIM),  // ╰
                 Span::styled(format!("... ({} more lines)", msg_lines.len() - 5), DIM),
             ]));
         }
@@ -797,15 +800,21 @@ impl Cell for TaskCard {
 
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        // Title line: ✓ Read N files (dim green check, secondary title)
+        // ┣━ [*] READ_FILES (N files)
+        let count = self.paths.len();
+        let header = if count <= 1 {
+            self.title.clone()
+        } else {
+            format!("READ_FILES ({} files)", count)
+        };
         lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("\u{2713} ", DIM),
-            Span::styled(self.title.clone(), DIM),
+            Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
+            Span::styled("[*] ", DIM),
+            Span::styled(header, DIM),
         ]));
-        // Path list: indented, comma-separated, truncated to width
+        // ┇  path list: comma-separated, truncated to width
         if !self.paths.is_empty() {
-            let max_w = (width as usize).saturating_sub(8);
+            let max_w = (width as usize).saturating_sub(6);
             let joined = self.paths.join(", ");
             let display: String = if joined.len() > max_w {
                 let truncated: String = joined.chars().take(max_w.saturating_sub(1)).collect();
@@ -814,8 +823,7 @@ impl Cell for TaskCard {
                 joined
             };
             lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled("\u{00b7} ", DIM),
+                Span::styled("\u{2507}  ", DIM),  // ┇
                 Span::styled(display, DIM),
             ]));
         }
@@ -872,16 +880,17 @@ impl Cell for DiffCard {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let n = self.files.len();
-        // Header: "Edited N files" or "Edited 1 file"
-        let header = if n == 1 { "Edited 1 file".to_string() } else { format!("Edited {} files", n) };
+        // ┣━ [DIFF] N files edited
+        let header = if n == 1 { "1 file edited".to_string() } else { format!("{} files edited", n) };
         lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(header, Style::default().fg(Color::Cyan)),
+            Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
+            Span::styled("[DIFF] ", CYAN),
+            Span::styled(header, DIM),
         ]));
 
-        // File list (up to 3)
+        // File list (up to 3) with ┃ pipe
         for path in self.files.iter().take(3) {
-            let max_w = (width as usize).saturating_sub(4);
+            let max_w = (width as usize).saturating_sub(6);
             let display: String = if path.len() > max_w {
                 let t: String = path.chars().take(max_w.saturating_sub(1)).collect();
                 format!("{}\u{2026}", t)
@@ -889,32 +898,34 @@ impl Cell for DiffCard {
                 path.clone()
             };
             lines.push(Line::from(vec![
-                Span::raw("  "),
+                Span::styled("\u{2503}  ", DIM),  // ┃
                 Span::styled(display, DIM),
             ]));
         }
         if n > 3 {
             lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(format!("  \u{2026} {} more", n - 3), DIM),
+                Span::styled("\u{2503}  ", DIM),  // ┃
+                Span::styled(format!("... {} more", n - 3), DIM),
             ]));
         }
 
-        // Diff preview lines (max 3)
-        for line in self.preview.iter().take(3) {
+        // Diff preview lines (max 3) with pipe
+        let preview_count = self.preview.len().min(3);
+        for (i, line) in self.preview.iter().take(3).enumerate() {
             let (prefix, style) = match line.kind {
                 DiffPreviewKind::Add => ("+", GREEN),
                 DiffPreviewKind::Remove => ("-", RED),
             };
-            let max_w = (width as usize).saturating_sub(6);
+            let max_w = (width as usize).saturating_sub(8);
             let text: String = if line.text.len() > max_w {
                 let t: String = line.text.chars().take(max_w.saturating_sub(1)).collect();
                 format!("{}\u{2026}", t)
             } else {
                 line.text.clone()
             };
+            let pipe = if i == preview_count - 1 { "\u{2570}  " } else { "\u{2503}  " };  // ╰ or ┃
             lines.push(Line::from(vec![
-                Span::raw("    "),
+                Span::styled(pipe, DIM),
                 Span::styled(format!("{} ", prefix), style),
                 Span::styled(text, DIM),
             ]));
@@ -927,13 +938,14 @@ impl Cell for DiffCard {
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let n = self.files.len();
-        let header = if n == 1 { "Edited 1 file".to_string() } else { format!("Edited {} files", n) };
+        let header = if n == 1 { "1 file edited".to_string() } else { format!("{} files edited", n) };
         lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(header, Style::default().fg(Color::Cyan)),
+            Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
+            Span::styled("[DIFF] ", CYAN),
+            Span::styled(header, DIM),
         ]));
         for path in &self.files {
-            let max_w = (width as usize).saturating_sub(4);
+            let max_w = (width as usize).saturating_sub(6);
             let display: String = if path.len() > max_w {
                 let t: String = path.chars().take(max_w.saturating_sub(1)).collect();
                 format!("{}\u{2026}", t)
@@ -941,24 +953,26 @@ impl Cell for DiffCard {
                 path.clone()
             };
             lines.push(Line::from(vec![
-                Span::raw("  "),
+                Span::styled("\u{2503}  ", DIM),  // ┃
                 Span::styled(display, DIM),
             ]));
         }
-        for line in &self.preview {
+        let total_preview = self.preview.len();
+        for (i, line) in self.preview.iter().enumerate() {
             let (prefix, style) = match line.kind {
                 DiffPreviewKind::Add => ("+", GREEN),
                 DiffPreviewKind::Remove => ("-", RED),
             };
-            let max_w = (width as usize).saturating_sub(6);
+            let max_w = (width as usize).saturating_sub(8);
             let text: String = if line.text.len() > max_w {
                 let t: String = line.text.chars().take(max_w.saturating_sub(1)).collect();
                 format!("{}\u{2026}", t)
             } else {
                 line.text.clone()
             };
+            let pipe = if i == total_preview - 1 { "\u{2570}  " } else { "\u{2503}  " };
             lines.push(Line::from(vec![
-                Span::raw("    "),
+                Span::styled(pipe, DIM),
                 Span::styled(format!("{} ", prefix), style),
                 Span::styled(text, DIM),
             ]));
@@ -980,19 +994,17 @@ impl Cell for GroupDivider {
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        // Use the dashed divider style from the visual spec for mid-flow separators.
-        let w = (width as usize).saturating_sub(2).min(60);
+        // ┇┄┄┄┄┄... — V2 pipe divider style
+        let w = (width as usize).saturating_sub(3).min(60);
         vec![
-            Line::from(""),
             Line::from(Span::styled(
-                format!("  {}", "\u{2504}".repeat(w)),
+                format!("\u{2507}{}", "\u{2504}".repeat(w)),
                 DIM,
             )),
-            Line::from(""),
         ]
     }
 
-    fn desired_height(&self, _width: u16) -> u16 { 3 }
+    fn desired_height(&self, _width: u16) -> u16 { 1 }
 
     fn is_continuation(&self) -> bool { true }
 }
@@ -1035,44 +1047,43 @@ impl Cell for ResultCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         let secs = self.elapsed_ms as f64 / 1000.0;
         let mut lines = Vec::new();
-        lines.push(Line::from(""));
 
-        // Outcome: "  ✓ Pass  (12.4s)" or "  ✗ Fail  (3.2s)"
-        let (icon, label, outcome_style) = match self.outcome.as_str() {
-            "PASS" => ("\u{2713}", "Pass", GREEN),
-            "PARTIAL" => ("\u{25d0}", "Partial", YELLOW),
-            _ => ("\u{2717}", "Fail", RED),
+        // ┏━ [*] RESULT: PASS  (12.4s)
+        let (switch, label, outcome_style) = match self.outcome.as_str() {
+            "PASS" => ("[*]", "PASS", GREEN),
+            "PARTIAL" => ("[~]", "PARTIAL", YELLOW),
+            _ => ("[x]", "FAIL", RED),
         };
         lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("{icon} "), outcome_style),
+            Span::styled("\u{250f}\u{2501} ", DIM),  // ┏━
+            Span::styled(format!("{switch} "), outcome_style),
+            Span::styled("RESULT: ", DIM),
             Span::styled(label.to_string(), Style::new().fg(outcome_style.fg.unwrap_or(Color::Reset)).add_modifier(Modifier::BOLD)),
             Span::styled(format!("  ({secs:.1}s)"), DIM),
         ]));
 
-        // One-line summary (primary description of what happened)
+        // ┃  summary line
         if !self.summary.is_empty() {
             let first = self.summary.lines().next().unwrap_or(&self.summary);
             let truncated: String = first.chars().take(120).collect();
             lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(truncated, Style::default()),
+                Span::styled("\u{2503}  ", DIM),  // ┃
+                Span::styled(truncated, Style::default().fg(Color::White)),
             ]));
         }
 
-        // Next step hint for non-pass outcomes (max 1 line)
+        // ┇  Next: hint for non-pass outcomes
         if self.outcome != "PASS" {
             if let Some(step) = self.next_steps.first() {
                 let truncated: String = step.chars().take(100).collect();
                 lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("\u{2192} ", DIM),
+                    Span::styled("\u{2507}  ", DIM),  // ┇
+                    Span::styled("Next: ", DIM),
                     Span::styled(truncated, DIM),
                 ]));
             }
         }
 
-        lines.push(Line::from(""));
         lines
     }
 }
@@ -1095,22 +1106,28 @@ impl Cell for ClarificationCell {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let rule_w = (width as usize).saturating_sub(22).min(50);
         vec![
-            Line::from(""),
             Line::from(vec![
-                Span::styled("\u{250c} ", DIM),
-                Span::styled("CLARIFICATION NEEDED", YELLOW),
-                Span::raw(" "),
-                Span::styled("\u{2500}".repeat(30), DIM),
+                Span::styled("\u{2501}\u{2501} ", DIM),  // ━━
+                Span::styled("[?] ", YELLOW),
+                Span::styled("CLARIFICATION ", YELLOW),
+                Span::styled("\u{2501}".repeat(rule_w), DIM),
             ]),
             Line::from(vec![
-                Span::raw("  "),
+                Span::styled("\u{2503}  ", DIM),  // ┃
                 Span::styled("DeCIpher asks: ", BOLD_YELLOW),
                 Span::styled(self.question.clone(), Style::default().fg(Color::White)),
             ]),
-            Line::from(Span::styled("  Reply below and DeCIpher will continue.", DIM)),
-            Line::from(""),
+            Line::from(vec![
+                Span::styled("\u{2503}  ", DIM),  // ┃
+                Span::styled("Reply below and DeCIpher will continue.", DIM),
+            ]),
+            Line::from(Span::styled(
+                "\u{2501}".repeat((width as usize).min(67)),
+                DIM,
+            )),
         ]
     }
 }
@@ -1139,62 +1156,56 @@ impl Cell for ApprovalCell {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        let bar = "\u{2500}".repeat(56);
-        lines.push(Line::from(""));
+        let rule_w = (width as usize).saturating_sub(26).min(50);
+        // ━━ [!] APPROVAL_REQUIRED ━━━...
         lines.push(Line::from(vec![
-            Span::styled("  \u{250c}\u{2500} ", DIM),
-            Span::styled("APPROVAL", BOLD_YELLOW),
-            Span::styled(format!(" {}", bar), DIM),
+            Span::styled("\u{2501}\u{2501} ", DIM),  // ��━
+            Span::styled("[!] ", YELLOW),
+            Span::styled("APPROVAL_REQUIRED ", YELLOW),
+            Span::styled("\u{2501}".repeat(rule_w), DIM),
         ]));
-        lines.push(Line::from(Span::styled("  \u{2502}", DIM)));
         if let Some(ref action) = self.action {
             lines.push(Line::from(vec![
-                Span::styled("  \u{2502} ", DIM),
-                Span::styled("Action: ", BOLD),
+                Span::styled("\u{2503}  ", DIM),  // ┃
+                Span::styled("ACTION: ", BOLD),
                 Span::styled(action.clone(), CYAN),
             ]));
-            lines.push(Line::from(Span::styled("  \u{2502}", DIM)));
         }
-        lines.push(Line::from(vec![
-            Span::styled("  \u{2502} ", DIM),
-            Span::raw("DeCIpher requests these capabilities:"),
-        ]));
-        for cap in &self.capabilities {
+        if !self.capabilities.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled("  \u{2502}   ", DIM),
-                Span::styled("\u{00b7} ", YELLOW),
-                Span::raw(cap.clone()),
+                Span::styled("\u{2503}  ", DIM),  // ┃
+                Span::styled("CAPABILITIES:", DIM),
             ]));
+            for cap in &self.capabilities {
+                lines.push(Line::from(vec![
+                    Span::styled("\u{2503}    ", DIM),  // ┃
+                    Span::styled("[-] ", YELLOW),
+                    Span::raw(cap.clone()),
+                ]));
+            }
         }
-        lines.push(Line::from(Span::styled("  \u{2502}", DIM)));
         match self.decision {
             Some(true) => {
                 lines.push(Line::from(vec![
-                    Span::styled("  \u{2502}  ", DIM),
-                    Span::styled("Approved", GREEN),
+                    Span::styled("\u{2503}  ", DIM),  // ┃
+                    Span::styled("[*] Approved", GREEN),
                 ]));
             }
             Some(false) => {
                 lines.push(Line::from(vec![
-                    Span::styled("  \u{2502}  ", DIM),
-                    Span::styled("Denied", RED),
+                    Span::styled("\u{2503}  ", DIM),  // ┃
+                    Span::styled("[x] Denied", RED),
                 ]));
             }
-            None => {
-                lines.push(Line::from(vec![
-                    Span::styled("  \u{2502}  ", DIM),
-                    Span::styled("y", BOLD),
-                    Span::styled(" approve  ", DIM),
-                    Span::styled("a", BOLD),
-                    Span::styled(" always  ", DIM),
-                    Span::styled("n", BOLD),
-                    Span::styled(" deny", DIM),
-                ]));
-            }
+            None => {}
         }
-        lines.push(Line::from(Span::styled(format!("  \u{2514}{}\u{2500}", bar), DIM)));
+        // Bottom rule
+        lines.push(Line::from(Span::styled(
+            "\u{2501}".repeat((width as usize).min(67)),
+            DIM,
+        )));
         lines
     }
 }
@@ -1216,9 +1227,9 @@ pub fn render_smart_card_lines(
     let secs = elapsed_ms as f64 / 1000.0;
 
     let (icon, icon_style) = if success {
-        ("\u{2713}", GREEN)     // ✓
+        ("*", GREEN)     // [*]
     } else {
-        ("\u{2717}", RED)       // ✗
+        ("x", RED)       // [x]
     };
 
     match kind {
@@ -1248,20 +1259,20 @@ fn u32_field(v: &serde_json::Value, key: &str) -> u32 {
 
 fn header_line(icon: &'static str, style: Style, title: String, secs: f64) -> Line<'static> {
     Line::from(vec![
-        Span::raw("  "),
-        Span::styled(format!("{icon} "), style),
+        Span::styled("\u{2523}\u{2501} ", DIM),  // ┣━
+        Span::styled(format!("[{icon}] "), style),
         Span::styled(title, Style::default()),
-        Span::styled(format!(" ({secs:.1}s)"), DIM),
+        Span::styled(format!("  ({secs:.1}s)"), DIM),
     ])
 }
 
 fn detail_line(detail: String) -> Line<'static> {
     Line::from(vec![
-        Span::raw("    "),
-        Span::styled("\u{25cf} ", DIM),   // ●
+        Span::styled("\u{2507}  ", DIM),  // ┇
         Span::styled(detail, DIM),
     ])
 }
+
 
 fn render_test_suite(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64) -> Option<Vec<Line<'static>>> {
     let runner = str_field(v, "runner");
@@ -1291,7 +1302,7 @@ fn render_test_suite(v: &serde_json::Value, icon: &'static str, style: Style, se
             if !name.is_empty() {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled("\u{2514} ", DIM),
+                    Span::styled("\u{2570}  ", DIM),  // ╰
                     Span::styled(name.to_string(), Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
                 ]));
             }
@@ -1336,7 +1347,7 @@ fn render_docker_build(v: &serde_json::Value, icon: &'static str, style: Style, 
             let truncated: String = err.chars().take(100).collect();
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled("\u{2514} ", DIM),
+                Span::styled("\u{2570}  ", DIM),  // ╰
                 Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
             ]));
         }
@@ -1377,8 +1388,8 @@ fn render_compose(v: &serde_json::Value, icon: &'static str, style: Style, secs:
         let svc_str: String = services.iter().take(5).filter_map(|s| {
             let name = s.get("name").and_then(|n| n.as_str())?;
             let status = s.get("status").and_then(|st| st.as_str()).unwrap_or("?");
-            let icon = if status == "up" { "\u{2713}" } else { "\u{2717}" };
-            Some(format!("{icon} {name}"))
+            let switch = if status == "up" { "[*]" } else { "[x]" };
+            Some(format!("{switch} {name}"))
         }).collect::<Vec<_>>().join(" \u{00b7} ");
         if !svc_str.is_empty() { lines.push(detail_line(svc_str)); }
     }
@@ -1411,7 +1422,7 @@ fn render_git_op(v: &serde_json::Value, icon: &'static str, style: Style, secs: 
         if !conflicts.is_empty() {
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled("\u{2514} ", DIM),
+                Span::styled("\u{2570}  ", DIM),  // ╰
                 Span::styled(format!("{} conflict{}", conflicts.len(), if conflicts.len() == 1 { "" } else { "s" }),
                     Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
             ]));
@@ -1448,7 +1459,7 @@ fn render_lint(v: &serde_json::Value, icon: &'static str, style: Style, secs: f6
                 let truncated: String = msg.chars().take(80).collect();
                 lines.push(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled("\u{2514} ", DIM),
+                    Span::styled("\u{2570}  ", DIM),  // ╰
                     Span::styled(truncated, DIM),
                 ]));
             }
@@ -1494,7 +1505,7 @@ fn render_kube_log(v: &serde_json::Value, icon: &'static str, style: Style, secs
             let truncated: String = cause.chars().take(100).collect();
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled("\u{2514} ", DIM),
+                Span::styled("\u{2570}  ", DIM),  // ╰
                 Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
             ]));
         }
@@ -1531,8 +1542,8 @@ fn render_ci(v: &serde_json::Value, icon: &'static str, style: Style, secs: f64)
         let stage_str: String = stages.iter().take(6).filter_map(|s| {
             let name = s.get("name").and_then(|n| n.as_str())?;
             let status = s.get("status").and_then(|st| st.as_str()).unwrap_or("?");
-            let i = match status { "success" => "\u{2713}", "failure" => "\u{2717}", _ => "\u{25cf}" };
-            Some(format!("{i} {name}"))
+            let switch = match status { "success" => "[*]", "failure" => "[x]", _ => "[-]" };
+            Some(format!("{switch} {name}"))
         }).collect::<Vec<_>>().join(" \u{00b7} ");
         if !stage_str.is_empty() { lines.push(detail_line(stage_str)); }
     }
@@ -1560,7 +1571,7 @@ fn render_env_setup(v: &serde_json::Value, icon: &'static str, style: Style, sec
             let truncated: String = err.chars().take(100).collect();
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled("\u{2514} ", DIM),
+                Span::styled("\u{2570}  ", DIM),  // ╰
                 Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
             ]));
         }
@@ -1585,7 +1596,7 @@ fn render_migration(v: &serde_json::Value, icon: &'static str, style: Style, sec
             let truncated: String = err.chars().take(100).collect();
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled("\u{2514} ", DIM),
+                Span::styled("\u{2570}  ", DIM),  // ╰
                 Span::styled(truncated, Style::new().fg(ratatui::style::Color::Red).add_modifier(Modifier::DIM)),
             ]));
         }
@@ -1626,8 +1637,8 @@ mod tests {
             vec!["Read Dockerfile".into(), "Fix COPY path".into()],
         );
         let lines = cell.display_lines(80);
-        // empty + header + understood + target + blank + Plan: + 2 steps + empty = 9
-        assert!(lines.len() >= 7);
+        // ┣━ [MISSION] + Understood + Target + Plan: + 2 steps = 6
+        assert!(lines.len() >= 5, "Expected >= 5 lines, got {}", lines.len());
     }
 
     #[test]
@@ -1702,14 +1713,13 @@ mod tests {
     fn result_cell_success() {
         let cell = ResultCell::new("PASS".into(), "All tests pass".into(), 5, 12000, vec![], vec![], vec![]);
         let lines = cell.display_lines(80);
-        // blank + outcome + summary + blank = 4 lines minimum
-        assert!(lines.len() >= 3, "Expected >= 3 lines, got {}", lines.len());
+        // ┏━ [*] RESULT: PASS + ┃ summary = 2 lines
+        assert!(lines.len() >= 2, "Expected >= 2 lines, got {}", lines.len());
         let all_text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>().join("");
-        // New design: no legacy [RESULT] header
-        assert!(!all_text.contains("[RESULT]"), "Legacy [RESULT] header must be removed");
-        assert!(all_text.contains("Pass"), "Should contain Pass");
+        assert!(all_text.contains("PASS"), "Should contain PASS");
+        assert!(all_text.contains("RESULT"), "Should contain RESULT");
     }
 
     #[test]
@@ -1723,13 +1733,13 @@ mod tests {
             vec!["Check Python version".into(), "Update requirements.txt".into()],
         );
         let lines = cell.display_lines(80);
-        // blank + outcome + summary + next_step hint + blank = 5 lines
+        // ┏━ [x] RESULT: FAIL + ┃ summary + ┇ Next: hint = 3 lines
         assert!(lines.len() >= 3, "Expected >= 3 lines, got {}", lines.len());
         let all_text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>().join("");
-        assert!(!all_text.contains("[RESULT]"), "Legacy [RESULT] header must be removed");
-        assert!(all_text.contains("Fail"), "Should contain Fail");
+        assert!(all_text.contains("FAIL"), "Should contain FAIL");
+        assert!(all_text.contains("Next:"), "Should contain Next: hint");
     }
 
     // ── New cell types ─────────────────────────────────────────────────────
@@ -1776,18 +1786,18 @@ mod tests {
             ],
         );
         let lines = card.display_lines(80);
-        assert!(lines.len() >= 4, "Expected header + 2 paths + 2 preview = >=5, got {}", lines.len());
+        assert!(lines.len() >= 4, "Expected header + 2 paths + 2 preview = >=4, got {}", lines.len());
         let text: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect::<Vec<_>>().join("");
-        assert!(text.contains("Edited 2 files"), "Should say 'Edited 2 files': {text}");
+        assert!(text.contains("2 files edited"), "Should say '2 files edited': {text}");
         assert!(text.contains("+ ") || text.contains("- "), "Should contain diff lines: {text}");
     }
 
     #[test]
     fn group_divider_renders() {
         let d = GroupDivider;
-        assert_eq!(d.desired_height(80), 3);
+        assert_eq!(d.desired_height(80), 1);
         let lines = d.display_lines(80);
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 1);
         assert!(d.is_continuation(), "GroupDivider should suppress blank separator");
     }
 
@@ -1814,7 +1824,8 @@ mod tests {
             Some("run tests".into()),
             vec!["exec_command".into()],
         );
-        assert!(cell.desired_height(80) >= 6); // empty + header + bar + action + cap + waiting + footer
+        // ━━ [!] APPROVAL_REQUIRED + ACTION + CAPABILITIES: + [-] cap + bottom rule = 5
+        assert!(cell.desired_height(80) >= 4, "Expected >= 4, got {}", cell.desired_height(80));
         assert_eq!(cell.decision, None);
     }
 

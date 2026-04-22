@@ -1055,8 +1055,8 @@ mod tests {
         let all_text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>().join("");
-        assert!(all_text.contains("Pass"), "Result should contain Pass");
-        assert!(!all_text.contains("[RESULT]"), "Result should not contain legacy [RESULT] header");
+        assert!(all_text.contains("PASS"), "Result should contain PASS");
+        assert!(all_text.contains("RESULT:"), "Result should contain RESULT: label");
     }
 
     #[test]
@@ -1093,7 +1093,7 @@ mod tests {
         let all_text: String = lines.iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>().join("");
-        assert!(all_text.contains("Edited 2 files"), "DiffCard header should say 'Edited 2 files'");
+        assert!(all_text.contains("2 files edited"), "DiffCard header should say '2 files edited'");
     }
 
     #[test]
