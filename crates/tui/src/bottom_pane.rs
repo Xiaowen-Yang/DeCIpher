@@ -96,14 +96,9 @@ impl<'a> BottomPane<'a> {
             self.build_spinner(label, &mut lines);
         }
 
-        // Approval action detail (shown in viewport so user sees what needs approval).
+        // Approval popup — visible, interactive overlay with arrow-key selection.
         if self.app.mode == InputMode::ApprovalPending {
-            if let Some(ref action) = self.app.pending_approval_action {
-                lines.push(Line::from(vec![
-                    Span::styled("    ", DIM),
-                    Span::styled(action.clone(), BOLD_YELLOW),
-                ]));
-            }
+            self.build_approval_popup(&mut lines);
         }
 
         // Queued message indicator
@@ -171,6 +166,36 @@ impl<'a> BottomPane<'a> {
                 format!("  \u{2026} {} more", filtered.len() - max_show),
                 DIM,
             )));
+        }
+    }
+
+    fn build_approval_popup(&self, lines: &mut Vec<Line<'static>>) {
+        // Tool action being requested.
+        if let Some(ref action) = self.app.pending_approval_action {
+            lines.push(Line::from(vec![
+                Span::styled("  ", DIM),
+                Span::styled(action.clone(), BOLD_YELLOW),
+            ]));
+        }
+        // Selectable options.
+        let options = [
+            ("y", "Approve", "allow this action"),
+            ("a", "Always", "approve all future actions"),
+            ("n", "Deny", "reject and stop"),
+        ];
+        for (i, (key, label, desc)) in options.iter().enumerate() {
+            let selected = i == self.app.approval_index;
+            let (marker, key_style, label_style, desc_style) = if selected {
+                ("\u{25b8} ", BOLD_CYAN, BOLD_CYAN, Style::default().fg(Color::White))
+            } else {
+                ("  ", CYAN, DIM, DIM)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {marker}"), if selected { BOLD_CYAN } else { DIM }),
+                Span::styled(format!("{key} "), key_style),
+                Span::styled(format!("{label:<8}"), label_style),
+                Span::styled(desc.to_string(), desc_style),
+            ]));
         }
     }
 
@@ -333,7 +358,7 @@ impl<'a> BottomPane<'a> {
     fn build_hints(&self, lines: &mut Vec<Line<'static>>) {
         // Left-side hint text.
         let left_text: String = match self.app.mode {
-            InputMode::ApprovalPending => "  y approve  a always  n deny  Esc cancel".to_string(),
+            InputMode::ApprovalPending => "  \u{2191}\u{2193} select  Enter confirm  y/a/n direct".to_string(),
             InputMode::CommandPopup => "  \u{2191}\u{2193} navigate  Enter select  Esc cancel".to_string(),
             InputMode::HistorySearch => {
                 let status = if self.app.search_match_index.is_some() {

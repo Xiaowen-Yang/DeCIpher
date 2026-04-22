@@ -1237,7 +1237,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
 
     match app.mode {
         app::InputMode::ApprovalPending => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            // Direct key shortcuts (still work for fast users).
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
                 KeyAction::Submit(app.respond_approval(true))
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -1246,6 +1247,23 @@ fn handle_key(app: &mut App, key: KeyEvent) -> KeyAction {
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 KeyAction::Submit(app.respond_approval(false))
+            }
+            // Arrow-key navigation in popup.
+            KeyCode::Up => {
+                if app.approval_index > 0 { app.approval_index -= 1; }
+                KeyAction::Redraw
+            }
+            KeyCode::Down => {
+                if app.approval_index < 2 { app.approval_index += 1; }
+                KeyAction::Redraw
+            }
+            // Enter confirms the selected option.
+            KeyCode::Enter => {
+                match app.approval_index {
+                    0 => KeyAction::Submit(app.respond_approval(true)),
+                    1 => { app.always_approve = true; KeyAction::Submit(app.respond_approval(true)) }
+                    _ => KeyAction::Submit(app.respond_approval(false)),
+                }
             }
             _ => KeyAction::None,
         },

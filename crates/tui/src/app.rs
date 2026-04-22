@@ -163,6 +163,8 @@ pub struct App {
     pub mission_started: Option<std::time::Instant>,
     /// Approval action detail (tool name + reasoning) for viewport display.
     pub pending_approval_action: Option<String>,
+    /// Selected option in the approval popup (0=approve, 1=always, 2=deny).
+    pub approval_index: usize,
     pub should_quit: bool,
     pub last_submitted: String,
     pub kill_buffer: String,
@@ -251,6 +253,7 @@ impl App {
             agent_max_turns: 20,
             mission_started: None,
             pending_approval_action: None,
+            approval_index: 0,
             spinner_started: None,
             should_quit: false,
             last_submitted: String::new(),
@@ -311,6 +314,7 @@ impl App {
             }
             ServerMessage::ApprovalRequest { ref action, .. } => {
                 self.mode = InputMode::ApprovalPending;
+                self.approval_index = 0; // Default to "Approve"
                 self.agent_phase = AgentPhase::WaitingForApproval;
                 self.pending_approval_action = action.as_ref().map(|a| {
                     if let Some(ref reason) = a.reasoning {
