@@ -201,6 +201,9 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
     // inserted via Reverse Index. Adjusted on resize via cursor delta.
     let mut vp_y = initial_rows.saturating_sub(viewport_height);
     let mut screen_rows = initial_rows;
+    // Accumulated scrollback lines — re-emitted on resize to restore content
+    // after clearing ghost artifacts from terminal reflow.
+    let mut scrollback_history: Vec<ratatui::text::Line<'static>> = Vec::new();
     // Clear the viewport area so no stale shell content shows through.
     let _ = execute!(io::stdout(), cursor::MoveTo(0, vp_y), Clear(ClearType::FromCursorDown));
     let mut terminal = make_terminal(viewport_height, initial_cols, vp_y)?;
@@ -247,6 +250,7 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
         let instr_display = instr_files.loaded_paths_display();
         let banner = bottom_pane::banner_lines(version, provider, &model, &directory, api_key_set, instr_display.as_deref());
         if !banner.is_empty() {
+            scrollback_history.extend(banner.iter().cloned());
             let shift = insert_history::insert_history_lines(&banner, vp_y, screen_rows, initial_cols)?;
             if shift > 0 {
                 vp_y += shift;
@@ -267,30 +271,38 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
 
     loop {
         // ── Apply debounced resize ───────────────────────────────────────────
-        // With Viewport::Fixed, draw() never calls scroll_up(), so there are
-        // no ghost lines from resize. We just recreate the terminal at the new
-        // viewport position. ratatui 0.29's resize() re-uses the stored Fixed
-        // rect, so we must recreate to update vp_y.
+        // Terminal reflow during drag-resize moves viewport content to
+        // unpredictable positions, creating ghost lines.  The fix:
+        //   1. Clear the ENTIRE visible screen (kills all ghosts)
+        //   2. Anchor viewport at the bottom
+        //   3. Re-emit accumulated scrollback history above the viewport
+        // Content already in the terminal's native scrollback buffer (scroll
+        // up to see) is untouched by ClearType::FromCursorDown.
         if let Some((cols, rows)) = pending_resize.take() {
             app.chat.set_width(cols);
             let vp_h = viewport_height.min(rows);
-            let old_vp_y = vp_y;
-
-            // Adjust vp_y: keep it at the same distance from the bottom.
-            let max_vp_y = rows.saturating_sub(vp_h);
-            if rows != screen_rows {
-                let from_bottom = screen_rows.saturating_sub(vp_y);
-                vp_y = rows.saturating_sub(from_bottom).min(max_vp_y);
-            }
-            vp_y = vp_y.min(max_vp_y);
             screen_rows = rows;
 
-            // Clear from the HIGHER of old/new viewport positions down.
-            // When the terminal grows, the old viewport position is above
-            // the new one — its separator lines would ghost if not cleared.
-            let clear_from = old_vp_y.min(vp_y);
-            let _ = execute!(io::stdout(), cursor::MoveTo(0, clear_from), Clear(ClearType::FromCursorDown));
+            // 1. Clear entire visible screen — eliminates all ghost artifacts.
+            let _ = execute!(io::stdout(), cursor::MoveTo(0, 0), Clear(ClearType::FromCursorDown));
+
+            // 2. Anchor viewport at bottom of new screen.
+            vp_y = rows.saturating_sub(vp_h);
             terminal = make_terminal(vp_h, cols, vp_y)?;
+
+            // 3. Rebuild scrollback from cells at the new width, then re-emit.
+            scrollback_history = app.chat.rebuild_scrollback(cols);
+            if !scrollback_history.is_empty() {
+                let shift = insert_history::insert_history_lines(
+                    &scrollback_history, vp_y, screen_rows, cols,
+                )?;
+                if shift > 0 {
+                    vp_y += shift;
+                    let _ = execute!(io::stdout(), cursor::MoveTo(0, vp_y), Clear(ClearType::FromCursorDown));
+                    terminal = make_terminal(vp_h, cols, vp_y)?;
+                }
+            }
+
             need_redraw = true;
         }
 
@@ -325,6 +337,7 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
                             KeyAction::Submit(msg) => {
                                 // Push submitted user input into scrollback.
                                 let lines = bottom_pane::user_input_lines(&app.last_submitted);
+                                scrollback_history.extend(lines.iter().cloned());
                                 let shift = insert_history::insert_history_lines(&lines, vp_y, screen_rows, app.chat.width())?;
                                 if shift > 0 {
                                     vp_y += shift;
@@ -825,6 +838,7 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
                     decipher_tui::render::set_terminal_title(&mut stdout, &format!("DeCIpher \u{2014} {model}"))?;
                     let banner = bottom_pane::banner_lines(version, provider, model, directory, api_key_set, None);
                     if !banner.is_empty() {
+                        scrollback_history.extend(banner.iter().cloned());
                         let shift = insert_history::insert_history_lines(&banner, vp_y, screen_rows, app.chat.width())?;
                         if shift > 0 {
                             vp_y += shift;
@@ -860,6 +874,7 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
                 // Route through ChatWidget → typed cells → scrollback lines.
                 let scrollback_lines = app.chat.handle_server_message(&msg);
                 if !scrollback_lines.is_empty() {
+                    scrollback_history.extend(scrollback_lines.iter().cloned());
                     let shift = insert_history::insert_history_lines(&scrollback_lines, vp_y, screen_rows, app.chat.width())?;
                     if shift > 0 {
                         vp_y += shift;
@@ -931,6 +946,7 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
             if let Some(queued) = app.queued_message.take() {
                 if let ClientMessage::UserInput { ref text, .. } = queued {
                     let lines = bottom_pane::user_input_lines(&app.last_submitted);
+                    scrollback_history.extend(lines.iter().cloned());
                     let shift = insert_history::insert_history_lines(&lines, vp_y, screen_rows, app.chat.width())?;
                     if shift > 0 {
                         vp_y += shift;
