@@ -754,6 +754,17 @@ impl ChatWidget {
         lines
     }
 
+    /// Rebuild all scrollback lines from committed cells at the given width.
+    ///
+    /// Used on terminal resize to produce width-correct scrollback history.
+    pub fn rebuild_scrollback(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for cell in &self.committed_cells {
+            lines.extend(cell.display_lines(width));
+        }
+        lines
+    }
+
     /// Cache key for transcript (committed count + active revision).
     pub fn transcript_cache_key(&self) -> (usize, u64) {
         let tick = self.active_cell
@@ -1171,5 +1182,23 @@ mod tests {
         // Transcript at narrow width must wrap
         let narrow_lines = widget.transcript_lines(30);
         assert!(narrow_lines.len() > 1, "should wrap at width 30, got {} lines", narrow_lines.len());
+    }
+
+    #[test]
+    fn rebuild_scrollback_adapts_to_width() {
+        let mut widget = ChatWidget::new(120);
+        widget.handle_server_message(&ServerMessage::Mission {
+            understood: "Fix the Docker build pipeline".into(),
+            target: Some("/Dockerfile".into()),
+            target_type: None,
+            steps: vec!["Read Dockerfile".into(), "Fix syntax error".into()],
+        });
+        widget.handle_server_message(&ServerMessage::AgentMessage {
+            text: "I have analyzed the Dockerfile and found a syntax error on line 42 where the RUN command is missing a backslash continuation".into(),
+        });
+
+        let wide = widget.rebuild_scrollback(120);
+        let narrow = widget.rebuild_scrollback(40);
+        assert!(narrow.len() >= wide.len(), "narrow ({}) should have >= lines than wide ({})", narrow.len(), wide.len());
     }
 }
