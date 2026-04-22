@@ -845,6 +845,18 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
                     }
                 }
 
+                // Early auto-approve: when always_approve is set, skip the transcript card
+                // entirely and respond immediately without entering ApprovalPending mode.
+                if app.always_approve {
+                    if let ServerMessage::ApprovalRequest { .. } = &msg {
+                        if let Some(atx) = &current_approval_tx {
+                            let _ = atx.try_send(true);
+                        }
+                        need_redraw = true;
+                        continue;
+                    }
+                }
+
                 // Route through ChatWidget → typed cells → scrollback lines.
                 let scrollback_lines = app.chat.handle_server_message(&msg);
                 if !scrollback_lines.is_empty() {
@@ -903,13 +915,6 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
                 app.handle_server_message(msg);
                 need_redraw = true;
 
-                // Auto-approve if user pressed 'a' (always) earlier.
-                if app.always_approve && app.mode == app::InputMode::ApprovalPending {
-                    app.respond_approval(true);
-                    if let Some(atx) = &current_approval_tx {
-                        let _ = atx.try_send(true);
-                    }
-                }
             }
 
             // ── Tick — spinner animation ──────────────────────────────────────

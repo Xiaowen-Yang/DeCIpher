@@ -1184,6 +1184,7 @@ impl Cell for ApprovalCell {
 
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        lines.push(Line::from(""));  // Rule 1: top-level card isolation
         let rule_w = (width as usize).saturating_sub(26).min(50);
         // ━━ [!] APPROVAL_REQUIRED ━━━...
         lines.push(Line::from(vec![

@@ -501,6 +501,7 @@ impl App {
     pub fn respond_approval(&mut self, approved: bool) -> ClientMessage {
         self.mode = InputMode::Normal;
         self.pending_approval_action = None;
+        self.chat.resolve_active_approval(approved);
         ClientMessage::ApprovalResponse { approved }
     }
 

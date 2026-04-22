@@ -213,6 +213,17 @@ impl ChatWidget {
         self.flush_active_cell_internal();
     }
 
+    /// Set the decision on the active ApprovalCell so the card shows [*]/[x] when flushed.
+    /// Called from `app.respond_approval()` after the user makes their choice.
+    pub fn resolve_active_approval(&mut self, approved: bool) {
+        if let Some(ref mut cell) = self.active_cell {
+            if let Some(ac) = cell.as_any_mut().downcast_mut::<ApprovalCell>() {
+                ac.set_decision(approved);
+                self.active_cell_revision += 1;
+            }
+        }
+    }
+
     /// Process a server message: create typed cells and return scrollback lines.
     ///
     /// This is the canonical entry point for all server messages. It:

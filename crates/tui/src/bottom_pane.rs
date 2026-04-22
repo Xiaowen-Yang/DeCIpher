@@ -110,8 +110,15 @@ impl<'a> BottomPane<'a> {
             ]));
         }
 
-        // Input line(s) — pinned at the bottom
-        self.build_input_lines(&mut lines);
+        // Input line(s) — pinned at the bottom.
+        // In approval mode the full 3-line input area would push the popup options
+        // off-screen (MAX_PANE_HEIGHT=6). Replace with a single separator instead.
+        if self.app.mode == InputMode::ApprovalPending {
+            let w = self.app.chat.width() as usize;
+            lines.push(Line::from(Span::styled("\u{2501}".repeat(w), DIM)));
+        } else {
+            self.build_input_lines(&mut lines);
+        }
 
         // Footer hints
         self.build_hints(&mut lines);
