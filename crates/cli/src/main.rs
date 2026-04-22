@@ -204,6 +204,8 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
     // Accumulated scrollback lines — re-emitted on resize to restore content
     // after clearing ghost artifacts from terminal reflow.
     let mut scrollback_history: Vec<ratatui::text::Line<'static>> = Vec::new();
+    // Banner lines saved separately — not stored in cells, must survive rebuild.
+    let mut banner_lines_saved: Vec<ratatui::text::Line<'static>> = Vec::new();
     // Clear the viewport area so no stale shell content shows through.
     let _ = execute!(io::stdout(), cursor::MoveTo(0, vp_y), Clear(ClearType::FromCursorDown));
     let mut terminal = make_terminal(viewport_height, initial_cols, vp_y)?;
@@ -250,6 +252,7 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
         let instr_display = instr_files.loaded_paths_display();
         let banner = bottom_pane::banner_lines(version, provider, &model, &directory, api_key_set, instr_display.as_deref());
         if !banner.is_empty() {
+            banner_lines_saved = banner.clone();
             scrollback_history.extend(banner.iter().cloned());
             let shift = insert_history::insert_history_lines(&banner, vp_y, screen_rows, initial_cols)?;
             if shift > 0 {
@@ -291,7 +294,9 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
             terminal = make_terminal(vp_h, cols, vp_y)?;
 
             // 3. Rebuild scrollback from cells at the new width, then re-emit.
-            scrollback_history = app.chat.rebuild_scrollback(cols);
+            //    Prepend saved banner lines — they're not stored in cells.
+            scrollback_history = banner_lines_saved.clone();
+            scrollback_history.extend(app.chat.rebuild_scrollback(cols));
             if !scrollback_history.is_empty() {
                 let shift = insert_history::insert_history_lines(
                     &scrollback_history, vp_y, screen_rows, cols,
@@ -838,6 +843,7 @@ async fn run_app(cli_cfg: config::CliConfig, initial_cols: u16, initial_rows: u1
                     decipher_tui::render::set_terminal_title(&mut stdout, &format!("DeCIpher \u{2014} {model}"))?;
                     let banner = bottom_pane::banner_lines(version, provider, model, directory, api_key_set, None);
                     if !banner.is_empty() {
+                        banner_lines_saved = banner.clone();
                         scrollback_history.extend(banner.iter().cloned());
                         let shift = insert_history::insert_history_lines(&banner, vp_y, screen_rows, app.chat.width())?;
                         if shift > 0 {
