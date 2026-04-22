@@ -113,6 +113,19 @@ impl MarkdownStreamCollector {
         self.buffer.is_empty()
     }
 
+    /// Return the raw text that has been committed so far (up to last newline).
+    pub fn committed_raw(&self) -> &str {
+        match self.buffer.rfind('\n') {
+            Some(pos) => &self.buffer[..=pos],
+            None => "",
+        }
+    }
+
+    /// Return the full raw buffer (committed + partial).
+    pub fn raw_buffer(&self) -> &str {
+        &self.buffer
+    }
+
     /// Render markdown text to styled ratatui lines.
     ///
     /// This is a simplified renderer for streaming — it handles basic
