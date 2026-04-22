@@ -1212,4 +1212,51 @@ mod tests {
         let narrow = cell.display_lines(40);
         assert!(narrow.len() > wide.len(), "narrow ({}) should have more lines than wide ({})", narrow.len(), wide.len());
     }
+
+    #[test]
+    fn full_resize_cycle_no_ghost_lines() {
+        let mut widget = ChatWidget::new(120);
+
+        // Mission cell
+        widget.handle_server_message(&ServerMessage::Mission {
+            understood: "Analyze the CI pipeline failure in the main branch build that has been failing since yesterday afternoon".into(),
+            target: Some("/github/workflows/ci.yml".into()),
+            target_type: None,
+            steps: vec![
+                "Read the workflow file and recent logs".into(),
+                "Identify the failing step and root cause".into(),
+            ],
+        });
+
+        // Agent streams a long response
+        widget.push_delta("I have analyzed the CI pipeline and found that the failure is caused by ");
+        widget.push_delta("a dependency resolution conflict in the lockfile. The pnpm-lock.yaml ");
+        widget.push_delta("has diverged from package.json after the last merge.\n");
+        widget.push_delta("Here are the specific issues:\n");
+        widget.push_delta("- The types/node version was bumped to 22.x but the lockfile still references 20.x\n");
+        widget.push_delta("- The vitest dependency has a peer dep conflict with the new TypeScript version\n");
+        widget.end_stream();
+
+        // Scrollback at original width
+        let wide_scrollback = widget.rebuild_scrollback(120);
+        let wide_count = wide_scrollback.len();
+
+        // Resize to narrow
+        widget.set_width(40);
+        let narrow_scrollback = widget.rebuild_scrollback(40);
+        let narrow_count = narrow_scrollback.len();
+
+        // Narrow MUST have more lines (text wrapped)
+        assert!(narrow_count > wide_count,
+            "narrow ({narrow_count}) should have more lines than wide ({wide_count})");
+
+        // Resize back to wide
+        widget.set_width(120);
+        let restored_scrollback = widget.rebuild_scrollback(120);
+        let restored_count = restored_scrollback.len();
+
+        // Restored should match original count (same width)
+        assert_eq!(restored_count, wide_count,
+            "restored ({restored_count}) should match original ({wide_count})");
+    }
 }
