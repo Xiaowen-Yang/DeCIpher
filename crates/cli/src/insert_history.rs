@@ -143,7 +143,7 @@ pub fn insert_history_lines(
 /// Clears the current line, sets per-span foreground/background colors and
 /// text modifiers, and prints each span's content. Resets all attributes
 /// at the end.
-fn write_history_line(stdout: &mut io::Stdout, line: &Line<'static>, _width: u16) -> io::Result<()> {
+fn write_history_line(stdout: &mut io::Stdout, line: &Line<'static>, width: u16) -> io::Result<()> {
     // Set line-level colors (merged into spans below).
     queue!(
         stdout,
@@ -160,7 +160,14 @@ fn write_history_line(stdout: &mut io::Stdout, line: &Line<'static>, _width: u16
     let mut bg = Color::Reset;
     let mut last_modifier = Modifier::empty();
 
+    let max_col = width as usize;
+    let mut col: usize = 0;
+
     for span in &line.spans {
+        if col >= max_col {
+            break;
+        }
+
         let merged = span.style.patch(line.style);
         let next_fg = merged.fg.unwrap_or(Color::Reset);
         let next_bg = merged.bg.unwrap_or(Color::Reset);
@@ -187,7 +194,18 @@ fn write_history_line(stdout: &mut io::Stdout, line: &Line<'static>, _width: u16
             last_modifier = modifier;
         }
 
-        queue!(stdout, Print(span.content.as_ref()))?;
+        let content = span.content.as_ref();
+        let char_count = content.chars().count();
+        let remaining = max_col.saturating_sub(col);
+        if char_count <= remaining {
+            queue!(stdout, Print(content))?;
+            col += char_count;
+        } else {
+            // Truncate to fit remaining columns
+            let truncated: String = content.chars().take(remaining).collect();
+            col += remaining;
+            queue!(stdout, Print(truncated))?;
+        }
     }
 
     // Reset all attributes.
