@@ -7,63 +7,182 @@
 
 A mission-driven local execution agent for CI/deployment tasks. Give it a goal — it plans, executes, verifies, and adapts until the job is done.
 
-## Install
+---
 
-Requires **Node.js 22+**. Check your version:
+## Quick Start (from source)
+
+Follow these steps in order. Each step explains what it is and why you need it.
+
+### Step 0: Open a Terminal
+
+- **macOS**: press `Cmd + Space`, type "Terminal", press Enter.
+- **Windows**: press `Win + R`, type `cmd`, press Enter. Or search for "PowerShell".
+- **Linux**: press `Ctrl + Alt + T`.
+
+You will type (or paste) the commands below into this window, then press Enter to run them.
+
+### Step 1: Install Node.js (v22 or newer)
+
+Node.js is a program that runs JavaScript code. DeCIpher's startup script needs it.
+
+**Check if you already have it:**
 
 ```bash
-node -v   # Should show v22.x.x or higher
+node -v
 ```
 
-If you don't have Node.js or need to upgrade:
+If the output shows `v22.x.x` or higher, skip to Step 2. If it says "command not found" or shows a lower version, install it:
 
+<details>
+<summary><strong>macOS</strong></summary>
+
+Option A — Homebrew (if you have it):
 ```bash
-# macOS / Linux (via nvm — recommended)
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
-nvm install 22
-nvm use 22
-
-# Or via Homebrew (macOS)
 brew install node@22
+```
 
-# Windows — download the installer from:
-# https://nodejs.org/en/download
-# Or via winget:
+Option B — nvm (version manager):
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+```
+Close and reopen your terminal, then:
+```bash
+nvm install 22
+```
+</details>
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+Download the installer from https://nodejs.org/en/download and run it.
+Or, if you have winget:
+```bash
 winget install OpenJS.NodeJS.LTS
 ```
+</details>
 
-Then install DeCIpher:
-
-```bash
-npm install -g decipher-cli
-decipher
-```
-
-That's it. On first run, DeCIpher will ask you to configure an AI provider.
-
-### Update
-
-DeCIpher checks for new versions automatically and notifies you on startup. To update:
+<details>
+<summary><strong>Linux</strong></summary>
 
 ```bash
-npm update -g decipher-cli
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+```
+Close and reopen your terminal, then:
+```bash
+nvm install 22
+```
+</details>
+
+### Step 2: Install Rust
+
+Rust is a programming language. DeCIpher's terminal interface (TUI) is written in Rust, so you need the Rust compiler to build it.
+
+**Check if you already have it:**
+
+```bash
+rustc --version
 ```
 
-Optional: **Docker** (for container missions).
+If it prints a version number, skip to Step 3. Otherwise, install it:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+When prompted, choose the default installation (press Enter). After it finishes, close and reopen your terminal so the `cargo` command becomes available.
+
+> **Windows users**: download the installer from https://rustup.rs and run it.
+
+### Step 3: Install pnpm
+
+pnpm is a package manager for JavaScript. It downloads the libraries DeCIpher depends on.
+
+```bash
+npm install -g pnpm
+```
+
+(`npm` was installed automatically when you installed Node.js in Step 1.)
+
+### Step 4: Download the project
+
+If you haven't already, clone (download) the project:
+
+```bash
+git clone https://github.com/Xiaowen-Yang/DeCIpher.git
+cd DeCIpher
+```
+
+> If `git` is not found: install it from https://git-scm.com/downloads.
+
+### Step 5: Install JavaScript dependencies
+
+```bash
+pnpm install
+```
+
+This reads `package.json` and downloads everything DeCIpher's JavaScript side needs.
+
+### Step 6: Build the Rust TUI
+
+```bash
+cargo build --bin decipher-tui
+```
+
+This compiles the terminal interface. The first build may take 1–3 minutes (it downloads and compiles Rust dependencies). Subsequent builds are much faster.
+
+### Step 7: Configure an AI provider
+
+DeCIpher needs an API key from an AI provider (OpenAI, Anthropic, etc.) to work. Set one up:
+
+```bash
+# For OpenAI:
+./bin/decipher setting set provider openai
+./bin/decipher setting set api-key sk-YOUR_KEY_HERE
+
+# For Anthropic:
+./bin/decipher setting set provider anthropic
+./bin/decipher setting set api-key sk-ant-YOUR_KEY_HERE
+```
+
+Replace `sk-YOUR_KEY_HERE` with your actual API key (you get this from the provider's website).
+
+### Step 8: Run DeCIpher
+
+```bash
+./bin/decipher
+```
+
+You should see the DeCIpher interface. Type a task (e.g. "Fix this Docker build failure") and press Enter.
+
+---
+
+## Verify your setup
+
+If something feels wrong, run the built-in health check:
+
+```bash
+./bin/decipher doctor
+```
+
+It will tell you what is missing or misconfigured.
+
+---
+
+## Updating
+
+```bash
+git pull              # get latest code
+pnpm install          # update JS dependencies (if any changed)
+cargo build --bin decipher-tui   # rebuild the TUI
+```
+
+---
 
 ## Usage
 
-```bash
-# Start interactive mode
-decipher
-
-# Check environment
-decipher doctor
-```
-
 ### Interactive Mode
 
-The terminal UI is built in Rust (crossterm) for smooth input handling, multi-line paste, and streaming output. It communicates with the Node.js agent backend via JSON over stdin/stdout.
+When you run `./bin/decipher`, the terminal UI starts:
 
 ```
     /\_/\
@@ -133,25 +252,19 @@ The terminal UI is built in Rust (crossterm) for smooth input handling, multi-li
 | `/agents` | List available agents |
 | `/quit` | Exit |
 
-## Configuration
+### Additional Provider Setup
 
 ```bash
-# OpenAI (default)
-decipher setting set provider openai
-decipher setting set api-key sk-xxx
-
-# Anthropic
-decipher setting set provider anthropic
-decipher setting set api-key sk-ant-xxx
-
-# Custom OpenAI-compatible (DeepSeek, Ollama, etc.)
-decipher setting set provider custom
-decipher setting set base_url https://your-api.com/v1/chat/completions
-decipher setting set model your-model
-decipher setting set api-key your-key
+# Custom OpenAI-compatible endpoint (DeepSeek, Ollama, etc.)
+./bin/decipher setting set provider custom
+./bin/decipher setting set base_url https://your-api.com/v1/chat/completions
+./bin/decipher setting set model your-model
+./bin/decipher setting set api-key your-key
 ```
 
-Config stored at `~/.decipher/config.json`.
+Config is stored at `~/.decipher/config.json`.
+
+---
 
 ## How It Works
 
